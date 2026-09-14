@@ -110,9 +110,11 @@ sudo /opt/logalert-venv/bin/pip install --upgrade ./logalert-X.Y.Z-py3-none-any.
 
 ## Upgrading Python
 
-A **different operation**. The venv does not survive a Python minor-version change (step 1);
-rebuild it against the new interpreter, then reinstall the wheel (download it again per step 2 if
-you no longer have it):
+A **different operation**. The venv does not survive a Python minor-version change (step 1).
+Expect it after a distribution release upgrade, which removes the previous minor's packages;
+where interpreters are installed side by side (FreeBSD `pkg`, Fedora) the old one usually stays
+and the venv keeps running until you choose to rebuild. Either way, rebuild against the new
+interpreter, then reinstall the wheel (download it again per step 2 if you no longer have it):
 
 ```bash
 sudo python3.13 -m venv --clear /opt/logalert-venv     # the NEW version
@@ -143,7 +145,7 @@ Configuration and state files are left for you to remove deliberately.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `ModuleNotFoundError: No module named 'logalert'` from `/usr/local/bin/logalert` or the venv | The venv's interpreter was upgraded out from under it. Confirm: `readlink /opt/logalert-venv/bin/python` prints the unversioned `python3`, and `/opt/logalert-venv/bin/python --version` reports a minor whose `python3.X/` directory under `/opt/logalert-venv/lib` is missing — or exists but holds only pip, meaning someone already ran `venv --upgrade`. `grep ^command /opt/logalert-venv/pyvenv.cfg` shows the last `venv` command that touched the directory: `python3 -m venv` is the alias trap, `--upgrade` the wrong repair. Same fix either way. (A traceback naming `/usr/local/bin/logalert` is still a venv problem — the symlink only resolves into it.) | Rebuild the venv against the new interpreter ([Upgrading Python](#upgrading-python)). Not `venv --upgrade`. |
-| `cannot execute: required file not found` (bash 5.2+), `bad interpreter: No such file or directory` (older bash), or `sudo` / a service manager reporting `No such file or directory` for `/usr/local/bin/logalert` although the file exists | The venv's `bin/python` symlink dangles — the old Python was **removed**, not just re-pointed | Same rebuild. |
+| `cannot execute: required file not found` (bash 5.2+), `bad interpreter: No such file or directory` (older bash), or `sudo` / a service manager reporting `No such file or directory` for `/usr/local/bin/logalert` although the file exists — typically right after a **distribution release upgrade** | The venv's `bin/python3.X` symlink dangles — the old Python was **removed**, not just re-pointed. A release upgrade (Debian 12 → 13, Ubuntu LTS → LTS) drops the previous minor's packages as obsolete, so `/usr/bin/python3.X` is gone. The versioned-interpreter rule cannot prevent this; it only prevents the *silent* alias case above. Confirm: `readlink /opt/logalert-venv/bin/python3.X` names a path that no longer exists. | Rebuild against the new interpreter ([Upgrading Python](#upgrading-python)) and reinstall the same wheel — it is pure Python, so no new download is needed unless you no longer have it. Plan this step into every release upgrade. |
 | `python3.12: command not found` | That versioned binary is not installed, or the example does not match your version | Use the version you have (`ls /usr/bin/python3.* /usr/local/bin/python3.*`); on a minimal box, bare `python3` plus rebuild-on-upgrade |
 | `ensurepip is not available` (Debian/Ubuntu) | The `venv` module ships separately | `apt install python3.12-venv` (match your version) |
 | `sudo: logalert: command not found` | No symlink in a `secure_path` directory | Create the `/usr/local/bin` symlink (step 3) or use the absolute venv path |
