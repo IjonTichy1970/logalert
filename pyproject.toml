@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]          # floor for SPDX license-expression support
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logalert"
+version = "0.1.0"
+description = "Generalized log file watcher."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"                        # PEP 639 SPDX string; no License:: classifier (deprecated)
+license-files = ["LICENSE"]
+authors = [{ name = "IjonTichy1970" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",   # MUST mirror the CI matrix in .github/workflows/ci.yml
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Logging",
+    "Topic :: System :: Monitoring",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff", "pytest", "build"]
+
+[project.urls]
+Homepage = "https://github.com/IjonTichy1970/logalert"
+Changelog = "https://github.com/IjonTichy1970/logalert/blob/main/CHANGELOG.md"
+Releases = "https://github.com/IjonTichy1970/logalert/releases"
+
+[project.scripts]
+logalert = "logalert.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["logalert*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
