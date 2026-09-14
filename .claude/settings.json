@@ -1,0 +1,24 @@
+{
+  "$comment": [
+    "PreToolUse hook: guard_shell_text.py refuses Bash commands that AUTHOR escape-bearing text",
+    "or truncate a file through a shell. The prose rule it enforces was broken ten times in the",
+    "project it came from, three of them while the rule was being written down, so it is a hook",
+    "and not a paragraph: it fires at the moment of the mistake. Coverage is deliberately narrow",
+    "(see the docstring); .claude/hooks/test_guard_shell_text.py pins both halves as a gate",
+    "stage. To disable, delete the hooks block -- but read that test first: every BLOCK case is",
+    "a failure that really happened."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/hooks/guard_shell_text.py"
+          }
+        ]
+      }
+    ]
+  }
+}

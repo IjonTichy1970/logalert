@@ -1,25 +1,28 @@
 # Installing logalert
 
-logalert is published as a Python wheel on the project's
-[GitHub Releases](https://github.com/IjonTichy1970/logalert/releases) page. It is **not on
-PyPI**: `pip install logalert` fails with `No matching distribution found` — install from the
-release wheel as described here.
+logalert is published as a Python wheel on the project's [GitHub
+Releases](https://github.com/IjonTichy1970/logalert/releases) page. It is **not
+on PyPI**: `pip install logalert` fails with `No matching distribution found` —
+install from the release wheel as described here.
 
-The pattern is a dedicated virtual environment at a fixed path, `/opt/logalert-venv`, that holds
-**only** the venv. It is isolated from the system Python, reproducible, and disposable: rebuilding
-it is remove + recreate + reinstall, with nothing else to reason about.
+The pattern is a dedicated virtual environment at a fixed path,
+`/opt/logalert-venv`, that holds **only** the venv. It is isolated from the
+system Python, reproducible, and disposable: rebuilding it is remove + recreate
++ reinstall, with nothing else to reason about.
 
 ## Requirements
 
-- Python **3.12 or newer**, available as a **versioned** binary (`python3.12`, `python3.13`, …).
-  The venv must be created with that versioned name — step 1 explains why.
-- `pip` and the `venv` module. Debian/Ubuntu ship `venv` separately:
-  `apt install python3.12-venv` (match your version).
-- Outbound access to PyPI during install if the release has runtime dependencies — those are
-  fetched from PyPI even though logalert itself is not (or pre-fetch their wheels on an
-  air-gapped host).
+- Python **3.12 or newer**, available as a **versioned** binary (`python3.12`,
+  `python3.13`, …). The venv must be created with that versioned name — step 1
+  explains why.
+- `pip` and the `venv` module. Debian/Ubuntu ship `venv` separately: `apt
+  install python3.12-venv` (match your version).
+- Outbound access to PyPI during install if the release has runtime dependencies
+  — those are fetched from PyPI even though logalert itself is not (or pre-fetch
+  their wheels on an air-gapped host).
 
-Commands that touch `/opt` or `/usr/local` need root; they are shown with `sudo`.
+Commands that touch `/opt` or `/usr/local` need root; they are shown with
+`sudo`.
 
 ## Install
 
@@ -29,25 +32,28 @@ Commands that touch `/opt` or `/usr/local` need root; they are shown with `sudo`
 sudo python3.12 -m venv /opt/logalert-venv
 ```
 
-`python3.12` is an **example** — use whichever 3.12-or-newer version you have (`python3.13 -m venv …`
-on a 3.13 box). The rule is to name *a* version, never bare `python3`.
+`python3.12` is an **example** — use whichever 3.12-or-newer version you have
+(`python3.13 -m venv …` on a 3.13 box). The rule is to name *a* version, never
+bare `python3`.
 
-Why: a venv is bound to the Python minor version that created it. Its packages live in
-`lib/python3.X/site-packages`, and its `bin/python` resolves (via `bin/python3.12`) to the
-interpreter that created it. `python3 -m venv` links to the unversioned `python3` alias, so when an OS upgrade re-points
-that alias at a newer minor, the venv silently starts running under a Python that looks in a
+Why: a venv is bound to the Python minor version that created it. Its packages
+live in `lib/python3.X/site-packages`, and its `bin/python` resolves (via
+`bin/python3.12`) to the interpreter that created it. `python3 -m venv` links to
+the unversioned `python3` alias, so when an OS upgrade re-points that alias at a
+newer minor, the venv silently starts running under a Python that looks in a
 `site-packages` directory that does not exist — and every command fails with
-`ModuleNotFoundError: No module named 'logalert'` although nothing on disk changed. A versioned
-binary is not silently re-pointed; the venv keeps running on 3.12 until you *choose* to rebuild it.
+`ModuleNotFoundError: No module named 'logalert'` although nothing on disk
+changed. A versioned binary is not silently re-pointed; the venv keeps running
+on 3.12 until you *choose* to rebuild it.
 
-If your system ships only an unversioned `python3` with no versioned binary beside it, `python3`
-is the only option — then plan to rebuild the venv after every Python upgrade
-([Upgrading Python](#upgrading-python)).
+If your system ships only an unversioned `python3` with no versioned binary
+beside it, `python3` is the only option — then plan to rebuild the venv after
+every Python upgrade ([Upgrading Python](#upgrading-python)).
 
 ### 2. Download the wheel and install it
 
-From the [Releases](https://github.com/IjonTichy1970/logalert/releases) page, or on the
-command line (`X.Y.Z` = the release you want):
+From the [Releases](https://github.com/IjonTichy1970/logalert/releases) page, or
+on the command line (`X.Y.Z` = the release you want):
 
 ```bash
 gh release download vX.Y.Z --repo IjonTichy1970/logalert --pattern '*.whl'
@@ -61,8 +67,8 @@ Then:
 sudo /opt/logalert-venv/bin/pip install ./logalert-X.Y.Z-py3-none-any.whl
 ```
 
-The `py3-none-any` wheel is pure Python — one file covers every supported Python version and
-operating system.
+The `py3-none-any` wheel is pure Python — one file covers every supported Python
+version and operating system.
 
 ### 3. Put the command on `PATH` — the `/usr/local/bin` symlink
 
@@ -70,13 +76,15 @@ operating system.
 sudo ln -s /opt/logalert-venv/bin/logalert /usr/local/bin/logalert
 ```
 
-This is more than convenience. `sudo` replaces the caller's `PATH` with the `secure_path` from
-`sudoers` (typically `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`), which never
-includes a venv's `bin/` — so `sudo logalert` works **only** because of this symlink. The right
-Python still runs: pip writes the console script with an absolute shebang into the venv's `bin/`
-(`#!/opt/logalert-venv/bin/python3.12` with the commands above — the name mirrors the interpreter
-the venv was created with), so following the symlink executes the venv's own interpreter
-regardless of `PATH`.
+This is more than convenience. `sudo` replaces the caller's `PATH` with the
+`secure_path` from `sudoers` (typically
+`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`), which never
+includes a venv's `bin/` — so `sudo logalert` works **only** because of this
+symlink. The right Python still runs: pip writes the console script with an
+absolute shebang into the venv's `bin/` (`#!/opt/logalert-venv/bin/python3.12`
+with the commands above — the name mirrors the interpreter the venv was created
+with), so following the symlink executes the venv's own interpreter regardless
+of `PATH`.
 
 ### 4. Verify
 
@@ -90,19 +98,19 @@ logalert --version
 ls /opt/logalert-venv                      # bin include lib [lib64] pyvenv.cfg — nothing else
 ```
 
-Run these once after install and again after any Python upgrade. The first line alone catches the
-alias problem before it bites.
+Run these once after install and again after any Python upgrade. The first line
+alone catches the alias problem before it bites.
 
 ## Keep the venv directory disposable
 
-Store **nothing of your own** in `/opt/logalert-venv` — no configuration, state, or launcher
-scripts. The rebuild below empties that directory (`--clear`) and the uninstall removes it;
-anything you keep inside goes with it.
+Store **nothing of your own** in `/opt/logalert-venv` — no configuration, state,
+or launcher scripts. The rebuild below empties that directory (`--clear`) and
+the uninstall removes it; anything you keep inside goes with it.
 
 ## Upgrading logalert
 
-Install the new wheel into the same venv; pip replaces the old version. Then restart any running
-logalert process.
+Install the new wheel into the same venv; pip replaces the old version. Then
+restart any running logalert process.
 
 ```bash
 sudo /opt/logalert-venv/bin/pip install --upgrade ./logalert-X.Y.Z-py3-none-any.whl
@@ -110,11 +118,13 @@ sudo /opt/logalert-venv/bin/pip install --upgrade ./logalert-X.Y.Z-py3-none-any.
 
 ## Upgrading Python
 
-A **different operation**. The venv does not survive a Python minor-version change (step 1).
-Expect it after a distribution release upgrade, which removes the previous minor's packages;
-where interpreters are installed side by side (FreeBSD `pkg`, Fedora) the old one usually stays
-and the venv keeps running until you choose to rebuild. Either way, rebuild against the new
-interpreter, then reinstall the wheel (download it again per step 2 if you no longer have it):
+A **different operation**. The venv does not survive a Python minor-version
+change (step 1). Expect it after a distribution release upgrade, which removes
+the previous minor's packages; where interpreters are installed side by side
+(FreeBSD `pkg`, Fedora) the old one usually stays and the venv keeps running
+until you choose to rebuild. Either way, rebuild against the new interpreter,
+then reinstall the wheel (download it again per step 2 if you no longer have
+it):
 
 ```bash
 sudo python3.13 -m venv --clear /opt/logalert-venv     # the NEW version
@@ -123,14 +133,17 @@ sudo /opt/logalert-venv/bin/pip install ./logalert-X.Y.Z-py3-none-any.whl
 
 Two traps:
 
-- `--clear` **wipes the directory first** — which is why it must hold nothing but the venv.
-- `python3 -m venv --upgrade` is **not** the fix. It rewrites `pyvenv.cfg` and bootstraps a
-  fresh `lib/python3.Y/site-packages` for the new version (holding only pip) but leaves the old
-  tree — and your packages — behind, so the venv stays broken behind a plausible-looking repair.
+- `--clear` **wipes the directory first** — which is why it must hold nothing
+  but the venv.
+- `python3 -m venv --upgrade` is **not** the fix. It rewrites `pyvenv.cfg` and
+  bootstraps a fresh `lib/python3.Y/site-packages` for the new version (holding
+  only pip) but leaves the old tree — and your packages — behind, so the venv
+  stays broken behind a plausible-looking repair.
 
 ## Uninstall
 
-Stop any running logalert process (and disable its service unit, if you created one) first.
+Stop any running logalert process (and disable its service unit, if you created
+one) first.
 
 ```bash
 sudo rm /usr/local/bin/logalert
@@ -154,15 +167,17 @@ Configuration and state files are left for you to remove deliberately.
 
 ## Platform notes
 
-- **Linux** is what CI tests. **FreeBSD** follows the same steps: Python from `pkg` lands in
-  `/usr/local/bin` (so `python3.12` is there), and `fetch` replaces `curl -LO`.
-- **Windows**: the same pattern with `py -3.12 -m venv C:\logalert-venv` and the `Scripts\`
-  layout (`C:\logalert-venv\Scripts\pip.exe`, `C:\logalert-venv\Scripts\logalert.exe`); there is
-  no symlink step.
+- **Linux** is what CI tests. **FreeBSD** follows the same steps: Python from
+  `pkg` lands in `/usr/local/bin` (so `python3.12` is there), and `fetch`
+  replaces `curl -LO`.
+- **Windows**: the same pattern with `py -3.12 -m venv C:\logalert-venv` and the
+  `Scripts\` layout (`C:\logalert-venv\Scripts\pip.exe`,
+  `C:\logalert-venv\Scripts\logalert.exe`); there is no symlink step.
 
 ## Development install
 
 Contributors use a separate, **editable** venv inside the source tree — see
-[README.md](README.md). Never deploy that pattern, and never develop in the deployment one. If
-`logalert --version` in the dev venv shows an old number after a version bump, the editable
-install's metadata snapshot is stale — run `.venv/bin/python -m pip install -e ".[dev]"` again.
+[README.md](README.md). Never deploy that pattern, and never develop in the
+deployment one. If `logalert --version` in the dev venv shows an old number
+after a version bump, the editable install's metadata snapshot is stale — run
+`.venv/bin/python -m pip install -e ".[dev]"` again.

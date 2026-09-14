@@ -1,5 +1,9 @@
-# Claude Code — per-developer config and PROJECT skills; local only, never shared
-.claude/
+# Claude Code: per-developer config and PROJECT skills stay local. The exceptions are the
+# committed agent tooling -- the PreToolUse hook, its test (a gate stage), and the hook wiring --
+# which CI and every clone must have. `.claude/*` (not `.claude/`) so the negations can apply.
+.claude/*
+!.claude/hooks/
+!.claude/settings.json
 
 # Python
 __pycache__/
@@ -9,10 +13,14 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+.mypy_cache/
 .ruff_cache/
 
 # Scratch dir for reference material that must never be tracked
 _review/
+
+# The gate's captured output, as README.md tells a reader to write it
+gate.out
 
 # Editors / OS
 .vscode/

@@ -1,4 +1,13 @@
+# Everything is LF, on every machine. The tree ships shell scripts, and a CRLF shebang line
+# breaks bash with "bad interpreter"; Python on Windows already emits CRLF from write_text
+# unless told not to, so nothing here may depend on the checkout translating line endings.
 * text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.conf text eol=lf
 *.png binary
 *.jpg binary
 *.gif binary

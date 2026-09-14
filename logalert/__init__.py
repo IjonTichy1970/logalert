@@ -1,4 +1,4 @@
-"""logalert — generalized log file watcher."""
+"""logalert -- generalized log file watcher."""
 
 from importlib.metadata import PackageNotFoundError, version
 

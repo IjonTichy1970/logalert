@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     parser.parse_args(argv)
-    # No watcher yet — the CLI surface is defined as the project takes shape.
+    # No watcher yet -- the CLI surface is defined as the project takes shape.
     parser.print_help()
     return 0
 
