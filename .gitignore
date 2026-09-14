@@ -1,0 +1,21 @@
+# Claude Code — per-developer config and PROJECT skills; local only, never shared
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Scratch dir for reference material that must never be tracked
+_review/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

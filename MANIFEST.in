@@ -1,0 +1,5 @@
+include README.md
+include INSTALL.md
+include CHANGELOG.md
+include LICENSE
+# Add "recursive-include docs *.md" once a docs/ directory exists (build warns if it is absent).
