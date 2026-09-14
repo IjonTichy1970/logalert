@@ -82,12 +82,35 @@ new entry.
   everything gets an entry, one category, load-bearing tags, 80 columns. Gated
   Python is ASCII, enforced by `tools/check_ascii.py`, which caught its own
   first draft: a backslash-u escape written through the tool-call transport
-  arrived as the literal character. Re-measured, the same escape arrived
-  decoded in some calls and literal in others, while the other escapes probed
-  (`\n`, `\t`, `\\`, `\r`, backticks, `$`) arrived literally every time -- so
-  gated code spells code points as `chr(0x...)` and never writes the escape.
-  ⚠️ mypy on the Windows dev host must
-  be the pure-Python build (`pip install --no-binary mypy mypy`): the compiled
-  wheel is blocked by an Application Control policy.
+  arrived as the literal character. Re-measured, the same escape arrived decoded
+  in some calls and literal in others, while the other escapes probed (`\n`,
+  `\t`, `\\`, `\r`, backticks, `$`) arrived literally every time -- so gated
+  code spells code points as `chr(0x...)` and never writes the escape. ⚠️ mypy
+  on the Windows dev host must be the pure-Python build (`pip install
+  --no-binary mypy mypy`): the compiled wheel is blocked by an Application
+  Control policy.
+
+- `[contract]` **The configuration file: INI sections, a loader that validates
+  everything, `--check-config` and `--example-config`** (#6). One file, any
+  number of watch sections plus a reserved `[logalert]` section; every key of
+  the 0.1.0 schema is parsed in `logalert/config.py` and nowhere else. Patterns
+  are case-sensitive by default (`ipatterns` / `iregex` opt in); noise exclusion
+  in the same four shapes; priority tags `[high] `, `[medium] `, `[low] ` with
+  the priority system off unless configured; `report`, `start`, `archive_dir`,
+  `max_lines`, `context`. Paths must be absolute and globs are refused so a glob
+  is never silently a literal path; addresses are bare `local@domain`; an empty
+  list entry is an error rather than a match-everything pattern; `%` is literal;
+  a duplicate section or key is an error with its line number; `[DEFAULT]` is
+  refused because `configparser` would merge it into every section. ⚠️ A
+  continuation line beginning with `#` or `;` is dropped by `configparser` as a
+  comment -- documented and pinned, not fixable inside INI. `--check-config`
+  prints the effective settings -- including whether the sendmail binary exists
+  AND is executable, and the effective From address with a warning when it would
+  not travel beyond this host -- and exits 0 or 2 without touching state;
+  `--example-config` prints the commented example that ships inside the package,
+  so an installed host has it and the docs quote it. ⭐ The adversarial review
+  reproduced a `--check-config` that called a non-executable sendmail "found",
+  `re.compile` raising `OverflowError` past the `re.error` handler, and a path
+  with an embedded newline passing every check -- all fixed and pinned.
 
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main

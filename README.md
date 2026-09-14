@@ -3,8 +3,9 @@
 Generalized log file watcher.
 
 > **Status:** pre-release. The packaging, CI, gate and release workflow are in
-> place; the watcher itself is being designed. `logalert --version` is the only
-> thing the command does today.
+> place and the configuration file is defined: `logalert --example-config`
+> prints a complete commented example and `logalert --check-config` validates
+> yours. The watcher itself is being built.
 
 ## Installation
 

@@ -28,8 +28,10 @@ line is red), `mypy` (strict), `pytest`, `linux stage` (delegated into the
 names every stage that announced a skip. **Read the stage lines, not the
 verdict** -- an announced skip reads as green at a glance.
 
-Expected before the first release: `changelog refs` announces "no release commit
-yet". Any other announced skip is worth reading. mypy on this host is the
+Expected announced skips on the Windows host: `changelog refs` ("no release
+commit yet", until the first release) and `pytest` (1 skipped: the POSIX-only
+file-mode test in `tests/test_config.py`, which runs natively in the sandbox
+and on CI). Any other announced skip is worth reading. mypy on this host is the
 pure-Python build (`pip install --no-binary mypy mypy`): the compiled wheel's
 DLL is blocked by an Application Control policy.
 

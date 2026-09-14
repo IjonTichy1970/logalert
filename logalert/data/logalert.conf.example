@@ -1,0 +1,144 @@
+# logalert configuration -- /etc/logalert.conf
+#
+# One file, any number of sections. The [logalert] section holds the global
+# settings; every other section is a WATCH: which files to read, what to look
+# for, and whom to email. Run `logalert --check-config` after editing.
+#
+# Values that are lists (to, files, patterns, ...) go one per line, indented:
+#
+#     patterns =
+#         disk failure
+#         Requesting reboot
+#
+# A blank line inside such a list is an error. A list line that begins with
+# `#` or `;` is treated as a comment by the parser and dropped -- to match text
+# that starts with one of those, use a regex with an escape: `\#` or `\;`
+# (the `regex` block below shows one).
+
+[logalert]
+# Sender address of the alert emails. Default: the user logalert runs as, at
+# this host's name (`root@host.example.net`). Set it explicitly on hosts with
+# odd DNS, or to make replies land somewhere useful.
+#from = logalert@example.net
+
+# Where logalert remembers its position in each file between runs. The
+# directory must be writable by the user cron runs logalert as.
+#state_file = /var/lib/logalert/state.json
+
+# Where logalert writes its own activity: syslog (default), stderr,
+# file:/absolute/path, or udp:host:port (explicit only; never a fallback).
+#log = syslog
+
+# How alert emails leave the box: auto (default) uses the local sendmail
+# binary when it exists and otherwise refuses to start with a message saying
+# what to install; sendmail; or smtp to a relay.
+#transport = auto
+#sendmail_path = /usr/sbin/sendmail
+#smtp_host = mail.example.net
+#smtp_port = 25
+#smtp_starttls = no
+
+# Seconds to wait for the mail system before treating a message as not
+# delivered. Nothing in a cron job may hang forever.
+#mail_timeout = 60
+
+# A run that finds another run still holding the lock exits quietly -- unless
+# that run is older than this many seconds, which is reported as a problem.
+#lock_stale = 3600
+
+# Days after which the position of a file that has not been seen is forgotten.
+#state_ttl = 30
+
+# Append " -- N match(es)" to the Subject. Set to no for the bare subject.
+#subject_suffix = yes
+
+# ---------------------------------------------------------------------------
+# A watch. The section name is yours; it appears in the X-Logalert-Section
+# header and in logalert's own log.
+
+[router-disk]
+# Subject of the alert email (verbatim; see subject_suffix above).
+subject = Router disk failure
+
+# Recipients: one per line, or comma-separated. Bare addresses only.
+to =
+    noc@example.net
+
+# Log files to read: absolute paths, one per line. Compressed files (.gz,
+# .bz2, .xz) may be listed directly. No wildcards in this release.
+files =
+    /var/log/router.log
+
+# What to look for. Literal text is matched case-SENSITIVELY:
+patterns =
+    disk failure
+    Requesting reboot
+
+# Case-insensitive literals, and regular expressions (Python `re` syntax),
+# case-sensitive and case-insensitive:
+#ipatterns =
+#    link down
+#regex =
+#    ^\S+ \d+ \d\d:\d\d:\d\d router1 kernel: .*fail
+#    \#\d+ .*failed
+#iregex =
+#    error|panic
+
+# Noise: a line that matches a pattern but also matches one of these is
+# dropped. The same four shapes as the patterns.
+#exclude =
+#    disk failure on da9 (known bad, ticket open)
+#iexclude =
+#    test message
+#exclude_regex =
+#    ^.* kernel: \[debug\]
+#iexclude_regex =
+#    heartbeat
+
+# Priority (optional; OFF unless set here or by a tag). high, medium or low.
+# When set, the email carries X-Logalert-Priority plus the standard
+# X-Priority / Importance headers, so a mail client can route high-priority
+# alerts to the inbox and the rest to a folder. A single pattern can carry its
+# own priority with a leading tag (lowercase, then one space), which also
+# works when priority is unset:
+#
+#     patterns =
+#         [high] Requesting reboot
+#         [low] link flap
+#
+#priority = medium
+
+# Where the findings go: inline (default) as a plain-text report in the body,
+# or attachment as a text file, with a brief summary in the body either way.
+#report = inline
+
+# Lines of context before and after each match (like grep -C). Default: the
+# command line's -c, which defaults to 0.
+#context = 0
+
+# Flood cap: at most this many matching lines per email ("... and N more").
+#max_lines = 200
+
+# On the first run, where to begin in each file: end (default -- no flood of
+# old news) or beginning.
+#start = end
+
+# Where rotated archives live when they are not beside the log (logrotate's
+# olddir, newsyslog's -a). Default: the log's own directory.
+#archive_dir = /var/log/archive
+
+# ---------------------------------------------------------------------------
+# A second watch, on a compressed log, with case-insensitive matching.
+
+#[firewall-denies]
+#subject = Firewall denies
+#to = noc@example.net, security@example.net
+#files =
+#    /var/log/firewall.log
+#    /var/log/firewall.log.0.gz
+#ipatterns =
+#    deny
+#exclude_regex =
+#    from 192\.0\.2\.
+#report = attachment
+#max_lines = 1000
