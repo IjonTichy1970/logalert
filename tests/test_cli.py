@@ -10,27 +10,28 @@ from logalert import __version__
 from logalert.__main__ import main
 
 
-def test_version_derives_from_installed_metadata():
+def test_version_derives_from_installed_metadata() -> None:
     assert __version__ == version("logalert")
 
 
-def test_version_flag(capsys):
+def test_version_flag(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exc:
         main(["--version"])
     assert exc.value.code == 0
     assert capsys.readouterr().out.strip() == f"logalert {__version__}"
 
 
-def test_no_args_prints_help(capsys):
+def test_no_args_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert main([]) == 0
     assert "usage: logalert" in capsys.readouterr().out
 
 
-def test_module_is_runnable():
+def test_module_is_runnable() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "logalert", "--version"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     assert result.returncode == 0
