@@ -271,10 +271,10 @@ def test_first_sight_starts_at_the_end_and_logs_the_skip(
     log, lines = scan(path, None)
     assert log.verdict == "first-sight" and lines == []
     assert log.skipped == 22 and log.offset == 22
-    assert [r.getMessage() for r in caplog.records] == [
-        f"[{SECTION}] {path}: first sight; starting at the end, 22 bytes skipped"
-    ]
-    assert caplog.records[0].levelno == logging.INFO
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
+    assert messages == [f"[{SECTION}] {path}: first sight; starting at the end, 22 bytes skipped"]
+    counted = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    assert counted == [f"[{SECTION}] {path}: counted 2 lines before offset 22 (once)"]
     saved = log.cursor()
     assert saved.offset == 22 and saved.fingerprint == sha(b"old news 1")
     assert saved.ino == path.stat().st_ino and saved.ino != 0

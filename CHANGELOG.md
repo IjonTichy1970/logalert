@@ -208,4 +208,49 @@ new entry.
   chain member out -- all fixed and pinned by the tests their surviving
   mutations named.
 
+- `[contract]` **Matching and context: whole lines against literal and regex
+  patterns, noise exclusion, priority tags, and `grep -C` context that never
+  crosses a file** (#9). `logalert/match.py` turns the `Line` stream a source
+  yields into a bounded report per file. Every pattern is tried in config order
+  and the first to match is recorded: a literal as a substring, a regex with
+  `search`, case-sensitive unless the section opted in (`ipatterns` fold with
+  `lower()`, the same simple folding `re.IGNORECASE` applies, so `ipatterns` and
+  `iregex` agree). A `[high]` / `[medium]` / `[low]` tag sets the priority of
+  the lines ITS pattern matches, an untagged pattern carries the section's
+  `priority`, and a line matching several takes the highest; with nothing
+  configured a match has no priority -- the system is off by default, as decided
+  in #9. A matching line that also matches an exclude is dropped and counted
+  (one DEBUG line per file) but stays in the stream as context for a
+  neighbouring match: an exclude means "do not alert on this", not "never show
+  this". Context follows `grep -n -C` as measured natively: `n` lines either
+  side, windows that touch or overlap merge, a stretch of omitted lines is a
+  `--` gap (even under `-c 0`), and the lines before a run's first match may lie
+  before the saved position -- the source is asked for exactly the missing ones,
+  once, through a second handle that is checked against the identity the run saw
+  and answers nothing, with one WARNING, when the file is gone or unreadable (a
+  rotation between the open and the first match would otherwise hand the NEW
+  file's lines over as the old one's context). Line numbers are the file's, as
+  `grep -n` shows them: the reader counts them, the count rides in the state
+  file as an optional `line` field (the one addition to #7's layout; a state
+  file without it is counted once at first sight, at DEBUG, and never again),
+  and the fragments of a line the 2000-byte cap split share the number. ⭐ A
+  physical line is matched WHOLE, its fragments joined up to `MAX_FRAGMENTS` (8,
+  16 KB of a line): per-fragment matching had an anchored `^kernel: .*oom`
+  firing on a tail fragment and a literal the cap split never matching. ⭐
+  Context never crosses files, now pinned rather than asserted: after a rotation
+  the stream spans the archive's tail and the live file, and the before-window
+  was carrying the archive's last lines into the live file's first match -- a
+  change of physical file empties both windows and is a gap, and the pre-offset
+  hook serves only the file the stream started in. A report is bounded (`cap`):
+  past it nothing more is stored, only counted, so a first run from the top of a
+  large log cannot hold the whole log in memory, and the priority is tracked as
+  the matches arrive. The section's `context` (else the command line's `-c`) is
+  wired by the run loop in #12 and `max_lines` applied by the report in #10;
+  this entry is the matching alone. ⭐ Three review lenses (the byte arithmetic
+  against `grep`, spec fidelity of the line count, mutation of the new tests)
+  also reproduced the priority rule demoting a `high` section line matched by a
+  `[low]` pattern, a vanished archive turning a match into a traceback, and the
+  hook answering from an archive that had yielded nothing -- fixed and pinned,
+  with the reviewer's tests that named their mutations merged into the suite.
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main

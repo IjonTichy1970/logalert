@@ -80,6 +80,7 @@ def _stream_errors() -> tuple[type[Exception], ...]:
 
 
 STREAM_ERRORS: tuple[type[Exception], ...] = _stream_errors()
+_HOOK_ERRORS: tuple[type[Exception], ...] = (OSError, *STREAM_ERRORS)
 
 Verdict = Literal["first-sight", "continue", "rotated", "truncated"]
 # what open(), gzip.open(), bz2.open() and lzma.open() have in common, per typeshed
@@ -220,15 +221,22 @@ def identify(saved: Cursor | None, ino: int, dev: int, size: int | None,
 class Line:
     text: str
     cut: bool  # longer than LINE_CAP and cut there; the rest follows as further lines
+    number: int  # the physical line's number in the file (1-based); fragments share it
+    path: str = ""  # the physical file it was read from (an archive, after a rotation)
 
 
 class LineReader:
-    """Complete lines from ``offset``; ``offset`` tracks the end of the last one yielded."""
+    """Complete lines from ``offset``; ``offset`` tracks the end of the last one yielded and
+    ``line`` the number of complete lines before it (``start_line`` is that count at
+    ``offset``), so every Line carries the number the file would show in ``grep -n``."""
 
-    def __init__(self, handle: BinaryStream, offset: int, cap: int = LINE_CAP) -> None:
+    def __init__(self, handle: BinaryStream, offset: int, cap: int = LINE_CAP,
+                 start_line: int = 0, path: str = "") -> None:
         self.handle = handle
         self.offset = offset
         self.cap = cap
+        self.line = start_line
+        self.path = path
         self.nul_bytes = 0  # NUL bytes skipped at line starts (a copytruncate hole)
         handle.seek(offset)
 
@@ -265,6 +273,9 @@ class LineReader:
                     break
                 self.offset += hole + len(raw) + (0 if cut else 1)
                 self.nul_bytes += hole
+                number = self.line + 1  # a fragment is still part of this physical line
+                if not cut:
+                    self.line += 1
                 if raw.endswith(b"\r"):
                     raw = raw[:-1]
                 nul_only = bool(hole) and not raw
@@ -272,7 +283,7 @@ class LineReader:
                 line_start = not cut
                 if nul_only:
                     continue  # a line of nothing but the hole
-                yield Line(raw.decode("utf-8", errors="replace"), cut)
+                yield Line(raw.decode("utf-8", errors="replace"), cut, number, self.path)
             # read1, not read: on a cut archive read() raises before handing over the bytes
             # it did decompress, read1 hands them over first (measured for gz, bz2, xz)
             chunk = self.handle.read1(_CHUNK)
@@ -305,7 +316,9 @@ class LogFile:
                                                self.fingerprint)
             self.skipped = 0  # bytes passed over on first sight
             self.start = self._start_offset(from_start)
-            self.reader = LineReader(self.handle, self.start)
+            self.start_line = self._start_line()
+            self.reader = LineReader(self.handle, self.start, start_line=self.start_line,
+                                     path=path)
         except STREAM_ERRORS as exc:
             self.handle.close()
             raise OSError(f"{path}: incomplete or corrupt compressed stream ({exc})") from exc
@@ -333,6 +346,36 @@ class LogFile:
                     return 0
             return offset
         return 0  # rotated / truncated: the live file from the top (the copy is issue #8)
+
+    def _start_line(self) -> int:
+        """The complete lines before ``start``: 0 from the top, the cursor's count when it
+        has one, and otherwise -- first sight at the end, or a state file from before the
+        count existed -- one pass over the bytes before the start, once."""
+        if self.start == 0:
+            return 0
+        if self.verdict == "continue" and self.saved is not None and self.saved.line is not None:
+            return self.saved.line
+        counted = count_newlines(self.handle, self.start)
+        log.debug("[%s] %s: counted %d lines before offset %d (once)", self.section, self.path,
+                  counted, self.start)
+        return counted
+
+    def context_before(self, n: int) -> list[Line]:
+        """The last ``n`` complete lines before the start offset, numbered as the file numbers
+        them -- the context a match early in a run would otherwise lack. A second handle, so
+        the reader's buffer is never disturbed; the read is bounded (see ``lines_before``)."""
+        if n <= 0 or self.start == 0:
+            return []
+        try:
+            with open_log(self.path) as handle:
+                st = os.fstat(handle.fileno())
+                if (st.st_ino, st.st_dev) != (self.ino, self.dev):
+                    return []  # rotated under us since the open: not this file's lines
+                return lines_before(handle, self.start, n, self.start_line, self.path)
+        except _HOOK_ERRORS as exc:
+            log.warning("[%s] %s: context before the saved position could not be read (%s)",
+                        self.section, self.path, exc)
+            return []
 
     def _log(self) -> None:
         where = f"[{self.section}] {self.path}"
@@ -367,7 +410,7 @@ class LogFile:
     def cursor(self, now: datetime | None = None) -> Cursor:
         return Cursor(offset=self.reader.offset, ino=self.ino, dev=self.dev,
                       fingerprint=self.fingerprint, realpath=self.realpath,
-                      last_seen=timestamp(now))
+                      last_seen=timestamp(now), line=self.reader.line)
 
     def close(self) -> None:
         self.handle.close()
@@ -387,6 +430,59 @@ def open_log_file(section: str, path: str, saved: Cursor | None, *,
     except FileNotFoundError:
         log.debug("[%s] %s: absent this run", section, path)
         return None
+
+
+def count_newlines(handle: BinaryStream, end: int) -> int:
+    """The complete lines in ``[0, end)``: one pass, chunked. Leaves the position at 0."""
+    handle.seek(0)
+    count = 0
+    remaining = end
+    while remaining > 0:
+        chunk = _read_up_to(handle, min(_CHUNK, remaining))
+        if not chunk:
+            break
+        count += chunk.count(b"\n")
+        remaining -= len(chunk)
+    handle.seek(0)
+    return count
+
+
+def lines_before(handle: BinaryStream, offset: int, n: int, line: int,
+                 path: str = "") -> list[Line]:
+    """The last ``n`` complete lines ending at ``offset`` (a line boundary), numbered so that
+    the last of them is line ``line``. One read of the ``n * (LINE_CAP + 1) + _CHUNK`` bytes
+    before the offset -- a single seek, which on a compressed stream is one decompression
+    up to that point. Lines over the cap are cut as the reader cuts them; NUL-only lines are
+    counted but not returned, as the reader skips them."""
+    if n <= 0 or offset <= 0:
+        return []
+    start = max(0, offset - (n * (LINE_CAP + 1) + _CHUNK))
+    handle.seek(max(0, start - 1))  # one byte more: it says whether the window starts a line
+    buf = _read_up_to(handle, offset - max(0, start - 1))
+    handle.seek(0)
+    if start > 0:
+        # the window's first line is complete only if the byte before it is a newline;
+        # otherwise it is the tail of a line that began earlier, and is dropped
+        complete = buf[:1] == b"\n"
+        buf = buf[1:]
+        parts = buf.split(b"\n")[:-1]
+        if not complete:
+            parts = parts[1:]
+    else:
+        parts = buf.split(b"\n")[:-1]  # the last element is the empty string after the boundary
+    numbered: list[Line] = []
+    number = line
+    for raw in reversed(parts[-n:]):
+        if raw.endswith(b"\r"):
+            raw = raw[:-1]
+        text = raw.lstrip(NUL)
+        if text or not raw:
+            cut = len(text) > LINE_CAP
+            numbered.append(Line(text[:LINE_CAP].decode("utf-8", errors="replace"), cut, number,
+                                 path))
+        number -= 1
+    numbered.reverse()
+    return numbered
 
 
 def _end_of_last_line(handle: BinaryStream) -> int:

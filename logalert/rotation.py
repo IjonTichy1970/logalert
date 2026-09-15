@@ -72,7 +72,9 @@ from logalert.cursor import (
     LogFile,
     Verdict,
     compressed_suffix,
+    count_newlines,
     fingerprint,
+    lines_before,
     open_log,
 )
 from logalert.state import Cursor, parse_timestamp, timestamp
@@ -393,17 +395,20 @@ class Segment:
     """One archive read from ``start``; ``offset`` is where the read ended."""
 
     def __init__(self, section: str, path: str, start: int,
-                 expected: tuple[int, int] | None) -> None:
+                 expected: tuple[int, int] | None, start_line: int | None = 0) -> None:
         self.section = section
         self.path = path
         self.start = start
         self.expected = expected  # the (ino, dev) the plan saw; a rename since is skipped
+        self.start_line = start_line  # None: not counted yet (a cursor from before #9)
+        self.line = start_line or 0
         self.offset = start
         self.ino = 0
         self.dev = 0
         self.fingerprint: str | None = None
         self.started = False
         self.finished = False
+        self.yielded = False  # at least one line came out of it
         self.handle: BinaryStream | None = None
 
     def lines(self) -> Iterator[Line]:
@@ -419,11 +424,16 @@ class Segment:
                     return
                 self.ino, self.dev = st.st_ino, st.st_dev
                 self.fingerprint = fingerprint(handle)
-                reader = LineReader(handle, self.start)
+                if self.start_line is None:
+                    self.start_line = count_newlines(handle, self.start)
+                    self.line = self.start_line
+                reader = LineReader(handle, self.start, start_line=self.start_line,
+                                    path=self.path)
                 for line in reader:
-                    self.offset = reader.offset
+                    self.offset, self.line = reader.offset, reader.line
+                    self.yielded = True
                     yield line
-                self.offset = reader.offset
+                self.offset, self.line = reader.offset, reader.line
                 if reader.nul_bytes:
                     log.info("[%s] %s: skipped %d NUL bytes", self.section, self.path,
                              reader.nul_bytes)
@@ -438,7 +448,25 @@ class Segment:
 
     def cursor(self, now: datetime | None = None) -> Cursor:
         return Cursor(offset=self.offset, ino=self.ino, dev=self.dev, fingerprint=self.fingerprint,
-                      realpath=os.path.realpath(self.path), last_seen=timestamp(now))
+                      realpath=os.path.realpath(self.path), last_seen=timestamp(now),
+                      line=self.line)
+
+    def context_before(self, n: int) -> list[Line]:
+        """The lines before ``start`` in this archive, numbered; see ``LogFile``."""
+        if n <= 0 or self.start == 0:
+            return []
+        try:
+            with open_log(self.path) as handle:
+                st = os.fstat(handle.fileno())
+                if self.expected is not None and (st.st_ino, st.st_dev) != self.expected:
+                    return []  # renamed under us: not this archive any more
+                # lines() ran before any hook can be asked (CatchUpSource's yielded gate),
+                # so the count is known
+                return lines_before(handle, self.start, n, self.start_line or 0, self.path)
+        except _READ_ERRORS as exc:
+            log.warning("[%s] %s: context before the saved position could not be read (%s)",
+                        self.section, self.path, exc)
+            return []
 
 
 class CatchUpSource:
@@ -462,8 +490,20 @@ class CatchUpSource:
         self.segments: list[Segment] = []
         if plan.match is not None:
             self.segments.append(Segment(section, plan.match.path, saved.offset,
-                                         (plan.match.ino, plan.match.dev)))
+                                         (plan.match.ino, plan.match.dev), saved.line))
             self.segments += [Segment(section, a.path, 0, (a.ino, a.dev)) for a in plan.chain]
+
+    def context_before(self, n: int) -> list[Line]:
+        """The lines before the stream's first line: those before the saved offset in the
+        matched archive, when that is where the stream started. Context never crosses
+        files, so a chain member or the live file after a rotation (both read from 0) has
+        none -- and an archive tail that yielded nothing was not the stream's first file."""
+        if self.segments:
+            first = self.segments[0]
+            return first.context_before(n) if first.yielded else []
+        if self.live is not None:
+            return self.live.context_before(n)
+        return []
 
     def lines(self) -> Iterator[Line]:
         for segment in self.segments:

@@ -16,6 +16,8 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
   * An entry unseen for ``state_ttl`` days expires; ``touch`` records a sighting even when the
     section's mail failed, so a file that is present never expires.
   * ``version`` is the schema version. A file from a newer logalert is refused, not guessed at.
+    A cursor's ``line`` (the complete lines before ``offset``, so a report can number lines
+    as the file does) is optional: a file without it is read, counted once, and updated.
   * A run as root against a state file another user owns is refused up front: ``mkstemp``
     plus ``os.replace`` would hand the file to root, and that user's next cron run could
     not read it. The remedy is named (``sudo -u <owner>``), never applied by chown.
@@ -53,6 +55,7 @@ class Cursor:
     fingerprint: str | None  # sha256 of the first complete line; None until the file has one
     realpath: str
     last_seen: str  # ISO 8601 UTC, seconds; the last run that found the file present
+    line: int | None = None  # complete lines before offset; None in a file from before #9
 
 
 def timestamp(now: datetime | None = None) -> str:
@@ -198,12 +201,13 @@ def _cursor(fields: dict[str, Any], corrupt: Any, where: str) -> Cursor:
     offset, ino, dev = integer("offset", _MAX_OFFSET), integer("ino"), integer("dev")
     fp, realpath = text("fingerprint", optional=True), text("realpath")
     last_seen = text("last_seen")
+    line = integer("line", _MAX_OFFSET) if fields.get("line") is not None else None
     try:
         parse_timestamp(last_seen)
     except ValueError:
         raise corrupt(f"entries{where}: 'last_seen' is not a UTC timestamp") from None
     return Cursor(offset=offset, ino=ino, dev=dev, fingerprint=fp, realpath=realpath,
-                  last_seen=last_seen)
+                  last_seen=last_seen, line=line)
 
 
 def check_state_dir(state_file: str) -> None:

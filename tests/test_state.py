@@ -56,7 +56,8 @@ def test_round_trip_and_the_on_disk_shape(tmp_path: Path) -> None:
     assert data["version"] == STATE_VERSION
     entry = data["entries"]["router-disk"]["/var/log/router.log"]
     assert entry == {"offset": 10, "ino": 1234, "dev": 56, "fingerprint": "ab" * 32,
-                     "realpath": "/var/log/r.log", "last_seen": "2026-09-14T12:00:00Z"}
+                     "realpath": "/var/log/r.log", "last_seen": "2026-09-14T12:00:00Z",
+                     "line": None}
     assert data["entries"]["firewall"]["/var/log/router.log"]["fingerprint"] is None
     again = load_state(path)
     assert again.entries == state.entries
@@ -373,3 +374,27 @@ def test_foreign_owner_is_only_root_against_another_uid(
             assert _foreign_owner(str(path)) in ("nobody", "nogroup", "#65534")
             with pytest.raises(StateError, match="belongs to"):
                 check_state_dir(str(path))
+
+
+# -- the line count (#9) --------------------------------------------------------------------------
+
+
+def test_the_line_count_round_trips_through_the_state_file(tmp_path: Path) -> None:
+    path = str(tmp_path / "state.json")
+    state = State(path)
+    cursor = Cursor(offset=10, ino=1, dev=2, fingerprint=None, realpath="/var/log/r.log",
+                    last_seen="2026-09-14T12:00:00Z", line=7)
+    state.set("s", "/var/log/r.log", cursor)
+    state.save()
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert data["entries"]["s"]["/var/log/r.log"]["line"] == 7
+    assert load_state(path).get("s", "/var/log/r.log") == cursor
+@pytest.mark.parametrize("bad", ["-1", "true", '"3"', "1.5"])
+def test_a_bad_line_count_is_a_hard_error(tmp_path: Path, bad: str) -> None:
+    path = tmp_path / "state.json"
+    text = ('{"version": 1, "entries": {"a": {"/x": {"offset": 1, "ino": 2, "dev": 3, '
+            '"fingerprint": null, "realpath": "/x", "last_seen": "2026-09-14T12:00:00Z", '
+            '"line": BAD}}}}').replace("BAD", bad)
+    path.write_text(text, encoding="utf-8", newline="\n")
+    with pytest.raises(StateError, match="'line' is not a non-negative integer"):
+        load_state(str(path))
