@@ -573,9 +573,10 @@ def _sendmail_note(path: str) -> str:
     return "NOT FOUND -- install an MTA or set transport = smtp"
 
 
-def describe(config: Config, sender: str | None = None) -> str:
+def describe(config: Config, sender: str | None = None, state_file: str | None = None) -> str:
     """The effective settings, one ASCII line each, for ``--check-config``; ``sender`` is
-    ``--from``, which wins over ``from =`` for the run it is given to."""
+    ``--from`` and ``state_file`` is ``--state-file``, each of which wins over the config
+    for the run it is given to."""
     settings = config.settings
     out: list[str] = [f"config: {config.path}"]
     if settings.transport == "auto":
@@ -599,7 +600,10 @@ def describe(config: Config, sender: str | None = None) -> str:
         warning = from_warning(address)
     if warning:
         out.append(f"warning: {warning}")
-    out.append(f"state_file: {settings.state_file}")
+    if state_file is not None and state_file != settings.state_file:
+        out.append(f"state_file: {state_file} (--state-file)")
+    else:
+        out.append(f"state_file: {settings.state_file}")
     out.append(f"log: {settings.log}")
     out.append(f"mail_timeout: {settings.mail_timeout:g}s; lock_stale: {settings.lock_stale}s; "
                f"state_ttl: {settings.state_ttl_days} days; "

@@ -24,6 +24,7 @@ from typing import Any
 
 import pytest
 from esmtp_stub import StubConfig, run_stub  # tests/ has no __init__: the rootdir import
+from fake_sendmail import install
 
 import logalert.config
 import logalert.transport
@@ -57,19 +58,8 @@ MISSING = "/nonexistent/sbin/sendmail" if sys.platform != "win32" else "C:/nonex
 
 
 def fake_mta(tmp_path: Path) -> Path:
-    """The fake as a binary ``sendmail_path`` can name: a ``.cmd`` wrapper on Windows, a
-    copy with the interpreter's shebang and mode 0755 on POSIX (both measured to pass argv
-    and stdin through unchanged)."""
-    if sys.platform == "win32":
-        wrapper = tmp_path / "sendmail.cmd"
-        wrapper.write_text(f'@"{sys.executable}" "{FAKE}" %*' + NL, encoding="ascii",
-                           newline=chr(13) + chr(10))
-    else:
-        wrapper = tmp_path / "sendmail"
-        wrapper.write_text(f"#!{sys.executable}" + NL + FAKE.read_text(encoding="utf-8"),
-                           encoding="utf-8", newline=NL)
-        wrapper.chmod(0o755)
-    return wrapper
+    """The fake as a binary ``sendmail_path`` can name (see fake_sendmail.install)."""
+    return install(tmp_path)
 
 
 def make_config(tmp_path: Path, settings: str = "", to: str = "noc@example.net") -> Config:

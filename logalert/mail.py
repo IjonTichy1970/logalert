@@ -29,7 +29,8 @@ the bytes over and ``logalert.__main__`` (issue #12) decides when. The rules (de
     matching lines per email, each with its context, then ``... and N more matching line(s)``.
   * Sanitised before composition: a lone surrogate becomes ``?`` (``set_content`` raises on
     one), CR is removed (a bare CR is a line break to the encoder), every other C0 control
-    except TAB, and DEL, become U+FFFD (a NUL rides through ``7bit`` to the relay otherwise).
+    except TAB, DEL and the C1 range (a raw CSI is live on a terminal that honours C1)
+    become U+FFFD (a NUL rides through ``7bit`` to the relay otherwise).
     A header value further folds TAB and every line boundary ``str.splitlines()`` knows into
     a space: the loader forbids CR and LF there, but NEL, LS and PS pass it as one line and
     are exactly what ``EmailMessage`` refuses (measured: a ``ValueError`` on every run for
@@ -80,9 +81,11 @@ NL = chr(10)
 _CR = chr(13)
 _TAB = chr(9)
 _REPLACEMENT = chr(0xFFFD)
-# C0 controls other than TAB and LF, and DEL; built from code points (gated code is ASCII)
+# C0 controls other than TAB and LF, DEL, and the C1 range (a CSI a terminal honours)
+# except NEL, which is a line boundary clean_header folds; built from code points
+# (gated code is ASCII)
 _CONTROLS = re.compile("[" + "".join(chr(c) for c in range(0x20) if c not in (9, 10))
-                       + chr(0x7F) + "]")
+                       + "".join(chr(c) for c in range(0x7F, 0xA0) if c != 0x85) + "]")
 _UNSAFE_IN_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 _NAME_CAP = 40  # of the section's characters: the name must fit one Content-Disposition line
 #                 (measured: at 48 the stdlib folds it into RFC 2231 continuations)

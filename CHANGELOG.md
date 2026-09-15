@@ -437,4 +437,130 @@ new entry.
   `/var/log/mail.log`, a wrapper that `setsid`s itself, the per-operation SMTP
   timeout.
 
+- `[contract]` **The run: every section read, one message per section that
+  matched, the state moved after each section, nothing said on exit 0** (#12).
+  `logalert/run.py` is the single home of the run's rules;
+  `logalert/__main__.py` parses the command line and dispatches there. A bare
+  `logalert` IS the run now (the #1 test that a bare invocation prints the help
+  is retired -- the help is `--help` -- and a missing config is exit 2 with
+  `logalert: <path>: config file not found or not readable`). The order, each
+  step before anything irreversible: the transport and the effective From are
+  settled first (a configuration error is exit 2 with its own line before a file
+  is read); then, unless `--dry-run`, the state directory (#7's
+  `check_state_dir`) BEFORE the lock -- ⭐ the map had the lock first, and the
+  review reproduced as `nobody` and as root what that costs: a root run refused
+  for another user's state had already created a root-owned `lock`, so the
+  remedy the refusal names (`sudo -u <user> logalert ...`) then failed forever
+  on that lock, and a missing directory arrived as the lock's raw ENOENT instead
+  of `does not exist -- create it, owned by the user logalert runs as`; then the
+  lock (a holder younger than `lock_stale` is exit 0 with an INFO line, `another
+  run (PID N) has held the lock <path> for Ns; this run exits quietly` -- cron
+  overlap is normal -- and an older one exit 1, named as `stale lock: ...`; a
+  lock file that cannot be opened is `state directory: <reason> (<lock>) -- the
+  lock file must belong to the user logalert runs as`); then the state file (a
+  corrupt one is exit 1 naming `--reset-state`, nothing read) and the expiry of
+  entries unseen for `state_ttl` days, each logged as `forgotten` (`would be
+  forgotten` under `-n`). Then per section, in file order: a file that cannot be
+  opened is a failed item (`[section] <path>: <reason>`), its cursor stays and
+  the section continues; a file absent this run is nothing to do (cursor and
+  `last_seen` stay, so it expires in time; a configured file never seen is exit
+  0 with a DEBUG line); each source read is scanned with the section's `context`
+  (else `-c N`) and its `max_lines`, its cursor taken after the read, and logged
+  as `[section] <path>: N line(s) read, M matched`; a first sight starts at the
+  end unless `--from-start` or `start = beginning`. Nothing matched: the cursors
+  move. Anything matched: ONE message composed (#10) and delivered (#11).
+  Accepted: the cursors move (🔶 a partial refusal is accepted -- the recipient
+  who got it must not get it twice -- with each refused recipient a failed item,
+  `[section] refused: <recipient> -- <reply>`). Refused: `[section] <the
+  transport's answer>` is the failed item, logged at ERROR with the Message-ID,
+  and the files that contributed to the message keep their place so the re-run
+  re-sends them -- ⭐ while a file that was read and matched nothing moves
+  anyway: the map's rule was "touch every file read", `touch` is a no-op for a
+  file with no entry, so a file at its first sight in a section whose delivery
+  failed (any file added to the section that run, every file under
+  `--from-start`) was first-sighted AGAIN next run and skipped to its new end,
+  every line written in between silently lost, against #8's owner criterion;
+  none of a zero-match file's lines is in the message (the summary still names
+  it, `<file> -- no match in N line(s) read`), and context never crosses files,
+  so its cursor is safe to move. Every file read is `touch`ed so it never
+  expires while its mail keeps failing. The state is saved after EACH section,
+  never once at the end; a save that fails is `[section] state not saved:
+  <reason>` and, when the mail went out, an ERROR line saying the next run
+  re-sends it unless a later save in this run succeeds. Exit codes: 0 ran and
+  wrote NOTHING to stdout or stderr -- cron mails every byte -- matches
+  included, a match being the normal outcome; 1 with exactly one stderr line
+  naming every failed item, `logalert: 2 of 3 sections sent; failed:
+  [router-disk] sendmail exit 75 (EX_TEMPFAIL); see the log` (the count clause
+  only when some section had something to send, `section` singular for one,
+  `would be sent` under `-n`; header-clean, so a relay's or a file name's
+  control characters cannot forge a second line); 2 a usage or configuration
+  error, argparse's own included, nothing ran; 130 on Ctrl-C, one line
+  `logalert: interrupted` instead of a traceback, the lock released. The
+  options, all of them the run's: `-c/--context N` (like `grep -C`, for sections
+  that set no `context` of their own; a negative N is exit 2), `--attach` (every
+  report as an attachment this run, whatever the sections say), `--from-start`,
+  `-n/--dry-run` (reads and matches, prints each message that would be sent to
+  stdout as `Mail.preview()` renders it, takes no lock, needs no writable
+  directory, writes nothing; exit 0 or 1 by the same rule), `-d/--debug` (the
+  activity log at DEBUG on stderr for this call only, every record one
+  header-clean line -- breaking cron-quiet on purpose), `--state-file PATH`
+  (absolute; wins over `state_file =` in every mode: the run, `--reset-state`,
+  and `--check-config`, which prints `state_file: PATH (--state-file)`), and
+  `--from ADDR` from #11. ⭐ The run-only flags refuse the modes: `-n
+  --reset-state` wiped the state under a flag whose help promised to leave it
+  untouched, and `-n --test-mail` sent a real message; `-n`, `--attach`,
+  `--from-start` and `-c` with `--check-config`, `--reset-state` or
+  `--test-mail` are argparse's exit 2 now; and `--reset-state` reset the
+  configured file while `--state-file` kept its cursors (it takes the override
+  now). A `state_file` that is the config file itself is refused for every mode,
+  exit 2 (`state_file: <path> is the config file itself` -- `--reset-state`'s
+  replace-an-unparseable-file escape hatch would have overwritten the config); a
+  directory or any other non-regular file is exit 1 (`state file <path> is not a
+  regular file`); nothing is created either way. What root may not do, one step
+  earlier than #7 drew it: the lock is opened with `O_NOFOLLOW` (⭐ a `lock`
+  symlink planted in a directory another user owns was truncated and written
+  through by a root run -- reproduced), and when the state file does not exist
+  yet #7's foreign-owner rule applies to the state DIRECTORY, so a root first
+  run into the cron user's empty directory is refused (`state directory <dir>
+  belongs to <user>; a run as root would leave the state and the lock root-owned
+  and unusable by that user -- run as that user instead: sudo -u <user> logalert
+  ...`) instead of leaving root-owned state and lock there; on Windows a
+  read-only state file is refused up front (`state file <path> is read-only --
+  nothing was sent`: the directory probe passed, the mail went out, the save
+  failed, the next run double-sent). The activity log, on the `logalert.*`
+  loggers (the library's `NullHandler` swallows it until #13 wires `log =` and
+  `--log DEST`, which move there): the start line (config path, section count,
+  `(dry run)`) first of all and `end: exit N` last on every exit the run returns
+  (0, 1 and 2 -- the transport or From configuration error and a fresh lock
+  holder included; a killed run, Ctrl-C's 130 among them, leaves no end line) --
+  every failed item once at ERROR where it is collected, every expired entry,
+  per file the lines read and matched, per section the delivery or the failure
+  with the transport's answer and the Message-ID; ⭐ before the review a failed
+  delivery, a stale lock, an unwritable directory and a corrupt state left no
+  WARNING-or-above record at all. Also from the review's 27 reproduced findings
+  (four lenses, 39 shapes across both hosts, two real processes racing on the
+  lock and a run killed mid-delivery among them; #14's service-user rehearsal
+  run in the sandbox as `nobody` -- the state file lands `0600` from `mkstemp`,
+  the lock `0644`, exit 0 with 0 bytes on both streams): `clean_text` now folds
+  the C1 range too (a raw CSI is live on a terminal that honours C1; NEL stays
+  the boundary `clean_header` folds), and an OSError from our own `open_log` no
+  longer repeats the path. Five judgment-level findings were refuted by two
+  skeptics each and stand as designed: a configured file absent and never seen
+  is exit 0 (nothing to do); the loader's unknown-key warnings are
+  `--check-config`'s, not the run's; a file listed twice in one section is read
+  twice (the loader's rule, noted since #10); an unexpected exception inside a
+  section propagates with its traceback (a bug must be loud; the `finally`
+  releases the lock). `tests/test_run.py` (52 tests, the reviewers' 17 merged;
+  three POSIX-only, two of those also skipped in the root sandbox, one
+  Windows-only) drives the run end to end through a two-section config and the
+  fake sendmail, which now records every call in order (`call-NNNN-argv.json`,
+  `call-NNNN-stdin.bin`) and can fail for one recipient
+  (`LOGALERT_FAKE_EXIT_IF_RCPT`) so that one section of a run fails; 37
+  deliberate mutations, 36 reddened on Windows and the 37th (the directory-owner
+  rule) pinned by a POSIX-only test. Noted for #13: the record set above is what
+  its destinations carry, and `__main__`'s one-line formatter is the shape every
+  destination should use; for #15/#16: the exit-code table, the line shape, `-n`
+  semantics, `--from-start` on first sight only, `--state-file` absolute, the
+  lock's two verdicts, expiry.
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main

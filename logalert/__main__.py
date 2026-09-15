@@ -1,8 +1,11 @@
 """Command-line entry point for logalert."""
 
 import argparse
+import contextlib
+import logging
 import os
 import sys
+from collections.abc import Iterator
 
 from logalert import __version__
 from logalert.config import (
@@ -15,7 +18,8 @@ from logalert.config import (
     load_config,
 )
 from logalert.lock import LockBusy, RunLock
-from logalert.mail import compose_test
+from logalert.mail import clean_header, compose_test
+from logalert.run import Options, run
 from logalert.state import (
     RESET_HINT,
     State,
@@ -51,6 +55,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--from", dest="sender", default=None, metavar="ADDR",
         help="the From address for this run, a bare local@domain (default: from = in the "
         "config, else the user logalert runs as at this host)",
+    )
+    parser.add_argument(
+        "-c", "--context", type=int, default=0, metavar="N",
+        help="lines of context around each match, like grep -C, for sections that set no "
+        "context of their own (default: 0)",
+    )
+    parser.add_argument(
+        "--attach", action="store_true",
+        help="send every report as an attachment this run, whatever the sections say",
+    )
+    parser.add_argument(
+        "--from-start", action="store_true",
+        help="read a file seen for the first time from its beginning instead of its end",
+    )
+    parser.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="read and match, print the messages that would be sent, send nothing, and "
+        "leave the state untouched",
+    )
+    parser.add_argument(
+        "-d", "--debug", action="store_true",
+        help="write the activity log at DEBUG level to stderr as well",
+    )
+    parser.add_argument(
+        "--state-file", default=None, metavar="PATH",
+        help="use this state file for the run instead of the configured one",
     )
     # The "do this and exit" modes exclude one another; a silent precedence would
     # let `--check-config --reset-state` validate and exit 0 without resetting anything.
@@ -91,32 +121,86 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
     if args.sender is not None and not is_address(args.sender):
         parser.error(f"--from: {args.sender!r} is not a bare local@domain address")
-
-    if args.check_config or args.reset_state is not None or args.test_mail is not None:
-        try:
-            config = load_config(args.config)
-        except ConfigError as exc:
-            print(f"logalert: {exc}", file=sys.stderr)
-            return EXIT_USAGE
+    if args.context < 0:
+        parser.error(f"-c: {args.context} is not a number of lines")
+    if args.state_file is not None and not os.path.isabs(args.state_file):
+        parser.error(f"--state-file: {args.state_file!r} is not an absolute path")
+    mode = args.check_config or args.reset_state is not None or args.test_mail is not None
+    if mode and (args.dry_run or args.attach or args.from_start or args.context):
+        # a mode that ignored -n would reset state or send a test mail under a flag that
+        # promised neither
+        parser.error("-n/--attach/--from-start/-c apply to the run, not to --check-config, "
+                     "--reset-state or --test-mail")
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        print(f"logalert: {clean_header(str(exc))}", file=sys.stderr)
+        return EXIT_USAGE
+    state_file = args.state_file or config.settings.state_file
+    if _same_file(state_file, config.path):
+        # --reset-state's replace-an-unparseable-file escape hatch would overwrite the config
+        print(f"logalert: state_file: {state_file} is the config file itself", file=sys.stderr)
+        return EXIT_USAGE
+    with _debug_to_stderr(args.debug):
         if args.check_config:
-            print(describe(config, args.sender))
+            print(describe(config, args.sender, state_file))
             try:
                 choose(config.settings)  # auto with no sendmail is a configuration error
                 resolve_sender(config.settings, args.sender)  # a From the run would refuse
             except ConfigError as exc:
-                print(f"logalert: {exc}", file=sys.stderr)
+                print(f"logalert: {clean_header(str(exc))}", file=sys.stderr)
                 return EXIT_USAGE
             return EXIT_OK
         if args.test_mail is not None:
             return test_mail(config, args.test_mail, args.sender)
-        if args.reset_state != RESET_ALL and not os.path.isabs(args.reset_state):
-            # a cursor is keyed by the absolute path the config spells: this can never match
-            parser.error(f"--reset-state: {args.reset_state!r} is not an absolute path")
-        return reset_state(config, args.reset_state)
+        if args.reset_state is not None:
+            if args.reset_state != RESET_ALL and not os.path.isabs(args.reset_state):
+                # a cursor is keyed by the absolute path the config spells: no match ever
+                parser.error(f"--reset-state: {args.reset_state!r} is not an absolute path")
+            return reset_state(config, args.reset_state, state_file)
+        try:
+            return run(config, Options(context=args.context, sender=args.sender,
+                                       attach=args.attach, from_start=args.from_start,
+                                       dry_run=args.dry_run, state_file=args.state_file))
+        except KeyboardInterrupt:
+            print("logalert: interrupted", file=sys.stderr)
+            return 130  # the shell's convention for SIGINT; the lock was released
 
-    # The run itself arrives with the orchestration issue; until then, be helpful.
-    parser.print_help()
-    return EXIT_OK
+
+def _same_file(a: str, b: str) -> bool:
+    """Whether two paths name one existing file; a path that cannot be stat-ed is not."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+class _OneLine(logging.Formatter):
+    """A record as one header-clean line: a section or file name from the config, an
+    archive name from a watched directory or a relay's reply may carry control characters
+    and line boundaries, and stderr is read line by line."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return clean_header(super().format(record))
+
+
+@contextlib.contextmanager
+def _debug_to_stderr(enabled: bool) -> Iterator[None]:
+    """``--debug``: the activity log at DEBUG on stderr for this call only, so a process
+    that calls ``main()`` more than once does not accumulate handlers."""
+    if not enabled:
+        yield
+        return
+    logger = logging.getLogger("logalert")
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_OneLine("logalert: %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(logging.NOTSET)
 
 
 def test_mail(config: Config, section: str, override: str | None) -> int:
@@ -151,10 +235,10 @@ def test_mail(config: Config, section: str, override: str | None) -> int:
     return EXIT_ATTENTION if delivery.refused else EXIT_OK
 
 
-def reset_state(config: Config, target: str) -> int:
-    """``--reset-state``: forget the cursors for one file, or all of them, under the lock."""
+def reset_state(config: Config, target: str, path: str) -> int:
+    """``--reset-state``: forget the cursors for one file, or all of them, under the lock;
+    ``path`` is the effective state file (``--state-file`` wins over the config)."""
     settings = config.settings
-    path = settings.state_file
     try:
         os.stat(path)  # not os.path.exists: that reads a permission problem as absence
     except (FileNotFoundError, NotADirectoryError):

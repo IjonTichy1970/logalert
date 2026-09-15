@@ -317,6 +317,8 @@ def test_clean_text_and_clean_header() -> None:
     assert clean_header("a" + NL + "b" + TAB + "c ") == "a b c"
     assert clean_header(" " + CR + " ") == ""
     assert clean_text("a" + LONE_SURROGATE) == "a?"
+    assert clean_text("a" + chr(0x9B) + "31m") == "a" + REPLACEMENT + "31m"  # a C1 CSI
+    assert clean_header("a" + chr(0x85) + "b") == "a b"  # NEL is a boundary, not a control
 
 
 def test_a_line_over_78_chars_goes_quoted_printable_and_a_short_one_7bit(tmp_path: Path) -> None:

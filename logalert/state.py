@@ -230,15 +230,28 @@ def check_state_dir(state_file: str) -> None:
                          f"would send everything again next time") from exc
     os.close(fd)
     os.unlink(temp)
+    if os.path.exists(state_file) and not os.path.isfile(state_file):
+        raise StateError(f"state file {state_file} is not a regular file")
+    if sys.platform == "win32" and os.path.isfile(state_file) and not os.access(
+            state_file, os.W_OK):
+        # the read-only attribute survives the directory probe and fails os.replace later
+        raise StateError(f"state file {state_file} is read-only -- nothing was sent")
     owner = _foreign_owner(state_file)
     if owner is not None:
-        raise StateError(f"state file {state_file} belongs to {owner}; a run as root would "
-                         f"leave it root-owned and unreadable by that user -- run as that "
-                         f"user instead: sudo -u {owner} logalert ...")
+        if os.path.exists(state_file):
+            raise StateError(f"state file {state_file} belongs to {owner}; a run as root "
+                             f"would leave it root-owned and unreadable by that user -- "
+                             f"run as that user instead: sudo -u {owner} logalert ...")
+        raise StateError(f"state directory {directory} belongs to {owner}; a run as root "
+                         f"would leave the state and the lock root-owned and unusable by "
+                         f"that user -- run as that user instead: sudo -u {owner} "
+                         f"logalert ...")
 
 
 def _foreign_owner(state_file: str) -> str | None:
-    """The owner of an existing state file, when we are root and it is not root's."""
+    """The owner of the state file -- or, before the first run, of its directory -- when we
+    are root and it is not root's: a root run into another user's directory would leave
+    root-owned state and a root-owned lock there, and follow whatever that user planted."""
     if sys.platform == "win32":
         return None
     else:  # mypy narrows the platform per branch, not past an early return
@@ -247,7 +260,7 @@ def _foreign_owner(state_file: str) -> str | None:
         try:
             uid = os.stat(state_file).st_uid
         except FileNotFoundError:
-            return None
+            uid = os.stat(os.path.dirname(state_file) or ".").st_uid
         if uid == 0:
             return None
         try:
