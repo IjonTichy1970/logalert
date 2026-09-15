@@ -40,6 +40,9 @@ logalert = "logalert.__main__:main"
 [tool.setuptools.packages.find]
 include = ["logalert*"]
 
+[tool.setuptools.package-data]
+"logalert.data" = ["*.example"]   # the shipped example config (`logalert --example-config`)
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100
