@@ -19,6 +19,9 @@ def config(tmp_path: Path) -> str:
     log = (tmp_path / "router.log").as_posix()
     text = (
         f"[logalert]\nstate_file = {(tmp_path / 'state' / 'state.json').as_posix()}\n"
+        # --check-config exits 2 without a usable transport since #11: the interpreter
+        # stands in for sendmail (exists, executable, on both platforms)
+        f"sendmail_path = {Path(sys.executable).as_posix()}\n"
         "[router-disk]\nsubject = Router disk failure\nto = noc@example.net\n"
         f"files = {log}\npatterns =\n    disk failure\n"
         "[firewall]\nsubject = Denies\nto = noc@example.net\n"

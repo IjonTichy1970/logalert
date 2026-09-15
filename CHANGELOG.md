@@ -334,4 +334,107 @@ new entry.
   summary, and nothing but `max_lines` x the context x `MAX_FRAGMENTS` x
   `LINE_CAP` bounds a mail's size (about 23 MB worst case at the defaults).
 
+- `[contract]` **Mail delivery: the sendmail pipe and SMTP with a timeout on
+  everything that can hang, the effective From, `--test-mail`** (#11).
+  `logalert/transport.py` is the single home of the transport rules; `deliver()`
+  hands a composed mail over and returns a `Delivery` (the recipients accepted,
+  those the server refused with its answer, the bytes handed over, the
+  transport's one-line answer) or raises `DeliveryError` whose message IS the
+  transport's answer -- a returned `Delivery` always means the message left the
+  box. `transport = auto` (the default) is sendmail when `sendmail_path` is a
+  regular, executable file, else a configuration error that says what to do:
+  `transport = auto but /usr/sbin/sendmail does not exist: install an MTA
+  (Ubuntu: apt install postfix, dma or msmtp-mta; FreeBSD 14+: dma is in base)
+  or set transport = smtp and smtp_host` (a fresh Ubuntu server image has no
+  sendmail at all; a directory or a non-executable file gets the same shape);
+  `--check-config` now exits 2 on it, and on a From the run would refuse, where
+  it used to print `NOT FOUND` and exit 0. The sendmail argv is `[sendmail_path,
+  "-i", "-f", <From>, <recipient>...]` with the message piped in as the exact LF
+  bytes, the child bounded by `mail_timeout` and, on POSIX, leading its own
+  process group so a `sudo`- or `runuser`-style wrapper dies with its children
+  at the deadline. ⭐ Measured against dma 0.13 in the sandbox (installed for
+  the measurement and purged): `-oi`, the classic spelling its own man page
+  calls a synonym, is a no-op in dma -- only `-i` keeps a body line that is a
+  single `.` from ending the message silently with exit 0; its line limit is 997
+  bytes, headers included, and one longer line (unless it is the last, without a
+  newline) is the whole message refused with exit 65 and `sendmail: bad mail
+  input format: ...` (#10's quoted-printable bodies are what keeps every alert
+  under it); a recipient beginning with `-` is an option wherever it sits in
+  argv, and a lone `-bp` prints the queue, discards the alert and exits 0 (the
+  loader's rule on addresses is the guard; no `--`, not every sendmail honours
+  it); exit 0 arrives in 20 ms and means ACCEPTED FOR QUEUEING, never delivered
+  -- dma never returns 75, its temporary failures are exit 0 plus a queue entry,
+  `mailq` is the tell. A non-zero exit is reported as `sendmail exit 65
+  (EX_DATAERR): <its first stderr line>` (the sysexits names are a table of our
+  own: `os.EX_*` is absent on Windows), a timeout as `sendmail did not finish
+  within 60 s` with what the child said before hanging, a binary that cannot
+  start as `could not execute <path>: <reason>` -- naming the path ourselves,
+  since Windows leaves `exc.filename` empty, and saying when the file exists but
+  its `#!` interpreter does not; what an MTA writes to stderr on exit 0
+  (Postfix's `postdrop` with the daemon stopped) is kept in the answer and
+  logged as a WARNING. SMTP: `smtplib.SMTP(host, port, local_hostname=<the
+  From's host>, timeout=mail_timeout)` -- without `local_hostname` smtplib runs
+  its own `getfqdn()`, which stalled 20 s on a host with dead DNS --
+  `smtp_starttls = yes` requests STARTTLS with a default SSL context (the
+  certificate is verified against `smtp_host`, so it must be a name) and lets
+  `SMTPNotSupportedError` be the loud failure; the exact CRLF bytes go through
+  the low-level `sendmail()`, which adds one byte per line starting with `.` and
+  nothing else. One refused recipient is a per-recipient failure logged as a
+  WARNING with the others delivered; every recipient refused, a session the
+  server closed at RCPT (the recipients it never tried are named as such), a
+  refused sender, a rejected DATA, a dropped connection, a silent server and a
+  refused connection are `DeliveryError`, each naming what happened -- the
+  exception type where there is one, the server's reply where it gave one. ⚠️
+  smtplib's `timeout` bounds each socket operation, not the session: a slow
+  relay can hold a run for about eight times `mail_timeout` and still succeed,
+  and resolving `smtp_host` is the system resolver's bound -- bounded, not
+  forever; a timeout after DATA says the server may still deliver what it read.
+  `mail_timeout` is capped at 3600 s by the loader: above about 25 days the
+  platform's own timeouts overflow into a traceback. The effective From is
+  `--from ADDR`, else `from =`, else the user logalert runs as at this host (the
+  only branch that may consult a resolver), and must be the bare `local@domain`
+  the loader accepts -- `config.is_address()`, from #10 -- because dma accepts
+  anything without a newline as `-f` and smtplib puts a space or a `>` on the
+  wire in one line; a From with no domain or a local-only one gets the standing
+  warning. `--test-mail SECTION` sends one real message to that section's
+  recipients through the configured transport and prints `sent via sendmail
+  (/usr/sbin/sendmail): accepted for queueing (exit 0)`, `to: ...`, `size: N
+  bytes; Message-ID: <...>` (0), or `logalert: not delivered via smtp
+  (host:port): <answer>` on stderr (1), or the configuration error (2); a
+  partial refusal prints the accepted lines, `refused: <recipient> -- <reply>`
+  on stderr, and exits 1. Two test doubles ship in `tests/`: an ESMTP stub on
+  127.0.0.1 port 0 (banner, EHLO with SIZE / 8BITMIME / optional STARTTLS, a
+  configurable 550 per recipient, 552 on DATA, drops, silence, per-verb replies,
+  every command and DATA payload recorded -- verbs matched case-insensitively,
+  since 3.12 already sends them in lowercase while `STARTTLS` and the context
+  manager's `QUIT` are uppercase) and a fake sendmail that records its argv and
+  its stdin bytes, honours `-i` as dma does, sleeps or exits as told; the
+  end-to-end tests reach the fake through `sendmail_path` behind a `.cmd`
+  wrapper on Windows and a shebang copy on POSIX. ⭐ Four review lenses and a
+  refute pass reproduced nine defects the tests had not: a QUIT answered with
+  anything but 221 after the DATA 250 raised out of smtplib's context manager --
+  the message was queued, and the run loop would have re-sent it every run (the
+  farewell is ours now; the outcome is decided at DATA); a recipient listed
+  twice let DATA go out to nobody, since smtplib decides "all refused" by
+  counting (the loader deduplicates `to`, and nothing accepted raises); a
+  relay's multi-line or control-laden reply reached the log and the console as
+  forged extra lines (`mail.clean_header` folds every reply and stderr line); a
+  `mail_timeout` of 35 days was an uncaught `OverflowError`; a directory as
+  `sendmail_path` passed the transport while `--check-config` printed NOT FOUND
+  and exited 0 (one shared judgement now, `config.sendmail_problem()`);
+  `--check-config` never resolved the From it printed; from a real console a
+  refused recipient printed twice through `logging.lastResort`, which pytest's
+  own handler had hidden (the library `NullHandler` is in place); and a forking
+  wrapper's grandchild survived the timeout and queued the mail `deliver()` had
+  reported undelivered; and a 421 mid-RCPT named only the recipients smtplib had
+  tried (the untried ones are named as such now). Eight judgment-level findings
+  were refuted by two skeptics each; the three that would recur are recorded on
+  the issue: a 4xx per recipient stays a per-recipient failure (greylisting
+  refuses every recipient on first contact, which is a `DeliveryError` and the
+  next run's retry), and the SMTP answer stays `accepted by host:port` because
+  `sendmail()` discards the relay's DATA reply -- the Message-ID is the
+  correlation key. Noted for #16: `mailq`, `journalctl -t dma`,
+  `/var/log/mail.log`, a wrapper that `setsid`s itself, the per-operation SMTP
+  timeout.
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main

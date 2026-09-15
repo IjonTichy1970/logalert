@@ -46,6 +46,9 @@ the bytes over and ``logalert.__main__`` (issue #12) decides when. The rules (de
     the header, the body and the log.
   * No name lookup, ever: the msg-id domain comes from the From, the host in the summary is
     ``gethostname()``; the effective From is the caller's to resolve.
+  * ``compose_test`` (``--test-mail``, issue #11) carries the same headers minus the priority
+    trio, the subject ``logalert test: <section subject>`` (never the match count) and a
+    one-paragraph body naming the version, host, time, section, recipients and Message-ID.
 """
 
 import email.policy
@@ -151,25 +154,60 @@ def compose(watch: Watch, reports: Sequence[FileReport], *, sender: str, setting
     name -- and ``host`` the name in the summary (neither is looked up here); ``attach``
     forces the attachment mode for this run.
     """
-    if now is None:
-        now = email.utils.localtime()
-    if host is None:
-        host = socket.gethostname()  # never getfqdn(): a resolver is nothing to wait for
+    now, host = _when_where(now, host)
     priority = highest(report.priority for report in reports)
     matched = sum(report.matched for report in reports)
     subject = clean_header(watch.subject)
     if settings.subject_suffix:
         subject = f"{subject} -- {matched} match(es)"
+    msg, sender, message_id = _stamp(watch, sender=sender, subject=subject, now=now,
+                                     priority=priority)
+    name = attachment_name(watch.name, now)
+    summary = _summary(watch, reports, priority=priority, matched=matched,
+                       host=clean_header(host), now=now, message_id=message_id)
+    report = render(reports, watch.max_lines)
+    if attach or watch.report == "attachment":
+        msg.set_content(summary + NL + f"The report is attached as {name}." + NL)
+        msg.add_attachment(report, filename=name)
+    else:
+        msg.set_content(summary + NL + report)
+    return Mail(msg, message_id, sender, subject, watch.to, priority, matched)
+
+
+def compose_test(watch: Watch, *, sender: str, settings: Settings,
+                 now: datetime | None = None, host: str | None = None) -> Mail:
+    """The one-line test message ``--test-mail SECTION`` sends to the section's recipients."""
+    now, host = _when_where(now, host)
+    subject = f"logalert test: {clean_header(watch.subject)}"
+    msg, sender, message_id = _stamp(watch, sender=sender, subject=subject, now=now,
+                                     priority=None)
+    recipients = ", ".join(clean_header(address) for address in watch.to)
+    msg.set_content(
+        f"This is a test message from logalert {__version__} on {clean_header(host)} at "
+        f"{now:%Y-%m-%d %H:%M:%S %z} for the section [{clean_header(watch.name)}], sent to "
+        f"{recipients} through the configured transport. Its Message-ID is {message_id}. "
+        f"Alerts for this section arrive with the subject {clean_header(watch.subject)!r}."
+        + NL)
+    return Mail(msg, message_id, sender, subject, watch.to, None, 0)
+
+
+def _when_where(now: datetime | None, host: str | None) -> tuple[datetime, str]:
+    if now is None:
+        now = email.utils.localtime()
+    if host is None:
+        host = socket.gethostname()  # never getfqdn(): a resolver is nothing to wait for
+    return now, host
+
+
+def _stamp(watch: Watch, *, sender: str, subject: str, now: datetime,
+           priority: Priority | None) -> tuple[EmailMessage, str, str]:
+    """A message with every header in the documented order and nothing else yet: returns
+    it with the sanitised sender and the Message-ID."""
     sender = clean_header(sender)
     if not is_address(sender):
         raise ValueError(f"From address {sender!r} is not a bare local@domain address; set "
                          f"from = in [{RESERVED_SECTION}]")
     message_id = email.utils.make_msgid(domain=sender.rpartition("@")[2])  # no lookup
-    name = attachment_name(watch.name, now)
-    summary = _summary(watch, reports, priority=priority, matched=matched,
-                       host=clean_header(host), now=now, message_id=message_id)
-    report = render(reports, watch.max_lines)
-
     msg = EmailMessage(policy=POLICY)
     msg["From"] = sender
     msg["To"] = ", ".join(clean_header(address) for address in watch.to)
@@ -183,12 +221,7 @@ def compose(watch: Watch, reports: Sequence[FileReport], *, sender: str, setting
         msg["X-Logalert-Priority"] = priority
         msg["X-Priority"] = X_PRIORITY[priority]
         msg["Importance"] = IMPORTANCE[priority]
-    if attach or watch.report == "attachment":
-        msg.set_content(summary + NL + f"The report is attached as {name}." + NL)
-        msg.add_attachment(report, filename=name)
-    else:
-        msg.set_content(summary + NL + report)
-    return Mail(msg, message_id, sender, subject, watch.to, priority, matched)
+    return msg, sender, message_id
 
 
 def _summary(watch: Watch, reports: Sequence[FileReport], *, priority: Priority | None,

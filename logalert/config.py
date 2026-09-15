@@ -225,7 +225,8 @@ def _load_settings(section: configparser.SectionProxy, warnings: list[str]) -> S
         smtp_host=smtp_host,
         smtp_port=_int(where, section, "smtp_port", DEFAULT_SMTP_PORT, low=1, high=65535),
         smtp_starttls=_bool(where, section, "smtp_starttls", False),
-        mail_timeout=_number(where, section, "mail_timeout", DEFAULT_MAIL_TIMEOUT),
+        mail_timeout=_number(where, section, "mail_timeout", DEFAULT_MAIL_TIMEOUT,
+                             high=MAX_MAIL_TIMEOUT),
         lock_stale=_int(where, section, "lock_stale", DEFAULT_LOCK_STALE, low=1),
         state_ttl_days=_int(where, section, "state_ttl", DEFAULT_STATE_TTL_DAYS, low=1),
         subject_suffix=_bool(where, section, "subject_suffix", True),
@@ -267,7 +268,9 @@ def _load_watch(name: str, section: configparser.SectionProxy, warnings: list[st
 
     subject = _required(where, section, "subject")
 
-    to = tuple(_list(where, section, "to", required=True, split_commas=True))
+    # deduplicated in order: smtplib decides "all refused" by counting, and a recipient
+    # listed twice and refused once would let DATA go out to nobody
+    to = tuple(dict.fromkeys(_list(where, section, "to", required=True, split_commas=True)))
     for address in to:
         _check_address(where, "to", address)
 
@@ -420,7 +423,11 @@ def _int(
     return number
 
 
-def _number(where: str, section: configparser.SectionProxy, key: str, default: float) -> float:
+MAX_MAIL_TIMEOUT = 3600.0  # seconds; at about 25 days subprocess and socket timeouts overflow
+
+
+def _number(where: str, section: configparser.SectionProxy, key: str, default: float, *,
+            high: float | None = None) -> float:
     value = _optional(where, section, key)
     if value is None:
         return default
@@ -430,6 +437,8 @@ def _number(where: str, section: configparser.SectionProxy, key: str, default: f
         raise ConfigError(f"{where} {key}: expected a number of seconds, got {value!r}") from exc
     if not math.isfinite(number) or number <= 0:
         raise ConfigError(f"{where} {key}: must be a positive number, got {value}")
+    if high is not None and number > high:
+        raise ConfigError(f"{where} {key}: must be at most {high:g} seconds, got {value}")
     return number
 
 
@@ -475,7 +484,7 @@ def _check_address(where: str, key: str, value: str) -> None:
     if not value.isascii():
         raise ConfigError(f"{where} {key}: {value!r} is not ASCII; non-ASCII addresses are not "
                           f"supported in this release")
-    if not _ADDRESS.match(value):
+    if not _ADDRESS.fullmatch(value):
         raise ConfigError(
             f"{where} {key}: {value!r} is not a bare local@domain address (no display "
             f"names, no angle brackets, no spaces)"
@@ -541,16 +550,32 @@ def from_warning(address: str) -> str | None:
 # -- --check-config --------------------------------------------------------------------------
 
 
-def _sendmail_note(path: str) -> str:
+def sendmail_problem(path: str) -> str | None:
+    """Why ``path`` cannot be run as sendmail, or None: the one judgement ``--check-config``
+    and the transport share (a directory passes exists + X_OK on both platforms)."""
+    if not ospath.exists(path):
+        return "does not exist"
     if not ospath.isfile(path):
-        return "NOT FOUND -- install an MTA or set transport = smtp"
+        return "is not a regular file"
     if not os.access(path, os.X_OK):
+        return "is not executable"
+    return None
+
+
+def _sendmail_note(path: str) -> str:
+    problem = sendmail_problem(path)
+    if problem is None:
+        return "found, executable"
+    if problem == "is not executable":
         return "found but NOT EXECUTABLE -- fix its mode or set transport = smtp"
-    return "found, executable"
+    if problem == "is not a regular file":
+        return "NOT A FILE -- point sendmail_path at the binary or set transport = smtp"
+    return "NOT FOUND -- install an MTA or set transport = smtp"
 
 
-def describe(config: Config) -> str:
-    """The effective settings, one ASCII line each, for ``--check-config``."""
+def describe(config: Config, sender: str | None = None) -> str:
+    """The effective settings, one ASCII line each, for ``--check-config``; ``sender`` is
+    ``--from``, which wins over ``from =`` for the run it is given to."""
     settings = config.settings
     out: list[str] = [f"config: {config.path}"]
     if settings.transport == "auto":
@@ -562,7 +587,10 @@ def describe(config: Config) -> str:
     else:
         tls = "STARTTLS" if settings.smtp_starttls else "plain"
         out.append(f"transport: smtp to {settings.smtp_host}:{settings.smtp_port} ({tls})")
-    if settings.from_address:
+    if sender is not None:
+        out.append(f"from: {sender} (--from)")
+        warning = from_warning(sender)
+    elif settings.from_address:
         out.append(f"from: {settings.from_address}")
         warning = from_warning(settings.from_address)
     else:

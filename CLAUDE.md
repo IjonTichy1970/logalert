@@ -31,7 +31,7 @@ verdict** -- an announced skip reads as green at a glance.
 Expected announced skips on the Windows host: `changelog refs` ("no release
 commit yet", until the first release) and `pytest` (the POSIX-only tests --
 file modes, a FIFO, symlinks, the real-`logrotate` module -- each saying "runs
-in the sandbox and on CI"; 8 as of #8). In the root sandbox the non-root tests
+in the sandbox and on CI"; 11 as of #11). In the root sandbox the non-root tests
 skip instead, saying "expected in the root sandbox; CI runs it" (2 as of #7).
 Any other announced skip is worth reading. mypy on this host is the
 pure-Python build (`pip install --no-binary mypy mypy`): the compiled wheel's

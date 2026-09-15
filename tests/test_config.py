@@ -548,8 +548,15 @@ def test_describe_reports_a_sendmail_that_is_not_executable(tmp_path: Path) -> N
     assert f"transport: sendmail at {fake.as_posix()} (found but NOT EXECUTABLE" in out
 
 
+def usable(tmp_path: Path, text: str) -> str:
+    """A config whose transport can be chosen: the interpreter stands in for sendmail
+    (it exists and is executable on both platforms); since #11 --check-config exits 2
+    when transport = auto finds nothing."""
+    return f"[logalert]\nsendmail_path = {Path(sys.executable).as_posix()}\n" + text
+
+
 def test_cli_check_config_good_and_bad(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    good = write(tmp_path, watch(tmp_path))
+    good = write(tmp_path, usable(tmp_path, watch(tmp_path)))
     assert main(["--check-config", "-f", good]) == 0
     out = capsys.readouterr()
     assert out.out.startswith("config: ") and out.err == ""
@@ -571,7 +578,7 @@ def test_cli_example_config_and_help(capsys: pytest.CaptureFixture[str]) -> None
 
 
 def test_module_run_check_config(tmp_path: Path) -> None:
-    good = write(tmp_path, watch(tmp_path))
+    good = write(tmp_path, usable(tmp_path, watch(tmp_path)))
     result = subprocess.run(
         [sys.executable, "-m", "logalert", "--check-config", "-f", good],
         capture_output=True, encoding="utf-8", errors="replace", check=False,

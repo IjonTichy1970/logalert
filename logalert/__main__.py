@@ -11,9 +11,11 @@ from logalert.config import (
     ConfigError,
     describe,
     example_config,
+    is_address,
     load_config,
 )
 from logalert.lock import LockBusy, RunLock
+from logalert.mail import compose_test
 from logalert.state import (
     RESET_HINT,
     State,
@@ -22,6 +24,7 @@ from logalert.state import (
     load_state,
     lock_path,
 )
+from logalert.transport import DeliveryError, choose, deliver, resolve_sender
 
 EXIT_OK = 0
 EXIT_ATTENTION = 1  # ran, but something needs a look (a state problem, a stuck run, ...)
@@ -44,7 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
         "-f", "--config", default=DEFAULT_CONFIG_PATH, metavar="PATH",
         help=f"configuration file (default: {DEFAULT_CONFIG_PATH})",
     )
-    # The three "do this and exit" modes exclude one another; a silent precedence would
+    parser.add_argument(
+        "--from", dest="sender", default=None, metavar="ADDR",
+        help="the From address for this run, a bare local@domain (default: from = in the "
+        "config, else the user logalert runs as at this host)",
+    )
+    # The "do this and exit" modes exclude one another; a silent precedence would
     # let `--check-config --reset-state` validate and exit 0 without resetting anything.
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument(
@@ -62,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
         "in every file when PATH is omitted, and exit; the next run treats those files "
         "as first sight",
     )
+    modes.add_argument(
+        "--test-mail", default=None, metavar="SECTION",
+        help="send a one-line test message to SECTION's recipients through the configured "
+        "transport, report the transport's answer, and exit (0 accepted, 1 not delivered, "
+        "2 configuration)",
+    )
     return parser
 
 
@@ -75,16 +89,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.example_config:
         sys.stdout.write(example_config())
         return EXIT_OK
+    if args.sender is not None and not is_address(args.sender):
+        parser.error(f"--from: {args.sender!r} is not a bare local@domain address")
 
-    if args.check_config or args.reset_state is not None:
+    if args.check_config or args.reset_state is not None or args.test_mail is not None:
         try:
             config = load_config(args.config)
         except ConfigError as exc:
             print(f"logalert: {exc}", file=sys.stderr)
             return EXIT_USAGE
         if args.check_config:
-            print(describe(config))
+            print(describe(config, args.sender))
+            try:
+                choose(config.settings)  # auto with no sendmail is a configuration error
+                resolve_sender(config.settings, args.sender)  # a From the run would refuse
+            except ConfigError as exc:
+                print(f"logalert: {exc}", file=sys.stderr)
+                return EXIT_USAGE
             return EXIT_OK
+        if args.test_mail is not None:
+            return test_mail(config, args.test_mail, args.sender)
         if args.reset_state != RESET_ALL and not os.path.isabs(args.reset_state):
             # a cursor is keyed by the absolute path the config spells: this can never match
             parser.error(f"--reset-state: {args.reset_state!r} is not an absolute path")
@@ -93,6 +117,38 @@ def main(argv: list[str] | None = None) -> int:
     # The run itself arrives with the orchestration issue; until then, be helpful.
     parser.print_help()
     return EXIT_OK
+
+
+def test_mail(config: Config, section: str, override: str | None) -> int:
+    """``--test-mail SECTION``: one real message to the section's recipients, and the
+    transport's answer on stdout."""
+    watches = {watch.name: watch for watch in config.watches}
+    if section not in watches:
+        print(f"logalert: no section [{section}] in {config.path}; sections: "
+              f"{', '.join(watches) or '(none)'}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        transport = choose(config.settings)
+        sender, warning = resolve_sender(config.settings, override)
+    except ConfigError as exc:
+        print(f"logalert: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    if warning:
+        print(f"logalert: warning: {warning}", file=sys.stderr)
+    mail = compose_test(watches[section], sender=sender, settings=config.settings)
+    where = (config.settings.sendmail_path if transport == "sendmail"
+             else f"{config.settings.smtp_host}:{config.settings.smtp_port}")
+    try:
+        delivery = deliver(mail, config.settings)
+    except DeliveryError as exc:
+        print(f"logalert: not delivered via {transport} ({where}): {exc}", file=sys.stderr)
+        return EXIT_ATTENTION
+    print(f"sent via {transport} ({where}): {delivery.answer}")
+    print(f"to: {', '.join(delivery.accepted)}")
+    print(f"size: {delivery.size} bytes; Message-ID: {mail.message_id}")
+    for recipient, answer in delivery.refused:
+        print(f"refused: {recipient} -- {answer}", file=sys.stderr)
+    return EXIT_ATTENTION if delivery.refused else EXIT_OK
 
 
 def reset_state(config: Config, target: str) -> int:
