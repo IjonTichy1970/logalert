@@ -5,8 +5,8 @@ Generalized log file watcher.
 > **Status:** pre-release. The packaging, CI, gate and release workflow are in
 > place and the configuration file is defined: `logalert --example-config`
 > prints a complete commented example and `logalert --check-config` validates
-> yours. The state file and run lock exist (`logalert --reset-state` forgets a
-> position). The watcher itself is being built.
+> yours. The state file, run lock and rotation catch-up exist (`logalert
+> --reset-state` forgets a position). The watcher itself is being built.
 
 ## Installation
 

@@ -161,4 +161,51 @@ new entry.
   `os.access` probe that was inert on Windows and blocked the `--reset-state`
   escape hatch on Linux.
 
+- `[contract]` **Rotation catch-up: the rotated copies are read first, across
+  every naming style, compressed or not** (#8). When the cursor says a file
+  rotated or was truncated, `logalert/rotation.py` finds the copy that holds the
+  saved position and reads its tail, then every newer archive in full, then the
+  live file from 0 -- nothing written between two runs is missed, however many
+  rotations happened (the owner's criterion, pinned against real `logrotate` for
+  `create`, `compress`, three rounds of `delaycompress`, `copytruncate` with and
+  without `compress`, `dateext`, `rotate 0`, `nocreate` and `olddir`). Archives
+  are recognised by name in the file's directory, in the directory a re-pointed
+  link used to lead to, and in the section's `archive_dir` (now live): numeric
+  `.N` (lower is newer, so savelog's and newsyslog's `.0` and logrotate's `.1`
+  both work), the dated forms of logrotate `dateext`, TimedRotatingFileHandler
+  and newsyslog, hand-rolled `.YYYYMMDD` and `.<epoch>`, each with an optional
+  `.gz` / `.bz2` / `.xz` / `.zst`; anything else sharing the stem orders by
+  mtime and the log says so. The copy is identified by content -- the saved
+  first line, read through the decompressor, and a length of at least the saved
+  offset -- among the archives written after the last run, oldest first; then by
+  the saved inode among all regular files whatever their name; last among the
+  older archives, newest first, with a WARNING when that is a guess. ⭐ The
+  inode comes second because ext4 hands a freed number straight back: measured
+  natively, after a rotation that compressed the file, the NEW live file got the
+  old inode and the next rotation left it under `.1` with the same banner first
+  line -- an inode-first search took the wrong archive. A `nocreate` rotation
+  (the live file absent) is read at once and the cursor parks on the archive; a
+  consumer that stops part-way through the chain gets a cursor on the archive it
+  stopped in. A half-written or corrupt archive yields what it had with a
+  WARNING and the chain continues; nothing matching is one WARNING naming the
+  file, the saved identity, the directories searched and the likely causes, and
+  the live file is read from the top. `open_source()` is what the run loop calls
+  per file (wired in #12); `LogFile` alone still reads a rotated file from 0.
+  Two cursor rules changed with it: a file that HAD a complete first line and
+  now has none is TRUNCATED whatever its size (`copytruncate` under a writer
+  without `O_APPEND` leaves a NUL hole where the first line was, and a size that
+  passes the offset check), and the fingerprint skips a NUL hole of any size
+  (bounded at 64 MiB) rather than 4 KiB of it, so a file copytruncated once can
+  still be matched to its copies after the next time. `zlib.error` (a `.gz` with
+  a valid header over a corrupt body) and, on 3.14, `ZstdError` are read errors
+  like the others -- before, one such file anywhere among the archives was a
+  crash on every run -- and the reader uses `read1`, so a cut archive hands over
+  what it did decompress before failing. ⭐ Four review lenses reproduced,
+  besides those, a `None` saved fingerprint letting the inode stage take another
+  log's archive, `.YYYYMMDD` and `.<epoch>` parsed as `.N` and ordered
+  backwards, a `.bak` joining the chain behind an oddly named match, a stale
+  `router.log.1` shadowing `old/router.log.1.gz`, and hard links knocking a
+  chain member out -- all fixed and pinned by the tests their surviving
+  mutations named.
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main

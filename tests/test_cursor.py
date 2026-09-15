@@ -94,9 +94,16 @@ def test_identify_device_change_alone_continues_with_a_note() -> None:
     assert verdict == "continue" and note == "device id changed (3 -> 4; remount or reboot?)"
 
 
-def test_identify_never_compares_a_null_fingerprint() -> None:
+def test_identify_never_compares_a_null_saved_fingerprint() -> None:
     assert identify(saved_cursor(fingerprint=None), 7, 3, 500, sha(b"x")) == ("continue", None)
-    assert identify(saved_cursor(), 7, 3, 500, None) == ("continue", None)
+    assert identify(saved_cursor(fingerprint=None), 7, 3, 500, None) == ("continue", None)
+
+
+def test_identify_a_vanished_first_line_is_truncation_whatever_the_size() -> None:
+    # a file cannot lose its first line by being appended to: copytruncate under a writer
+    # without O_APPEND leaves a NUL hole there, and a size that passes the offset check
+    verdict, note = identify(saved_cursor(), 7, 3, 5000, None)
+    assert verdict == "truncated" and note == "the first line is gone (a copytruncate hole?)"
 
 
 def test_identify_size_is_not_consulted_for_compressed_files() -> None:
@@ -341,7 +348,7 @@ def test_same_inode_changed_first_line_is_not_resumed_mid_file(
     log2, lines = scan(path, saved)
     assert log2.verdict == "rotated" and texts(lines) == ["first", "second"]
     assert "different first line" in caplog.records[-1].getMessage()
-    assert "reading the live file from the beginning" in caplog.records[-1].getMessage()
+    assert caplog.records[-1].getMessage().endswith("; rotated")
 
 
 def test_inode_change_is_rotation(tmp_path: Path) -> None:
@@ -441,9 +448,31 @@ def test_fingerprint_skips_a_copytruncate_hole(tmp_path: Path) -> None:
     path.write_bytes(NUL * 100 + b"first line\nsecond\n")
     with open(path, "rb") as handle:
         assert fingerprint(handle) == sha(b"first line")
-    path.write_bytes(NUL * FINGERPRINT_CAP + b"first line\n")  # hole beyond the cap
+    # a real hole is the old file's size, far beyond the cap: still the line after it, so a
+    # file that was copytruncated once can still be matched to its copies after the next one
+    path.write_bytes(NUL * (FINGERPRINT_CAP * 3 + 7) + b"first line\n")
     with open(path, "rb") as handle:
-        assert fingerprint(handle) is None  # not identifiable yet, never compared
+        assert fingerprint(handle) == sha(b"first line")
+        assert handle.tell() == 0
+    path.write_bytes(NUL * (FINGERPRINT_CAP * 3 + 7) + b"x" * FINGERPRINT_CAP + b"tail\n")
+    with open(path, "rb") as handle:
+        assert fingerprint(handle) == sha(b"x" * FINGERPRINT_CAP)  # the cap, from the line start
+    path.write_bytes(NUL * (FINGERPRINT_CAP * 2))  # nothing but hole: not identifiable
+    with open(path, "rb") as handle:
+        assert fingerprint(handle) is None
+
+
+def test_fingerprint_gives_up_on_a_hole_beyond_the_hole_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("logalert.cursor.HOLE_CAP", FINGERPRINT_CAP * 2)
+    path = tmp_path / "a.log"
+    path.write_bytes(NUL * (FINGERPRINT_CAP * 2) + b"first line\n")
+    with open(path, "rb") as handle:
+        assert fingerprint(handle) is None and handle.tell() == 0
+    path.write_bytes(NUL * (FINGERPRINT_CAP * 2 - 1) + b"first line\n")
+    with open(path, "rb") as handle:
+        assert fingerprint(handle) == sha(b"first line")
 
 
 def test_one_file_two_sections_the_failed_section_keeps_its_place(tmp_path: Path) -> None:

@@ -8,7 +8,9 @@ will actually read, and decides how the saved cursor applies:
   * same inode, first line changed -> ROTATED: ext4 hands a freed inode number straight back,
     so a same-inode file with different content is a different file (measured: after two
     ``delaycompress`` rotations the saved live inode came back as the new live file)
-  * same inode, size < offset -> TRUNCATED (``copytruncate``)
+  * same inode, size < offset -> TRUNCATED (``copytruncate``); so is a file whose first line
+    is GONE (a NUL hole from ``copytruncate`` under a writer without ``O_APPEND``), whatever
+    its size
   * inode differs -> ROTATED
   * device id differs alone -> continue, with a log line (a remount or a reboot renumbers
     devices; that never declares a rotation by itself)
@@ -16,11 +18,12 @@ will actually read, and decides how the saved cursor applies:
     the first run is not a flood of old news; ``start = beginning`` / ``--from-start`` read
     from 0. Nothing is emitted; the skipped byte count is logged.
 
-In this issue ROTATED and TRUNCATED read the live file from 0; the rotation issue (#8) reads
-the rotated copy first, keyed by the fingerprint saved here. Compressed files (``.gz``,
-``.bz2``, ``.xz``; ``.zst`` where the stdlib has ``compression.zstd``) are read through the
-decompressor with the offset in the UNCOMPRESSED stream; ``seek`` past its end is silent, so
-``tell`` after the seek is what detects a shorter stream.
+On its own a ``LogFile`` reads a ROTATED or TRUNCATED live file from 0; ``logalert.rotation``
+wraps it to read the rotated copy first, found by the inode and the fingerprint saved here.
+Compressed files (``.gz``, ``.bz2``, ``.xz``; ``.zst`` where the stdlib has
+``compression.zstd``) are read through the decompressor with the offset in the UNCOMPRESSED
+stream; ``seek`` past its end is silent, so ``tell`` after the seek is what detects a shorter
+stream.
 
 Lines are read in binary and decoded as UTF-8 with replacement. The cursor advances only to
 the end of the last COMPLETE line: an unterminated tail is re-read next run. A line longer
@@ -40,6 +43,7 @@ import lzma
 import os
 import re
 import stat
+import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -51,11 +55,31 @@ log = logging.getLogger("logalert.cursor")
 
 LINE_CAP = 2000  # bytes; a longer line is cut here and the cut reported
 FINGERPRINT_CAP = 4096  # bytes of the first line that identify a file
+HOLE_CAP = 64 * 1024 * 1024  # NUL bytes fingerprint() will skip before giving up
 _CHUNK = 65536
 NUL = bytes([0])  # spelled from the code point: gated Python carries no control characters
 _NUL_RUN = re.compile(NUL + b"*")
-# what gzip / bz2 / lzma raise for a half-written or corrupt archive, besides OSError
-_STREAM_ERRORS: tuple[type[Exception], ...] = (EOFError, lzma.LZMAError)
+
+
+def _stream_errors() -> tuple[type[Exception], ...]:
+    """What the decompressors raise for a half-written or corrupt archive, besides OSError.
+
+    gzip: EOFError for a missing trailer, zlib.error for a bad deflate body (a crash during
+    compression leaves a valid header over zero-filled blocks). bz2: OSError. lzma:
+    LZMAError. zstd (3.14+): ZstdError, whose base is Exception, not OSError.
+    """
+    errors: list[type[Exception]] = [EOFError, zlib.error, lzma.LZMAError]
+    try:
+        zstd = importlib.import_module("compression.zstd")
+    except ImportError:
+        return tuple(errors)
+    zstd_error = getattr(zstd, "ZstdError", None)
+    if isinstance(zstd_error, type) and issubclass(zstd_error, Exception):
+        errors.append(zstd_error)
+    return tuple(errors)
+
+
+STREAM_ERRORS: tuple[type[Exception], ...] = _stream_errors()
 
 Verdict = Literal["first-sight", "continue", "rotated", "truncated"]
 # what open(), gzip.open(), bz2.open() and lzma.open() have in common, per typeshed
@@ -117,13 +141,25 @@ def fingerprint(handle: BinaryStream) -> str | None:
     """sha256 of the first complete line (at most FINGERPRINT_CAP bytes), read from 0.
 
     A run of NULs at the start (a copytruncate hole) is not the first line and is skipped,
-    as the reader skips it. None when the file has no complete first line yet -- and a None
-    is never compared. Leaves the position at 0.
+    as the reader skips it -- however long it is, up to HOLE_CAP: the hole is the old file's
+    size, and a file whose fingerprint stayed None across rotations could never be matched
+    to its copies again. None when the file has no complete first line yet -- and a None is
+    never compared. Leaves the position at 0.
     """
     handle.seek(0)
-    head = handle.read(FINGERPRINT_CAP)
+    skipped = 0
+    while True:
+        head = _read_up_to(handle, FINGERPRINT_CAP)
+        text = head.lstrip(NUL)
+        if text or len(head) < FINGERPRINT_CAP:
+            break
+        skipped += len(head)
+        if skipped >= HOLE_CAP:
+            handle.seek(0)
+            return None
+    if text and len(text) < FINGERPRINT_CAP:
+        text += _read_up_to(handle, FINGERPRINT_CAP - len(text))  # a cap of the line itself
     handle.seek(0)
-    text = head.lstrip(NUL)
     newline = text.find(b"\n")
     if newline >= 0:
         line = text[:newline]
@@ -132,6 +168,28 @@ def fingerprint(handle: BinaryStream) -> str | None:
     else:
         return None
     return hashlib.sha256(line).hexdigest()
+
+
+def _read_up_to(handle: BinaryStream, size: int) -> bytes:
+    """Up to ``size`` bytes, keeping what a cut archive yields before it fails.
+
+    ``read()`` on a decompressor raises before handing over the bytes it did decompress;
+    ``read1()`` hands them over first (measured for gz, bz2, xz), and a stream error on a
+    later call ends the read with what came through. The caller sees the error when it
+    reads the file itself.
+    """
+    parts: list[bytes] = []
+    got = 0
+    while got < size:
+        try:
+            chunk = handle.read1(size - got)
+        except STREAM_ERRORS:
+            break
+        if not chunk:
+            break
+        parts.append(chunk)
+        got += len(chunk)
+    return b"".join(parts)
 
 
 def identify(saved: Cursor | None, ino: int, dev: int, size: int | None,
@@ -146,6 +204,11 @@ def identify(saved: Cursor | None, ino: int, dev: int, size: int | None,
         return "rotated", f"inode changed ({saved.ino} -> {ino})"
     if saved.fingerprint is not None and current is not None and current != saved.fingerprint:
         return "rotated", "same inode, different first line (inode reuse or a rewrite)"
+    if saved.fingerprint is not None and current is None:
+        # A file cannot lose its first line by being appended to. copytruncate under a writer
+        # without O_APPEND leaves a NUL hole where it was -- and a size that passes the check
+        # below, which is why this comes first.
+        return "truncated", "the first line is gone (a copytruncate hole?)"
     if size is not None and size < saved.offset:
         return "truncated", f"size {size} < saved offset {saved.offset}"
     if dev != saved.dev:
@@ -210,7 +273,9 @@ class LineReader:
                 if nul_only:
                     continue  # a line of nothing but the hole
                 yield Line(raw.decode("utf-8", errors="replace"), cut)
-            chunk = self.handle.read(_CHUNK)
+            # read1, not read: on a cut archive read() raises before handing over the bytes
+            # it did decompress, read1 hands them over first (measured for gz, bz2, xz)
+            chunk = self.handle.read1(_CHUNK)
             if not chunk:
                 return  # what is left is an unterminated tail: re-read next run
             buf = buf[pos:] + chunk
@@ -241,7 +306,7 @@ class LogFile:
             self.skipped = 0  # bytes passed over on first sight
             self.start = self._start_offset(from_start)
             self.reader = LineReader(self.handle, self.start)
-        except _STREAM_ERRORS as exc:
+        except STREAM_ERRORS as exc:
             self.handle.close()
             raise OSError(f"{path}: incomplete or corrupt compressed stream ({exc})") from exc
         except BaseException:
@@ -280,8 +345,7 @@ class LogFile:
         elif self.note and self.verdict == "continue":
             log.info("%s: %s; continuing at offset %d", where, self.note, self.start)
         elif self.note:
-            log.info("%s: %s; %s: reading the live file from the beginning",
-                     where, self.note, self.verdict)
+            log.info("%s: %s; %s", where, self.note, self.verdict)
         else:
             log.debug("%s: continuing at offset %d", where, self.start)
 
@@ -289,7 +353,7 @@ class LogFile:
         """The complete lines from the start offset; ``OSError`` for a stream that ends early."""
         try:
             yield from self.reader
-        except _STREAM_ERRORS as exc:
+        except STREAM_ERRORS as exc:
             raise OSError(f"{self.path}: incomplete or corrupt compressed stream ({exc})") from exc
         if self.reader.nul_bytes:
             log.info("[%s] %s: skipped %d NUL bytes (copytruncate under a writer without "
