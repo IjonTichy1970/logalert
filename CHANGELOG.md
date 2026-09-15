@@ -113,4 +113,52 @@ new entry.
   `re.compile` raising `OverflowError` past the `re.error` handler, and a path
   with an embedded newline passing every check -- all fixed and pinned.
 
+- `[contract]` **Cursor and state: file identity, truncation, first sight at the
+  end, atomic per-section state, the run lock** (#7). `logalert/state.py` owns
+  the state file (`state_file`, default `/var/lib/logalert/state.json`): JSON
+  with a schema version, one cursor per (section, configured path) -- a file two
+  sections watch has two cursors, so the section whose mail failed keeps its
+  place while the other advances -- written atomically (a temp file in the same
+  directory, `fsync`, `os.replace`; `mkstemp` makes it 0600, so the state
+  directory belongs to the user cron runs logalert as) after each section's mail
+  is accepted; `check_state_dir` proves the directory is writable BEFORE
+  anything is sent and never creates it. A file that cannot be parsed is a hard
+  error naming the file and `--reset-state`; entries unseen for `state_ttl` days
+  expire. `logalert/cursor.py` opens each file, `fstat`s the descriptor it
+  reads, and applies the identity rules: same inode with the same first line
+  continues; a different first line on the same inode is a rotation (ext4 hands
+  a freed inode number straight back); a smaller size is `copytruncate`; a
+  different inode is a rotation; a device id change alone continues with one log
+  line. First sight starts at the end, on a line boundary, and logs the bytes
+  skipped; `start = beginning` (and `--from-start`, wired in #12) read from 0.
+  Lines are read in binary and decoded with replacement; the cursor advances
+  only past complete lines; a line longer than 2000 bytes is cut there, and the
+  cut is a hard boundary so the boundaries from a given offset are a function of
+  the bytes alone. A run of NUL bytes at a line start -- the hole `copytruncate`
+  leaves under a writer without `O_APPEND` -- is consumed before the cap is
+  measured, counted, and logged once per file. `.gz`, `.bz2` and `.xz` (and
+  `.zst` on 3.14+) are read through the decompressor with the offset in the
+  uncompressed stream, `tell()` after the seek detecting a shorter stream where
+  `seek` is silent; a half-written archive is an `OSError` like any other
+  unreadable file, and a FIFO, directory or device is refused before `open(2)`
+  could block on it. `logalert/lock.py` is a real OS lock on both platforms
+  (`flock`; `msvcrt.locking` on a byte beyond the holder info, so the info stays
+  readable); the holder writes its PID and start time, a holder older than
+  `lock_stale` is reported as stale, and a stale verdict is confirmed by a
+  second read so a run refused in the microseconds before the holder's write
+  cannot mistake the previous line for a stuck run. `--reset-state [PATH]`
+  forgets the cursors for one file or all of them, under the lock, replaces a
+  state file nothing can read, and refuses to run as root against a state file
+  another user owns (naming `sudo -u <owner>`) -- `mkstemp` plus `os.replace`
+  would hand the file to root and lock the cron user out; the three exit modes
+  exclude one another. In this issue a rotation or truncation reads the live
+  file from the top; reading the rotated copy first is #8. ⭐ The adversarial
+  review (five lenses, twelve refuters) reproduced a first-sight boundary one
+  byte short of the cap, `--reset-state` reporting a permission problem as "no
+  state file" (exit 0), a NUL hole splitting the line after it at the cap, and
+  the lock leaking when its info write failed -- all fixed and pinned; the
+  refuters replaced a `chown`-on-root fix with the refusal above and dropped an
+  `os.access` probe that was inert on Windows and blocked the `--reset-state`
+  escape hatch on Linux.
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main
