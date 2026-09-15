@@ -27,8 +27,12 @@
 # position: `logalert --reset-state /path/to/file` (every file: no path).
 #state_file = /var/lib/logalert/state.json
 
-# Where logalert writes its own activity: syslog (default), stderr,
-# file:/absolute/path, or udp:host:port (explicit only; never a fallback).
+# Where logalert writes its own activity: syslog (default: the first socket
+# of /dev/log, /var/run/log, /var/run/syslog, tagged `logalert` so that
+# `journalctl -t logalert` finds the runs), stderr, file:/absolute/path
+# (outside the venv), or udp:host:port (explicit only; never a fallback).
+# When the destination cannot be used the run says so once on stderr and
+# logs there. `--log DEST` overrides this for one run.
 #log = syslog
 
 # How alert emails leave the box: auto (default) uses the local sendmail

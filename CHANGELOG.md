@@ -563,4 +563,145 @@ new entry.
   semantics, `--from-start` on first sight only, `--state-file` absolute, the
   lock's two verdicts, expiry.
 
+- `[contract]` **The activity log: syslog with the identifier, stderr, a file or
+  UDP, `--log`, and a fallback that is never silent** (#13).
+  `logalert/activity.py` is the single home of where the records go, in what
+  shape, and what happens when the destination fails; the records themselves are
+  the ones #7-#12 emit on the `logalert.*` loggers (the start and end lines, per
+  file the lines read and matched and the identity line, per section `sent via
+  ...` with the recipients, the byte count and the Message-ID, or the failure
+  with the transport's answer, every failed item at ERROR, expiry, the lock at
+  DEBUG). `log = syslog` (the default) | `stderr` | `file:/absolute/path` |
+  `udp:host:port` in the config, `--log DEST` on the command line winning over
+  it in every mode, like `--state-file`. `syslog` probes `/dev/log`,
+  `/var/run/log` and `/var/run/syslog` in that order for a path that IS a socket
+  (`stat.S_ISSOCK`, never `exists()`: `/var/run/log` is a directory on Ubuntu
+  and a socket on FreeBSD) and that accepts a datagram, else a stream,
+  `connect()` of our own -- ⭐ measured, `SysLogHandler` constructs without
+  raising on a missing path or on a directory, holding a closed socket, and then
+  prints three chained tracebacks per record; a server that has gone with its
+  socket file left behind (journald stopped) is two tracebacks per record. The
+  handler's `ident` is `logalert[<pid>]: `, so journald records
+  `SYSLOG_IDENTIFIER=logalert` and `SYSLOG_PID`, `journalctl -t logalert` and
+  `journalctl -p warning -t logalert` find the runs (without the ident the
+  journal shows `_COMM=python` and no identifier; with the console script
+  `_COMM=logalert` too) and rsyslog's `/var/log/syslog` line reads `<time>
+  <host> logalert[<pid>]: <message>`; the facility is user. `--check-config`
+  prints what `syslog` resolves to here: `log: syslog (/dev/log)`, or `log:
+  syslog -- no usable socket (/dev/log: connection refused; /var/run/log: not a
+  socket; /var/run/syslog: missing); the run would log to stderr` (on Windows
+  `-- not available on this platform; ...`), with ` (--log)` when the command
+  line chose it; a check never touches the destination and creates nothing. The
+  fallback is ALWAYS stderr and ALWAYS loud: when the destination cannot be used
+  the first record on stderr is one WARNING in the log's own shape -- `no usable
+  syslog socket (...); logging to stderr`, `syslog is not available on this
+  platform; logging to stderr`, `cannot open the activity log
+  /var/log/logalert.log (Permission denied); logging to stderr`,
+  `udp:relay.example.net:514: cannot resolve the host (...); logging to stderr`,
+  or `udp:[2001:db8::1]:514: cannot open (...); logging to stderr` when the host
+  resolves but the socket cannot be created (an address family the host lacks)
+  -- and the run goes on with its exit code unchanged (cron mails that line,
+  which is the point; it is the one thing an exit 0 may now write to stderr). ⚠️
+  Never UDP as a fallback: measured on both platforms, three datagrams to a port
+  nobody listens on produce nothing anywhere, the "logs nowhere" fault; `udp:`
+  is built only when configured, an unresolvable host raises at construction and
+  takes the fallback, and `udp:[2001:db8::1]:514` is the IPv6 spelling (⭐ the
+  review found `[::1]` accepted by the loader and then unresolvable at run
+  time). A destination that fails later -- the syslog server gone, a full disk
+  -- is reported ONCE, `the activity log at syslog (/dev/log) failed
+  (ConnectionRefusedError: [Errno 111] Connection refused); logging to stderr
+  from here on`, the failed record and the rest of the call go to stderr, and
+  teardown stays quiet: ⭐ the review filled a 64 KiB tmpfs and found the run
+  mailing, saving its state and logging `end: exit 0` -- then `close()` flushing
+  the buffered bytes again, the `OSError` escaping `main()`, a 30-line traceback
+  in cron's mail and exit 1; the teardown now unwires every handler, suppresses
+  that second failure and resets the logger's level in its own `finally`.
+  `file:` is opened at setup, never lazily (⭐ measured,
+  `FileHandler(delay=True)` raises the open failure out of `logger.info()` into
+  the caller, which would have aborted a run at its first record with a
+  traceback), and by us, like the lock: ⭐ the review had `nobody` plant a
+  `logalert.log` symlink in a shared directory and a root run appended the
+  activity log into the file that user chose, and a FIFO as the destination
+  blocked `open(2)` for good before the lock so cron runs would pile up while
+  `--check-config` said nothing; now `lstat` first -- `is a symbolic link --
+  name the real path`, `is a directory`, `not a regular file` (a FIFO, a device:
+  `/dev/full` included) each take the loud fallback -- then `os.open` with
+  `O_NOFOLLOW` and an `fstat` behind it. The file is appended with `0644` under
+  the umask (it names files, sections, recipients and Message-IDs, never a log
+  line). ⭐ The state file, the run lock and the config file are refused as the
+  log, by the loader (`[logalert] log: <path> is the state file` / `the run
+  lock` / `the config file`, exit 2) and again in `main` for the effective paths
+  under `--log` and `--state-file`: measured, `log = file:<state_file>` wrote
+  `start: ...` into the state before every run read it (exit 1 forever, and
+  `--reset-state` replaced the state only for the next record to corrupt it
+  again, nothing naming `log =` as the cause), and `log = file:<config>` grew
+  the config by one stamped line per record until a doubled key made every mode
+  exit 2. A `file:` path or a `state_file` inside the running interpreter's venv
+  (`sys.prefix` when it differs from `sys.base_prefix`, by real path) is `is
+  inside the venv (/opt/logalert-venv), which the upgrade procedure wipes` --
+  the deployment constraint, applied to the state file too, which #7 had not; a
+  NUL in any path value is `contains a NUL character` instead of a `ValueError`
+  traceback from `realpath`. One line per record, whatever the destination: the
+  message, prefixed `warning: ` / `error: ` / `debug: ` for those levels and
+  nothing for INFO (journald and rsyslog carry the priority anyway; a file or a
+  cron mail needs the word), header-clean through `clean_header` (rsyslog writes
+  `#012` for a newline, a terminal honours a raw CSI); the destination's own
+  prefix is the ident for syslog (journald adds the time),
+  `2026-09-15T14:11:02-0600 logalert[<pid>]: ` for the file, `logalert: ` for
+  stderr -- which retires #12's `logalert: INFO logalert.run: ...` shape for
+  `--debug`. `--debug` adds a stderr handler at DEBUG and leaves the configured
+  destination at INFO (a debug session does not flood syslog); when the
+  destination IS stderr there is one handler, at DEBUG. 🔶 `--dry-run` logs to
+  stderr, not to the configured destination, unless `--log` is explicit: `-n`
+  promised to write nothing (#12), a `file:` log would be appended, and a dry
+  run's records (`start: ... (dry run)`, `would be forgotten`, the first-sight
+  line) belong in front of the operator, not in syslog as if they were a run's.
+  🔶 The first-sight skip (`first sight; starting at the end, N bytes skipped`)
+  is a WARNING now, as this issue lists it, where #7 logged it at INFO: the one
+  time lines are deliberately never mailed, and `journalctl -p warning` should
+  show it; `reading from the beginning` stays INFO. `--reset-state` writes its
+  own record (`forgot N cursor(s) for every file (--reset-state)`, and the
+  escape hatch's `...; replaced it with an empty state (--reset-state)` at
+  WARNING), `--test-mail`'s `sent via ...` is part of the trail, and both honour
+  `--log`. Two corrections to the issue's text, both settled during the #12
+  review: "bytes read" per file is not a well-defined number across a rotation
+  catch-up, so the per-file line stays `N line(s) read, M matched`; the identity
+  line is INFO when it says something and DEBUG for a plain continue. Rehearsed
+  end to end in the sandbox with the installed console script: as root and as
+  `nobody`, a run with the default lands in the journal under the identifier
+  with `PRIORITY` 4 for the first-sight warning and 6 for the rest, exit 0 with
+  0 bytes on both streams; `--check-config` prints `log: syslog (/dev/log)`; a
+  `file:` path in a missing directory is one warning line and the log on stderr,
+  no traceback. Four review lenses (correctness by reproduction on both hosts,
+  specification fidelity and the #14/#15/#16 consumers, 42 mutants against the
+  tests, operational safety as the cron user) reported 15 reproduced findings --
+  the ones above and: `--check-config` never touching the destination (a mutant
+  that made the check attach -- and create a `file:` log -- survived every test
+  on Linux; the map had the check attaching to an explicit `--log`, which would
+  have doubled the fallback line, corrected before the review), the
+  stream-socket branch, the dying-destination path under `--debug`, `--log` for
+  `--reset-state` and `--test-mail`, the teardown `close()` and the escape
+  hatch's record were unpinned -- all fixed and pinned; six judgment-level
+  findings were refuted by two skeptics each and stand (a `--test-mail` record
+  carries no marker; `--check-config` does not stat a `file:` destination's
+  directory; a record over rsyslog's 8 KiB default needs no cap: only a `sent
+  via` line with 160 recipients gets there, and the journal and the file keep it
+  whole). `tests/test_activity.py` (32 tests, the reviewers' 12 merged; seven
+  POSIX-only -- a datagram socket the test binds stands in for `/dev/log`, the
+  dead daemon, a stream socket, `/dev/full`, a FIFO, a planted symlink, the
+  socket a check names -- each saying so; the journal itself is #14's check, as
+  the issue says); the fixtures of the run, transport and reset-state tests set
+  `log = file:<tmp>/activity.log`, since the default falls back to stderr on
+  Windows. 22 mutations of the fix round, 20 reddened; the two race guards
+  (`O_NOFOLLOW` behind the `lstat` check, the pre-open regular-file check behind
+  the post-open one) are equivalent by design, and the map's claim that
+  `S_ISSOCK -> exists()` is a killable mutation was wrong for the same reason --
+  the connect probe is the guard. Noted for #14: the journal side is assertable
+  with `SYSLOG_IDENTIFIER`, `SYSLOG_PID`, `_UID` of the service user, `PRIORITY`
+  and `_COMM`; for #15/#16: the five fallback lines (a `udp:` destination has
+  two: `cannot resolve the host` and `cannot open`), the `--check-config`
+  resolutions, the level words, the file line shape, `--log`, `-n` to stderr,
+  and that a text syslog file may cut a very long `sent via` line where the
+  journal keeps it whole.
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main

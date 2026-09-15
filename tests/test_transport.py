@@ -63,7 +63,8 @@ def fake_mta(tmp_path: Path) -> Path:
 
 
 def make_config(tmp_path: Path, settings: str = "", to: str = "noc@example.net") -> Config:
-    text = (f"[logalert]\n{settings}\n[router-disk]\nsubject = Router disk failure\n"
+    text = (f"[logalert]\nlog = file:{(tmp_path / 'activity.log').as_posix()}\n{settings}\n"
+            f"[router-disk]\nsubject = Router disk failure\n"
             f"to = {to}\nfiles = {FILE}\npatterns =\n    disk failure\n")
     path = tmp_path / "logalert.conf"
     path.write_text(text, encoding="utf-8", newline="\n")

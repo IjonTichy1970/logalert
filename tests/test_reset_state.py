@@ -19,6 +19,7 @@ def config(tmp_path: Path) -> str:
     log = (tmp_path / "router.log").as_posix()
     text = (
         f"[logalert]\nstate_file = {(tmp_path / 'state' / 'state.json').as_posix()}\n"
+        f"log = file:{(tmp_path / 'activity.log').as_posix()}\n"
         # --check-config exits 2 without a usable transport since #11: the interpreter
         # stands in for sendmail (exists, executable, on both platforms)
         f"sendmail_path = {Path(sys.executable).as_posix()}\n"

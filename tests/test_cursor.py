@@ -384,6 +384,7 @@ def test_device_change_alone_continues_with_one_log_line(
         handle.write(b"c\n")
     saved = replace(log.cursor(), dev=log.dev + 1)
     caplog.set_level(logging.DEBUG, logger="logalert")
+    caplog.clear()  # the first sight above is a WARNING since #13, captured unasked
     log2, lines = scan(path, saved)
     assert log2.verdict == "continue" and texts(lines) == ["c"]
     messages = [r.getMessage() for r in caplog.records]

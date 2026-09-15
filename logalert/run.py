@@ -40,12 +40,12 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
   * ``--dry-run`` prints each message that would be sent (headers decoded, the body as a
     reader sees it) to stdout, sends nothing, writes nothing; exit 0 or 1 by the same rule.
     ``--debug`` attaches a DEBUG handler on stderr, breaking cron-quiet on purpose.
-  * The activity log (issue #13 wires its destinations; the library ``NullHandler`` swallows
-    it until then): the start (config path, section count) first of all, per file the lines
-    read and matched, per section the delivery (``transport`` logs it) or the failure with
-    the transport's answer and the Message-ID, every failed item once at ERROR where it is
-    collected, every expired entry, and the exit code at the end -- on every exit the run
-    returns (a killed run, Ctrl-C included, leaves no end line).
+  * The activity log (``logalert.activity`` wires its destinations, issue #13; the library
+    ``NullHandler`` swallows it otherwise): the start (config path, section count) first of
+    all, per file the lines read and matched, per section the delivery (``transport`` logs
+    it) or the failure with the transport's answer and the Message-ID, every failed item
+    once at ERROR where it is collected, every expired entry, and the exit code at the end
+    -- on every exit the run returns (a killed run, Ctrl-C included, leaves no end line).
 """
 
 import logging

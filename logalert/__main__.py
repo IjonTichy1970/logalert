@@ -1,17 +1,18 @@
 """Command-line entry point for logalert."""
 
 import argparse
-import contextlib
 import logging
 import os
 import sys
-from collections.abc import Iterator
 
-from logalert import __version__
+from logalert import __version__, activity
 from logalert.config import (
     DEFAULT_CONFIG_PATH,
+    RESERVED_SECTION,
     Config,
     ConfigError,
+    check_log,
+    check_log_target,
     describe,
     example_config,
     is_address,
@@ -29,6 +30,8 @@ from logalert.state import (
     lock_path,
 )
 from logalert.transport import DeliveryError, choose, deliver, resolve_sender
+
+log = logging.getLogger("logalert.main")
 
 EXIT_OK = 0
 EXIT_ATTENTION = 1  # ran, but something needs a look (a state problem, a stuck run, ...)
@@ -82,6 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--state-file", default=None, metavar="PATH",
         help="use this state file for the run instead of the configured one",
     )
+    parser.add_argument(
+        "--log", default=None, metavar="DEST",
+        help="write the activity log to DEST instead of the configured destination: "
+        "syslog, stderr, file:/absolute/path or udp:host:port",
+    )
     # The "do this and exit" modes exclude one another; a silent precedence would
     # let `--check-config --reset-state` validate and exit 0 without resetting anything.
     modes = parser.add_mutually_exclusive_group()
@@ -125,6 +133,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"-c: {args.context} is not a number of lines")
     if args.state_file is not None and not os.path.isabs(args.state_file):
         parser.error(f"--state-file: {args.state_file!r} is not an absolute path")
+    if args.log is not None:
+        try:
+            check_log("--log", args.log)
+        except ConfigError as exc:
+            parser.error(str(exc))
     mode = args.check_config or args.reset_state is not None or args.test_mail is not None
     if mode and (args.dry_run or args.attach or args.from_start or args.context):
         # a mode that ignored -n would reset state or send a test mail under a flag that
@@ -141,9 +154,22 @@ def main(argv: list[str] | None = None) -> int:
         # --reset-state's replace-an-unparseable-file escape hatch would overwrite the config
         print(f"logalert: state_file: {state_file} is the config file itself", file=sys.stderr)
         return EXIT_USAGE
-    with _debug_to_stderr(args.debug):
+    # the activity log for this call: the configured destination, or --log. A dry run logs
+    # to stderr unless --log says otherwise (it writes nothing, and its records belong in
+    # front of the operator, not in syslog as if they were a run's); a check never touches
+    # the destination -- it reports it
+    log_spec = args.log or config.settings.log
+    try:  # the loader checked its own paths; --log and --state-file change them
+        check_log_target("--log" if args.log else f"[{RESERVED_SECTION}] log", log_spec,
+                         state_file=state_file, config_path=config.path)
+    except ConfigError as exc:
+        print(f"logalert: {clean_header(str(exc))}", file=sys.stderr)
+        return EXIT_USAGE
+    to_stderr = args.check_config or (args.dry_run and args.log is None)
+    with activity.attach(log_spec, debug=args.debug, to_stderr=to_stderr):
         if args.check_config:
-            print(describe(config, args.sender, state_file))
+            resolved = activity.describe(log_spec) + (" (--log)" if args.log else "")
+            print(describe(config, args.sender, state_file, log=resolved))
             try:
                 choose(config.settings)  # auto with no sendmail is a configuration error
                 resolve_sender(config.settings, args.sender)  # a From the run would refuse
@@ -173,34 +199,6 @@ def _same_file(a: str, b: str) -> bool:
         return os.path.samefile(a, b)
     except OSError:
         return False
-
-
-class _OneLine(logging.Formatter):
-    """A record as one header-clean line: a section or file name from the config, an
-    archive name from a watched directory or a relay's reply may carry control characters
-    and line boundaries, and stderr is read line by line."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        return clean_header(super().format(record))
-
-
-@contextlib.contextmanager
-def _debug_to_stderr(enabled: bool) -> Iterator[None]:
-    """``--debug``: the activity log at DEBUG on stderr for this call only, so a process
-    that calls ``main()`` more than once does not accumulate handlers."""
-    if not enabled:
-        yield
-        return
-    logger = logging.getLogger("logalert")
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(_OneLine("logalert: %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG)
-    try:
-        yield
-    finally:
-        logger.removeHandler(handler)
-        logger.setLevel(logging.NOTSET)
 
 
 def test_mail(config: Config, section: str, override: str | None) -> int:
@@ -284,6 +282,7 @@ def _reset(config: Config, path: str, target: str) -> int:
             return EXIT_ATTENTION
         # The escape hatch: a state file nothing can read is replaced, not repaired.
         State(path).save()
+        log.warning("%s; replaced it with an empty state (--reset-state)", problem)
         print(f"{problem}; replaced it with an empty state")
         return EXIT_OK
     if target == RESET_ALL:
@@ -302,6 +301,7 @@ def _reset(config: Config, path: str, target: str) -> int:
             return EXIT_ATTENTION
     state.save()
     what = "every file" if target == RESET_ALL else target
+    log.info("forgot %d cursor(s) for %s (--reset-state)", count, what)
     print(f"forgot {count} cursor(s) for {what}; the next run starts at the current end "
           f"(or the beginning, per the section's start = setting)")
     return EXIT_OK

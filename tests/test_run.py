@@ -49,6 +49,7 @@ class Site:
         self.state_dir = tmp_path / "state"
         self.state_dir.mkdir()
         self.state_file = self.state_dir / "state.json"
+        self.activity_log = tmp_path / "activity.log"  # not in the state dir: tests remove it
         self.fake_dir = tmp_path / "fake"
         monkeypatch.setenv("LOGALERT_FAKE_DIR", str(self.fake_dir))
         for knob in ("LOGALERT_FAKE_SLEEP", "LOGALERT_FAKE_EXIT", "LOGALERT_FAKE_EXIT_IF_RCPT",
@@ -60,10 +61,12 @@ class Site:
 
     def write_config(self, settings: str = "", router: str = "", firewall: str = "",
                      router_to: str = "noc@example.net", sendmail: str | None = None,
-                     firewall_files: str | None = None) -> None:
+                     firewall_files: str | None = None, log: str | None = None) -> None:
         fw_files = firewall_files or self.firewall.as_posix()
+        log = log or f"file:{self.activity_log.as_posix()}"
         text = (f"[logalert]\nsendmail_path = {sendmail or self.binary.as_posix()}\n"
-                f"state_file = {self.state_file.as_posix()}\nfrom = {SENDER}\n{settings}\n"
+                f"state_file = {self.state_file.as_posix()}\nfrom = {SENDER}\n"
+                f"log = {log}\n{settings}\n"
                 f"[router-disk]\nsubject = Router disk failure\nto = {router_to}\n"
                 f"files = {self.router.as_posix()}\npatterns =\n    disk failure\n{router}\n"
                 f"[firewall]\nsubject = Firewall denies\nto = fw@example.net\n"
@@ -101,6 +104,13 @@ class Site:
 
     def offset(self, section: str, path: Path) -> int:
         return int(self.state()[section][path.as_posix()]["offset"])
+
+    def activity(self) -> list[str]:
+        """The activity log so far, each line without its timestamp and ident."""
+        if not self.activity_log.exists():
+            return []
+        lines = self.activity_log.read_text(encoding="utf-8").splitlines()
+        return [line.split("]: ", 1)[1] for line in lines]
 
 
 @pytest.fixture
@@ -358,9 +368,14 @@ def test_dry_run_prints_the_mails_sends_nothing_and_writes_nothing(
     written = site.state_file.read_bytes()
     site.append(site.router, "disk failure now")
     site.append(site.firewall, "DENY 192.0.2.9")
+    recorded = site.activity()
     assert site.run("--dry-run") == 0
     out = capsys.readouterr()
-    assert out.err == ""
+    # the dry run's log goes to stderr (issue #13), never to the configured destination
+    assert out.err.splitlines()[0].startswith("logalert: start: ")
+    assert out.err.splitlines()[0].endswith("2 section(s) (dry run)")
+    assert out.err.splitlines()[-1] == "logalert: end: exit 0"
+    assert site.activity() == recorded
     assert "Subject: Router disk failure -- 1 match(es)" + NL in out.out
     assert "Subject: Firewall denies -- 1 match(es)" + NL in out.out
     assert "3: disk failure now" in out.out and "=?utf-8?" not in out.out
@@ -369,7 +384,7 @@ def test_dry_run_prints_the_mails_sends_nothing_and_writes_nothing(
     elsewhere = site.root / "nowhere" / "state.json"
     assert site.run("-n", "--state-file", str(elsewhere)) == 0
     assert not (site.root / "nowhere").exists()
-    assert capsys.readouterr().err == ""
+    assert "logging to stderr" not in capsys.readouterr().err  # no fallback: nothing to open
 
 
 def test_context_from_the_command_line_and_the_sections_override(
@@ -407,8 +422,8 @@ def test_debug_puts_the_activity_log_on_stderr(
                 logger.removeHandler(handler)
         logger.setLevel(logging.NOTSET)
     err = capsys.readouterr().err
-    assert "logalert: INFO logalert.run: start: " in err
-    assert "logalert: INFO logalert.run: end: exit 0" in err
+    assert "logalert: start: " in err
+    assert "logalert: end: exit 0" in err
 
 
 # -- expiry and rotation ------------------------------------------------------------------------
@@ -650,7 +665,7 @@ def test_debug_output_is_one_clean_line_per_record_and_leaves_no_handler(
     assert esc not in err and nel not in err
     assert err.count(NL) == len(err.splitlines())
     assert not any(line.startswith("logalert: forged") for line in err.splitlines())
-    assert "logalert: INFO logalert.run: start: " in err
+    assert "logalert: start: " in err
 
 
 def test_a_directory_listed_as_a_file_names_the_reason_once(
@@ -828,7 +843,7 @@ def test_debug_puts_debug_records_on_stderr(
                 logger.removeHandler(handler)
         logger.setLevel(logging.NOTSET)
     err = capsys.readouterr().err
-    assert "logalert: DEBUG logalert.lock: lock " in err  # the lock's own DEBUG line
+    assert "logalert: debug: lock " in err  # the lock's own DEBUG line
 
 
 # -- a file absent this run, a read that fails mid-stream ---------------------------------------
@@ -1033,6 +1048,7 @@ def test_dry_run_with_an_unreadable_file_is_exit_1_with_the_line(
     assert site.run("-n") == 1
     out = capsys.readouterr()
     assert "Subject: Router disk failure -- 1 match(es)" + NL in out.out
-    assert out.err == (f"logalert: 1 of 1 section would be sent; failed: [firewall] "
-                       f"{site.firewall.as_posix()}: Permission denied; see the log" + NL)
+    assert out.err.splitlines()[-1] == (  # after the dry run's log, the one line
+        f"logalert: 1 of 1 section would be sent; failed: [firewall] "
+        f"{site.firewall.as_posix()}: Permission denied; see the log")
     assert site.calls() == []

@@ -180,6 +180,8 @@ def load_config(path: str) -> Config:
     for name in parser.sections():
         if name == RESERVED_SECTION:
             settings = _load_settings(parser[name], warnings)
+            check_log_target(f"[{RESERVED_SECTION}] log", settings.log,
+                             state_file=settings.state_file, config_path=path)
         elif name.lower() == RESERVED_SECTION:
             raise ConfigError(
                 f"[{name}]: the name is reserved for the global settings; spell it "
@@ -214,11 +216,13 @@ def _load_settings(section: configparser.SectionProxy, warnings: list[str]) -> S
         raise ConfigError(f"{where} smtp_host: required when transport = smtp")
 
     log = _optional(where, section, "log") or "syslog"
-    _check_log(where, log)
+    check_log(f"{where} log", log)
+    state_file = _abs_path(where, section, "state_file", DEFAULT_STATE_FILE)
+    _outside_venv(f"{where} state_file", state_file)
 
     return Settings(
         from_address=from_address,
-        state_file=_abs_path(where, section, "state_file", DEFAULT_STATE_FILE),
+        state_file=state_file,
         log=log,
         transport=cast(Literal["auto", "sendmail", "smtp"], transport),
         sendmail_path=_abs_path(where, section, "sendmail_path", DEFAULT_SENDMAIL_PATH),
@@ -233,24 +237,89 @@ def _load_settings(section: configparser.SectionProxy, warnings: list[str]) -> S
     )
 
 
-def _check_log(where: str, log: str) -> None:
+def check_log(label: str, log: str) -> None:
+    """The activity log destination ``log =`` and ``--log`` (issue #13) accept: ``syslog``,
+    ``stderr``, ``file:/absolute/path`` outside the venv, ``udp:host:port``. ``label`` names
+    the setting in the error (``[logalert] log`` or ``--log``)."""
     if log in ("syslog", "stderr"):
         return
     if log.startswith("file:"):
         target = log[len("file:"):]
         if not target or not ospath.isabs(target):
-            raise ConfigError(f"{where} log: file: needs an absolute path, got {target!r}")
+            raise ConfigError(f"{label}: file: needs an absolute path, got {target!r}")
+        _no_nul(label, target)
+        _outside_venv(label, target)
         return
     if log.startswith("udp:"):
-        host, sep, port = log[len("udp:"):].rpartition(":")
-        # isdigit() alone accepts digits int() rejects (superscripts, other scripts)
-        digits = port.isascii() and port.isdigit()
-        if not sep or not host or not digits or not 1 <= int(port) <= 65535:
-            raise ConfigError(f"{where} log: udp: needs host:port, got {log[4:]!r}")
+        try:
+            udp_address(log)
+        except ValueError:
+            raise ConfigError(f"{label}: udp: needs host:port, got {log[4:]!r}") from None
         return
     raise ConfigError(
-        f"{where} log: expected syslog, stderr, file:/absolute/path or udp:host:port, got {log!r}"
+        f"{label}: expected syslog, stderr, file:/absolute/path or udp:host:port, got {log!r}"
     )
+
+
+def _outside_venv(label: str, target: str) -> None:
+    """Configuration and state live outside the venv: the upgrade and uninstall procedures
+    in INSTALL.md wipe it whole. Only meaningful when this interpreter IS a venv
+    (``sys.prefix != sys.base_prefix``); compared by real path."""
+    if sys.prefix == sys.base_prefix:
+        return
+    venv = ospath.normcase(ospath.realpath(sys.prefix)).rstrip(os.sep)
+    real = ospath.normcase(ospath.realpath(target))
+    if real == venv or real.startswith(venv + os.sep):  # commonpath raises across drives
+        raise ConfigError(f"{label}: {target} is inside the venv ({sys.prefix}), which the "
+                          f"upgrade procedure wipes")
+
+
+def udp_address(log: str) -> tuple[str, int]:
+    """The ``(host, port)`` of a ``udp:host:port`` destination; ``udp:[2001:db8::1]:514`` is
+    the IPv6 spelling (the brackets are the address's, not the host's -- measured, glibc
+    cannot resolve ``[::1]``). ``ValueError`` when the shape is wrong."""
+    host, sep, port = log[len("udp:"):].rpartition(":")
+    if host[:1] == "[" and host[-1:] == "]":
+        host = host[1:-1]
+    # isdigit() alone accepts digits int() rejects (superscripts, other scripts)
+    digits = port.isascii() and port.isdigit()
+    if not sep or not host or not digits or not 1 <= int(port) <= 65535:
+        raise ValueError(log)
+    return host, int(port)
+
+
+def check_log_target(label: str, log: str, *, state_file: str, config_path: str) -> None:
+    """A ``file:`` destination must not be the state file, the run lock beside it or the
+    config file: measured, the log written into the state file corrupts it before every
+    run (and ``--reset-state`` writes a fresh state the next record overwrites), into the
+    config it doubles a key and every mode is exit 2 until the operator hand-edits it. Both
+    the loader and ``--log`` apply it, each with the paths it knows."""
+    if not log.startswith("file:"):
+        return
+    target = log[len("file:"):]
+    lock = ospath.join(ospath.dirname(state_file), "lock")  # state.lock_path, sans import
+    for other, what in ((state_file, "the state file"), (lock, "the run lock"),
+                        (config_path, "the config file")):
+        if _same_path(target, other):
+            raise ConfigError(f"{label}: {target} is {what}")
+
+
+def _same_path(a: str, b: str) -> bool:
+    """One path or two, for files that may not exist yet: real paths, case-folded where the
+    platform does; ``samefile`` for two that exist (a hard link, a bind mount)."""
+    try:
+        if ospath.samefile(a, b):
+            return True
+    except (OSError, ValueError):
+        pass
+    return ospath.normcase(ospath.realpath(a)) == ospath.normcase(ospath.realpath(b))
+
+
+def _no_nul(label: str, value: str) -> None:
+    # configparser passes U+0000 through; realpath and open raise ValueError on it, a
+    # traceback instead of exit 2
+    if chr(0) in value:
+        raise ConfigError(f"{label}: contains a NUL character")
 
 
 # -- watch sections --------------------------------------------------------------------------
@@ -463,6 +532,7 @@ def _abs_path(where: str, section: configparser.SectionProxy, key: str, default:
 
 
 def _check_path(where: str, key: str, value: str) -> None:
+    _no_nul(f"{where} {key}", value)
     if not ospath.isabs(value):
         raise ConfigError(f"{where} {key}: {value!r} is not an absolute path")
     if any(char in _GLOB_CHARS for char in value):
@@ -573,10 +643,12 @@ def _sendmail_note(path: str) -> str:
     return "NOT FOUND -- install an MTA or set transport = smtp"
 
 
-def describe(config: Config, sender: str | None = None, state_file: str | None = None) -> str:
+def describe(config: Config, sender: str | None = None, state_file: str | None = None,
+             log: str | None = None) -> str:
     """The effective settings, one ASCII line each, for ``--check-config``; ``sender`` is
     ``--from`` and ``state_file`` is ``--state-file``, each of which wins over the config
-    for the run it is given to."""
+    for the run it is given to; ``log`` is the destination as ``activity.describe`` resolves
+    it (with `` (--log)`` when the command line chose it), else the setting is printed."""
     settings = config.settings
     out: list[str] = [f"config: {config.path}"]
     if settings.transport == "auto":
@@ -604,7 +676,7 @@ def describe(config: Config, sender: str | None = None, state_file: str | None =
         out.append(f"state_file: {state_file} (--state-file)")
     else:
         out.append(f"state_file: {settings.state_file}")
-    out.append(f"log: {settings.log}")
+    out.append(f"log: {log if log is not None else settings.log}")
     out.append(f"mail_timeout: {settings.mail_timeout:g}s; lock_stale: {settings.lock_stale}s; "
                f"state_ttl: {settings.state_ttl_days} days; "
                f"subject_suffix: {'yes' if settings.subject_suffix else 'no'}")
