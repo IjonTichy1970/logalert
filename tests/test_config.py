@@ -25,6 +25,7 @@ from logalert.config import (
     describe,
     example_config,
     from_warning,
+    is_address,
     load_config,
 )
 
@@ -577,3 +578,20 @@ def test_module_run_check_config(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "[router-disk] subject: Router disk failure" in result.stdout
+
+
+# -- is_address (#10): the loader's rule as a boolean, for compose and --from -----------------
+
+
+@pytest.mark.parametrize("value, ok", [
+    ("noc@example.net", True),
+    ("a+b@example.net", True),
+    ("Log Alert <noc@example.net>", False),
+    ("-noc@example.net", False),
+    ("noc@example.net" + chr(10), False),  # fullmatch: a trailing newline is not a match
+    ("n" + chr(0xE9) + "c@example.net", False),
+    ("noc@", False),
+    ("nobody", False),
+])
+def test_is_address_is_the_loaders_rule(value: str, ok: bool) -> None:
+    assert is_address(value) is ok

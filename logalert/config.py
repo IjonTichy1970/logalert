@@ -463,6 +463,12 @@ def _check_path(where: str, key: str, value: str) -> None:
         )
 
 
+def is_address(value: str) -> bool:
+    """The bare ``local@domain`` the loader accepts: what ``from``, ``to`` and ``--from``
+    (issue #12) must be. ``_check_address`` says which rule a rejected value broke."""
+    return value.isascii() and not value.startswith("-") and _ADDRESS.fullmatch(value) is not None
+
+
 def _check_address(where: str, key: str, value: str) -> None:
     if value.startswith("-"):
         raise ConfigError(f"{where} {key}: {value!r} starts with '-'")

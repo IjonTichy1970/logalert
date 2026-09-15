@@ -253,4 +253,85 @@ new entry.
   hook answering from an archive that had yielded nothing -- fixed and pinned,
   with the reviewer's tests that named their mutations merged into the suite.
 
+- `[contract]` **Alert email composition: one 7-bit-clean message per section, a
+  summary in both modes, the report inline or attached, the priority headers
+  only when configured** (#10). `logalert/mail.py` is the single home of the
+  message's shape: `compose()` turns a section's reports into a `Mail`, and the
+  transports (#11) and the run loop (#12) consume it. The message is built under
+  `email.policy.default.clone(cte_type="7bit")`, so `set_content` picks `7bit`
+  for ASCII lines of at most 78 characters and quoted-printable or base64
+  otherwise -- no wire line ever exceeds 78 bytes whatever a log line holds (dma
+  rejects an unencoded line over 998 bytes, and nothing folds one);
+  `max_line_length` stays at 78 because at 998 a non-ASCII subject folded into
+  one 280-character encoded-word (RFC 2047 caps them at 75). Headers, in this
+  order and all before the content: `From`, `To`, `Subject`, `Date` (the local
+  time with its offset), `Message-ID` (the From's domain, no lookup),
+  `Auto-Submitted: auto-generated`, `X-Prepared-By: logalert <version>`,
+  `X-Logalert-Section`; then ONLY when the section or a matched tag set a
+  priority -- the system is off by default -- `X-Logalert-Priority:
+  high|medium|low` with the conventional `X-Priority: 1|3|5` and `Importance:
+  high|normal|low`, carrying the highest across the mail's matches, stored or
+  not. The subject is the section's `subject` then ` -- N match(es)` (the
+  literal a filter can key on) unless `subject_suffix = no`. The body opens with
+  a summary in both modes -- the subject, the count, the host and the run time
+  on one line, then `Section:`, `Priority:` (when set), one `Files:` row per
+  file read with its match count, the lines read and any dropped by an exclude,
+  and the `Message-ID:` the activity log will carry, so an alert can be traced
+  to its run. `report = inline` continues with the report; `report = attachment`
+  (or `--attach`, wired in #12) attaches it as `text/plain` named
+  `<section>-<YYYYmmddTHHMM>.txt`, the section name reduced to `[A-Za-z0-9._-]`,
+  never starting with `-` (an option to a shell tool in the download directory)
+  or `.` (hidden), at most 40 characters -- measured, from 48 the stdlib folds
+  the name into RFC 2231 continuations some clients show as `ATT00001.txt`. The
+  report is `grep -n -C`'s vocabulary as measured for #9: a `tail`-style `==>
+  file <==` header per physical file (the archive's tail before the live file
+  after a rotation), `N: text` for a match, `N- text` for context, `--` for
+  omitted lines, the fragments of a cut line as one line ending in ` [cut]` when
+  the cap dropped the rest. `max_lines` is applied here, in its documented unit:
+  at most that many MATCHING lines per email across the section's files in
+  order, each with its context, then one trailer `... and N more matching
+  line(s)` with the exact remainder; after the last budgeted match only its own
+  after-window follows -- a NUL-only line the reader skipped inside that window
+  does not end it, a change of physical file does, as it does the scan's (the
+  verification of this entry reproduced the live file's header and two of its
+  lines printed before the trailer, and it is pinned). For that, #9's
+  `scan(cap=)` changes unit -- it stored the first `cap` report ENTRIES and now
+  stores the first `cap` matching lines with the context of each (an entry cap
+  of 200 cut the window of match 26 at `-c 3`); `FileReport` records its
+  `context` width and loses `omitted` (`matched - len(matches)` says it).
+  Sanitised before composition: a lone surrogate becomes `?` (`set_content`
+  raises on one), CR is removed (a bare CR is a line break to the encoder),
+  every other C0 control except TAB and LF, and DEL, become U+FFFD (measured: a
+  NUL and a form feed ride through `7bit` to the relay untouched); in a header
+  value TAB and the line boundaries that pass that -- LF, and NEL, LS and PS --
+  become a space. ⭐ The review reproduced why that last rule exists: U+0085,
+  U+2028 and U+2029 are one line to `configparser` and to the loader's
+  single-line rule, survive a C0-only sanitiser, and are exactly what
+  `EmailMessage` refuses in a header -- a `ValueError` on every run for a
+  section whose subject carried one, before any transport. The From must be the
+  bare `local@domain` the loader accepts, now a public `config.is_address()`
+  that `--from` (#11/#12) applies too; anything else is refused with a
+  `ValueError` naming the fix (`set from = in [logalert]`). ⭐ The native run
+  decided that: Python 3.12.10 on the dev host renders a From of `x@` as `<>`,
+  and 3.12.3 in the sandbox -- Ubuntu 24.04's -- raises `IndexError` from the
+  header parser on the same input; a tolerant path would have depended on the
+  patch level. `Mail.flatten("sendmail"|"smtp")` produces the exact bytes once
+  per transport and caches them -- LF for the sendmail pipe, CRLF
+  (`email.policy.SMTP`) for SMTP DATA, one byte per line apart -- and `len()` of
+  the one handed over is the size the log reports; a header added after a
+  transport's `flatten` never reaches that transport's wire. `Mail.preview()` is
+  what `--dry-run` (#12) prints: the headers decoded, the body as a reader sees
+  it, each attachment's text under its name -- never the quoted-printable wire.
+  Three review lenses (wire fidelity against `BytesParser` round trips, 300
+  random streams against `grep -n -C` and 400 against an independent budget
+  reference; specification fidelity and the #11/#12/#13 consumers; mutation
+  testing and hostile input) also reproduced the Message-ID domain cut from the
+  raw sender, the RFC 2231 threshold and the after-window gap above -- all
+  fixed, 18 deliberate mutations reddened by the merged tests. Recorded for the
+  issues that own them: the loader accepts a duplicate entry in `files` and has
+  no address length cap (a 1000-character local part puts a 1013-byte `To` line
+  on the wire, over RFC 5322's 998), an unreadable file is absent from the
+  summary, and nothing but `max_lines` x the context x `MAX_FRAGMENTS` x
+  `LINE_CAP` bounds a mail's size (about 23 MB worst case at the defaults).
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main

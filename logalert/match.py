@@ -30,9 +30,10 @@ the saved offset. The rules (decided in issue #9):
     fragment of a matching line is a ``match`` entry. Context never crosses files: a
     change of physical file empties the window, and the ``before`` hook serves only the
     file the stream started in.
-  * A report is bounded: past ``cap`` entries nothing more is stored, only counted, so a
-    first run from the top of a large log cannot hold the whole log in memory. The
-    priority is tracked as the matches arrive, never from the stored list.
+  * A report is bounded: after ``cap`` matching lines (the unit of ``max_lines``) and the
+    context that follows the last of them nothing more is stored, only counted, so a first
+    run from the top of a large log cannot hold the whole log in memory. The priority is
+    tracked as the matches arrive, never from the stored list.
 """
 
 import logging
@@ -81,12 +82,12 @@ class FileReport:
 
     file: str
     matches: list[Match] = field(default_factory=list)  # the first ``cap`` of them
-    entries: list[Entry] = field(default_factory=list)  # the first ``cap`` of them
-    matched: int = 0  # every match, stored or not
-    omitted: int = 0  # entries past the cap, counted only
+    entries: list[Entry] = field(default_factory=list)  # those matches and their context
+    matched: int = 0  # every match, stored or not: ``matched - len(matches)`` were not
     excluded: int = 0  # matching lines dropped by an exclude
     lines: int = 0  # lines examined
     priority: Priority | None = None  # the highest among every match, stored or not
+    context: int = 0  # the window the entries were built with
 
 
 def highest(priorities: Iterable[Priority | None]) -> Priority | None:
@@ -147,9 +148,9 @@ def scan(file: str, lines: Iterable[Line], watch: Watch, *, context: int,
     supplies up to ``n`` lines from before the stream (the saved offset) when the first match
     comes within ``context`` lines of it, and is called at most once. A physical line matches
     when any of its fragments does, and is excluded when any of its fragments is. ``cap``
-    bounds the stored entries and matches; everything is still counted.
+    bounds the stored matches (with the context of each); everything is still counted.
     """
-    report = FileReport(file=file)
+    report = FileReport(file=file, context=max(context, 0))
     pending: deque[list[Line]] = deque(maxlen=max(context, 0))
     after = 0
     last = 0  # the number of the last line emitted; 0 before any
@@ -157,14 +158,14 @@ def scan(file: str, lines: Iterable[Line], watch: Watch, *, context: int,
     emitted = False
     first_path: str | None = None  # the file the stream started in: the hook's file
     current_path: str | None = None
+    capped = False  # the cap-th match and its trailing context are in; count, store nothing
 
     def emit(line: Line, kind: Kind) -> None:
         nonlocal last, last_path, emitted
         # omitted lines, or another physical file (the archive before the live file)
         gap = emitted and (line.number > last + 1 or line.path != last_path)
         last, last_path, emitted = line.number, line.path, True
-        if cap is not None and len(report.entries) >= cap:
-            report.omitted += 1
+        if capped:
             return
         if gap:
             report.entries.append(GAP)
@@ -190,7 +191,9 @@ def scan(file: str, lines: Iterable[Line], watch: Watch, *, context: int,
             priority = highest(p.priority or watch.priority for p in found)
             report.matched += 1
             report.priority = highest((report.priority, priority))
-            if cap is None or len(report.matches) < cap:
+            if cap is not None and report.matched > cap:
+                capped = True
+            else:
                 report.matches.append(Match(file=file, number=head.number, text=text,
                                             cut=any(f.cut for f in group), pattern=found[0],
                                             priority=priority, path=head.path))

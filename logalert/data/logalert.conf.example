@@ -118,7 +118,8 @@ patterns =
 # command line's -c, which defaults to 0.
 #context = 0
 
-# Flood cap: at most this many matching lines per email ("... and N more").
+# Flood cap: at most this many matching lines per email, each with its
+# context; the rest is one trailer, "... and N more matching line(s)".
 #max_lines = 200
 
 # On the first run, where to begin in each file: end (default -- no flood of
