@@ -9,6 +9,10 @@ its notes.
 
 ### Nitty Gritty
 
+## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
+
+### Nitty Gritty
+
 - `[contract]` **Project bootstrap: packaging, CI, and the release workflow**
   (#1). `pyproject.toml` is the single source of the version (`0.1.0`), with
   `logalert.__version__` derived from installed metadata; MIT as a PEP 639 SPDX
@@ -1134,4 +1138,5 @@ standing rule; 🔶 an owner's call, with its reasoning. The prose separator is
 new entry.
 
 
-[Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main
+[Unreleased]: https://github.com/IjonTichy1970/logalert/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/IjonTichy1970/logalert/releases/tag/v0.1.0
