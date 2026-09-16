@@ -14,6 +14,12 @@ its notes.
   gate refuses an entry over six lines. Every earlier entry is rewritten to the
   shape.
 
+- `[contract]` **Python 3.11 is the floor: the wheel installs on Debian 12's
+  only Python** (#53). The code's measured floor was 3.11 all along; 3.12 was
+  the metadata's claim. CI gains a 3.11 leg, mypy reads the 3.11 typeshed on
+  every host, and a test pins the floor, the classifiers, the CI matrix and
+  the documents together.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

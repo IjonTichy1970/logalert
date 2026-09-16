@@ -587,8 +587,8 @@ def _parser_error(path: str, exc: configparser.Error) -> str:
     elif isinstance(exc, configparser.MissingSectionHeaderError):
         what = "the file must start with a section header such as [logalert]"
     elif isinstance(exc, configparser.ParsingError):
-        # exc.errors is (lineno, line) pairs; the line's spelling differs across 3.12-3.14
-        # (repr there, raw text later), so only the numbers are reported
+        # exc.errors is (lineno, line) pairs; the line's spelling differs across 3.11-3.14
+        # (repr on 3.11 and 3.12, raw text later), so only the numbers are reported
         numbers = [n for n, _ in exc.errors]
         others = f" (also line(s) {', '.join(map(str, numbers[1:]))})" if numbers[1:] else ""
         return (f"{path}:{numbers[0]}: not 'key = value', a [section] header or an indented "
