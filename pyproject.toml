@@ -14,6 +14,7 @@ authors = [{ name = "IjonTichy1970" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
+    "Operating System :: POSIX :: Linux",       # what CI tests (the classifier rule in CLAUDE.md)
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",   # MUST mirror the CI matrix in .github/workflows/ci.yml
     "Programming Language :: Python :: 3.13",
@@ -28,6 +29,11 @@ dependencies = []
 # dev host mypy's compiled wheel is blocked by an Application Control policy -- install it as
 # `pip install --no-binary mypy mypy` there (pure Python, slower, same verdicts).
 dev = ["ruff>=0.5", "mypy>=1.10", "pytest>=8", "build>=1"]
+# The changelog site (tools/render_changelog.py, .github/workflows/pages.yml): `markdown` renders
+# the entries' text; `types-Markdown` is its stubs for mypy --strict (the package ships none).
+# `--check` needs neither (the gate's `changelog structure` stage runs on `dev` alone), but the
+# gate's mypy stage and the render test do: a dev venv is `.[dev,docs]`, as is CI's.
+docs = ["markdown>=3.5", "types-Markdown"]
 
 [project.urls]
 Homepage = "https://github.com/IjonTichy1970/logalert"

@@ -5,36 +5,6 @@ section accumulates changes as they merge; the release step rolls it under a
 version, and the GitHub Release for that version carries the rolled section as
 its notes.
 
-**Everything gets an entry.** Internal work (CI, tooling, refactors, tests,
-hardening) is recorded too, because later corrections, guards and post-mortems
-cite it. All of it goes under **Nitty Gritty**, the only category, last in each
-version.
-
-⚠️ **Every entry is tagged `[contract]` or `[internal]`, and the tag is
-load-bearing, not decorative:**
-
-- **`[contract]`** -- touches anything an operator's deployment depends on: the
-  command-line surface, the configuration format, on-disk state and log layout,
-  the service unit, the install procedure. The release step scans for these and
-  writes the upgrade notes from them.
-- **`[internal]`** -- no operator-visible surface. Everything else.
-
-⚠️ **An untagged `[contract]` change is worse than an unrecorded one.**
-Operators upgrade on their own schedule, so the release notes are the only
-warning they get: the release step would report "no contract changes -- nothing
-to do on upgrade", and be believed. **If you are unsure which a change is, it is
-`[contract]`. An untagged entry stops the release.**
-
-Format: `- ` + the tag in backticks + an optional marker + a **bold headline
-sentence** + `(#N)` + a period + the body, wrapped at 80 display columns with
-two-space continuation (`tools/reflow_md.py --check` enforces; reflow only the
-new block, never the whole file). Markers: 🚨 a wrong claim or a check that
-measured nothing; ⭐ the insight or the control that proved it; ⚠️ a caveat or
-standing rule; 🔶 an owner's call, with its reasoning. The prose separator is
-`--`; version headings use the em dash. A false claim being corrected is quoted
-*"in italics inside double quotes"*, left in place, and cross-referenced from a
-new entry.
-
 ## [Unreleased]
 
 ### Nitty Gritty
@@ -1003,5 +973,165 @@ new entry.
   was red on mypy alone. Fixed by typing the field as `socket.SocketKind`; mypy
   2.3.1 natively in the sandbox is clean on all 40 files, and `CLAUDE.md` now
   says that mypy must run natively before a `/ship` that touches a POSIX branch.
+
+- `[internal]` **The changelog as a page: `tools/render_changelog.py` renders
+  this file to a GitHub Pages site and is the gate's structural check for it**
+  (#17). One page from one file, no framework: the renderer parses the
+  changelog's STRUCTURE itself -- the header, the version sections (`##
+  [Unreleased]` and `## [x.y.z] — date — label`, the shape the release roll
+  writes), one `### Nitty Gritty` each with its entries (`- ` + the tag in
+  backticks, an optional marker, the bold headline, `(#N)`, the body), the `##
+  About this changelog` afterword and the footer links -- and hands only the
+  entries' text to `markdown`. The page, `site/index.html`: an inline
+  stylesheet, a table of contents, one `<section>` per version (`unreleased`,
+  `v0-1-0`), the tag as a badge, every `(#N)` linked to its issue, each entry
+  anchored (`issue-N`), the marker emoji as text, no external assets; a
+  `<`-shaped word outside a code span is escaped, so `<pid>` in an entry is
+  prose, not a tag. **A structural defect is exit 1, naming the line:** an entry
+  without a tag or with a misspelled one (`[contact]`, `[Internal]`), an entry
+  outside a `### Nitty Gritty`, a second one under a version, a heading of
+  another shape, a repeated version, released versions out of order, the About
+  section anywhere but last, no `## [Unreleased]`; **a file it cannot read is
+  exit 2**, could-not-check, never a pass. `--check` parses without writing and
+  without importing `markdown`, and the gate runs it as the `changelog
+  structure` stage between `changelog refs` and `ruff` (#4's stage list gains
+  one): entry-then-gate now means `/ship` sees an untagged entry before CI does,
+  and the doctrine's "an untagged entry stops the release" is a check, not a
+  reading. `.github/workflows/pages.yml` builds the page on every pull request
+  and on a push to `main`, and deploys it from `main` only
+  (`actions/upload-pages-artifact@v5`, `actions/deploy-pages@v5`, the
+  `github-pages` environment, one deploy at a time and never cancelled); the
+  site is `https://ijontichy1970.github.io/logalert/` once Pages is enabled with
+  Source = GitHub Actions -- ⚠️ an owner action, BEFORE this batch merges, or
+  the first deploy on `main` fails. #1's docs `paths-ignore` stands, and the
+  rule `CLAUDE.md` drew from it changes: a docs-only PR gets the Pages build
+  now, not "NO CI checks"; it stays could-not-check for everything else (the
+  local gate stands in, and `git diff --name-only main..HEAD` must be docs-only
+  before the merge). A `docs` extra (`markdown>=3.5` and `types-Markdown` -- the
+  package ships no stubs) carries the renderer's dependency and the runtime
+  `dependencies` stay empty; the gate's `mypy` stage and the render test need
+  it, so every dev venv is `.[dev,docs]` (`CLAUDE.md` twice, `tools/gate.sh`'s
+  header, `INSTALL.md`, `ci.yml` and the release skill: a `.[dev]` venv ran a
+  red gate on both platforms, and a test pins the five spellings equal). 🔶 The
+  owner's call, mid-implementation: the explanatory text moves from the top of
+  this file to a trailing `## About this changelog` section -- a reader of a
+  changelog knows what one is; the versions come first. #4's *"This changelog
+  moves to the doctrine in its header"* is now that section, the only definition
+  of the policy and the tags; the renderer parses it as an afterword and refuses
+  it anywhere but last; `CLAUDE.md` says where a new entry goes (the end of
+  `[Unreleased]`, before the next version heading or that section), and
+  `tools/check_changelog_refs.py`'s wording follows. The review (four lenses:
+  the renderer by reproduction, the two workflows, an operator reading the
+  documents in the sandbox, spec fidelity and mutation) made 27 findings, 18
+  reproduced, all taken: the code-span rule now mirrors markdown's (a
+  backslash-escaped backtick opened a span for the renderer and not for
+  `markdown`, and raw HTML between it and the next real backtick reached the
+  page -- reproduced with a `<script>`); two `## [Unreleased]` headings (a
+  half-applied release roll) rendered two sections with one anchor and are a
+  defect now; a non-UTF-8 file and an unwritable `site/` are exit 2 with a
+  message, not a traceback, and a UTF-8 BOM is dropped; a `[ref]` in the intro
+  or the About section resolves; the three exit codes were compared against
+  themselves in the test and are pinned to their literals; `--check` is proven
+  to run with `markdown` unimportable. 39 tests, Windows-real (pure text); one
+  renders the real `CHANGELOG.md`, so the suite is red the moment this file is.
+  Windows 696 passed / 26 skips; native 724 / 7. Held after checking: the action
+  majors and their inputs match, the deploy guard skips every pull request, `pip
+  install -e ".[docs]"` builds on Ubuntu 24.04. The sandbox's Python 3.12 venv
+  gained the `docs` extra, so the native-mypy rule of #13 keeps meaning what it
+  says.
+
+- `[contract]` **README and INSTALL.md for the operator: what logalert is, what
+  it needs, and the install guide carried on through configuration, mail, the
+  schedule and the log** (#16). `README.md` is rewritten around the operator:
+  three sentences on what the program does, a ten-line configuration (a
+  `[logalert]` section and one watch, loaded by a test, its keys a subset of
+  `--example-config`'s), the cron line, the requirements (Linux -- what CI
+  tests; FreeBSD expected to work but ungated; Python 3.12 or newer as a
+  versioned binary; an MTA providing `/usr/sbin/sendmail`, or an SMTP relay),
+  the four-command install, and the links: `INSTALL.md`, `docs/USAGE.md`,
+  `CHANGELOG.md` and its rendered page (#17); the "being built" paragraph goes.
+  `INSTALL.md` continues past the venv. **5. Configuration and state:**
+  `/etc/logalert.conf` from `--example-config`; the service user (`useradd
+  --system --no-create-home --shell /usr/sbin/nologin logalert`);
+  `/var/lib/logalert` created by `install -d -o logalert -g logalert -m 750` and
+  owned by that user -- the state and the lock live there, never under the venv,
+  and a run as root against that directory is refused. **6. Mail:** an MTA, or
+  `transport = smtp` with `smtp_host`; then `sudo -u logalert logalert
+  --check-config` and `--test-mail SECTION`, at the END of this step -- one step
+  earlier, where the first draft had them, both exit 2 on the fresh host the
+  document describes, because the transport does not exist yet (the review's
+  operator lens ran them there); a root `logalert -n` is safe, it creates
+  nothing. **7. Schedule it:** the cron line with `MAILTO` and the absolute
+  path, or the `Type=oneshot` unit and timer with an absolute `ExecStart` and
+  `User=`, the same text as `docs/USAGE.md`'s, pinned equal by a test; #3's
+  foreground-and-`SIGHUP` constraint is for a long-running mode, and logalert
+  has none, so there is no daemon flag and no `Type=simple`. **8. Where the log
+  is:** `journalctl -t logalert`; without it, `/var/log/syslog` on Debian and
+  Ubuntu (`syslog:adm` 640 measured, so root or the `adm` group) or
+  `/var/log/messages` on Red Hat; `log = file:` for a file of logalert's own.
+  The Verify step points at steps 5 and 6; Uninstall stops the schedule first
+  and names what stays (the config, the state directory, the user); four
+  troubleshooting rows (the missing state directory, a root run against the
+  service user's state, the missing MTA, an unreadable log). Every command was
+  rehearsed in the sandbox from the built wheel, as a clean-room first install
+  and then as a 0.1.1 upgrade over it (#19): `state.json` 0600 and `lock` 0644
+  owned by the service user after the first run, `systemd-analyze verify`
+  silent, the unit run as `logalert` with `Result=success`. The review's other
+  corrections: the minimum watch the document names is `files`, `to`, `subject`
+  and a pattern -- `subject` was missing (`[section] subject: required`, exit
+  2), and a test now builds a section from exactly the keys that sentence names
+  and loads it; `journalctl -p err -t logalert` finds a failed item's ERROR
+  record, not the run's one stderr line (that reaches the journal at info), and
+  the sentence says so; `--check-config` does not look for the state directory
+  (a missing one surfaces at the first run, exit 1, with the remedy), said
+  beside the check. `pyproject.toml` claims `Operating System :: POSIX :: Linux`
+  and no other -- what CI tests, per the classifier rule. `MANIFEST.in`:
+  `recursive-include docs *.md` (the sdist lacked `docs/USAGE.md`; its own
+  comment said to add the line once the directory existed) and `prune tests` (it
+  carried `tests/test_*.py` without the helpers, `tools/` and the files they
+  read -- a suite that fails at import for whoever unpacks it; the wheel is the
+  product). `CLAUDE.md`'s bullet of what `INSTALL.md` "still needs" (with a
+  foreground flag the program never had) is now the standing rule for what the
+  document carries. #15's *"`README.md` and `INSTALL.md` do not yet point at the
+  document: #16 owns that"* is settled. `tests/test_install_doc.py`, eight
+  tests, pure text and real on both platforms: the README example loads, the
+  unit block and the cron line are one text across the documents, every relative
+  link resolves, the README names the documents and the site, the classifier,
+  the minimum watch, and `.[dev,docs]` spelled alike in `README.md`,
+  `INSTALL.md`, `CLAUDE.md`, `ci.yml` and `tools/gate.sh`. Windows 704 passed /
+  26 skips; native 732 / 7.
+
+## About this changelog
+
+**Everything gets an entry.** Internal work (CI, tooling, refactors, tests,
+hardening) is recorded too, because later corrections, guards and post-mortems
+cite it. All of it goes under **Nitty Gritty**, the only category, last in each
+version.
+
+⚠️ **Every entry is tagged `[contract]` or `[internal]`, and the tag is
+load-bearing, not decorative:**
+
+- **`[contract]`** -- touches anything an operator's deployment depends on: the
+  command-line surface, the configuration format, on-disk state and log layout,
+  the service unit, the install procedure. The release step scans for these and
+  writes the upgrade notes from them.
+- **`[internal]`** -- no operator-visible surface. Everything else.
+
+⚠️ **An untagged `[contract]` change is worse than an unrecorded one.**
+Operators upgrade on their own schedule, so the release notes are the only
+warning they get: the release step would report "no contract changes -- nothing
+to do on upgrade", and be believed. **If you are unsure which a change is, it is
+`[contract]`. An untagged entry stops the release.**
+
+Format: `- ` + the tag in backticks + an optional marker + a **bold headline
+sentence** + `(#N)` + a period + the body, wrapped at 80 display columns with
+two-space continuation (`tools/reflow_md.py --check` enforces; reflow only the
+new block, never the whole file). Markers: 🚨 a wrong claim or a check that
+measured nothing; ⭐ the insight or the control that proved it; ⚠️ a caveat or
+standing rule; 🔶 an owner's call, with its reasoning. The prose separator is
+`--`; version headings use the em dash. A false claim being corrected is quoted
+*"in italics inside double quotes"*, left in place, and cross-referenced from a
+new entry.
+
 
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main
