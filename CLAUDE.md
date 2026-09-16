@@ -36,7 +36,12 @@ skip instead, saying "expected in the root sandbox; CI runs it" (6 as of #18),
 plus one Windows-only test ("the read-only attribute is a Windows shape").
 Any other announced skip is worth reading. mypy on this host is the
 pure-Python build (`pip install --no-binary mypy mypy`): the compiled wheel's
-DLL is blocked by an Application Control policy.
+DLL is blocked by an Application Control policy. **mypy here checks nothing
+under a `sys.platform != "win32"` branch** (it narrows the platform and skips
+the block): a `/ship` that touches one runs mypy natively in the sandbox first
+(`/srv/logalert-py312/bin/python -m mypy --strict logalert tools tests` over a
+copy of the tree in `/tmp`), or CI's Linux mypy is the first to see it -- PR
+#21 was red on exactly that.
 
 Run the sandbox preflight FIRST in any session that runs the gate (see WSL
 sandbox). Never run two gates against the sandbox at once.

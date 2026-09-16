@@ -991,4 +991,17 @@ new entry.
   `Globs` section, the `files` and `include_archives` rows and two
   troubleshooting rows; the example config documents both.
 
+- `[internal]` **A typing slip in the syslog probe, caught by CI's mypy where
+  the host's could not see it** (#13). `SyslogProbe.found` carried the socket
+  type as `int`; `SysLogHandler` is typed for `socket.SocketKind`, and the one
+  place that passes it (`activity._open`) sits under `sys.platform != "win32"`.
+  🚨 The gate's `mypy` stage on the Windows host measures nothing in such a
+  branch: mypy narrows `sys.platform` and skips the whole block, so #13 shipped
+  through a green gate with an error CI's Linux mypy reports at once -- every
+  `sys.platform` branch in this package has that blind spot, and the first CI
+  run of the batch (PR #21, also the first run of the Linux stage, which passed)
+  was red on mypy alone. Fixed by typing the field as `socket.SocketKind`; mypy
+  2.3.1 natively in the sandbox is clean on all 40 files, and `CLAUDE.md` now
+  says that mypy must run natively before a `/ship` that touches a POSIX branch.
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main

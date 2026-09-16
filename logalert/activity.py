@@ -174,7 +174,7 @@ class SyslogProbe:
     """What ``syslog`` resolves to here: the first usable socket path with the socket type
     that connected, or ``None`` with one reason per candidate."""
 
-    found: tuple[str, int] | None
+    found: tuple[str, socket.SocketKind] | None  # SocketKind: what SysLogHandler is typed for
     rejected: tuple[str, ...]
 
     def reasons(self) -> str:
