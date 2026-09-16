@@ -21,7 +21,9 @@ bash tools/gate.sh > "<scratchpad>/gate.out" 2>&1; rc=$?
 ```
 
 Stages, in order: `ascii` (gated Python stays ASCII), `shell guard tests`,
-`markdown width` (80 display columns), `changelog refs`, `ruff` (a `warning:`
+`markdown width` (80 display columns), `changelog refs`, `changelog structure`
+(`tools/render_changelog.py --check`: one `### Nitty Gritty`, every entry
+tagged, the heading shapes, the About section last), `ruff` (a `warning:`
 line is red), `mypy` (strict), `pytest`, `linux stage` (delegated into the
 `rlyeh-sandbox` WSL distro here; native on CI under
 `LOGALERT_CHECK_MODE=required`, where a skip is a failure). The verdict line
@@ -40,7 +42,8 @@ DLL is blocked by an Application Control policy. **mypy here checks nothing
 under a `sys.platform != "win32"` branch** (it narrows the platform and skips
 the block): a `/ship` that touches one runs mypy natively in the sandbox first
 (`/srv/logalert-py312/bin/python -m mypy --strict logalert tools tests` over a
-copy of the tree in `/tmp`), or CI's Linux mypy is the first to see it -- PR
+copy of the tree in `/tmp`; that venv carries `markdown` and `types-Markdown`,
+the `docs` extra, since #17), or CI's Linux mypy is the first to see it -- PR
 #21 was red on exactly that.
 
 Run the sandbox preflight FIRST in any session that runs the gate (see WSL
@@ -67,11 +70,15 @@ sandbox). Never run two gates against the sandbox at once.
   never a second one; the release rolls `[Unreleased]` verbatim), tag it, reflow
   ONLY the new block to 80 columns, THEN run the gate on the tree that contains
   the entry. Entry-then-gate: the other order shipped red commits in the source
-  project. `CHANGELOG.md`'s header is the only definition of the policy and the
-  tags; never restate it in a skill or script.
-- A docs-only PR gets NO CI checks (`paths-ignore`). That is could-not-check,
-  not green: the local gate stands in, and `git diff --name-only main..HEAD`
-  must be docs-only before the merge.
+  project. The `## About this changelog` section at the END of `CHANGELOG.md`
+  is the only definition of the policy and the tags (the owner's call: a reader
+  of a changelog knows what one is; the versions come first); never restate it
+  in a skill or script. A new entry goes at the end of `[Unreleased]`, before
+  the next version heading or that section.
+- A docs-only PR gets the Pages build only (`pages.yml` renders the changelog
+  and refuses a structural defect); `ci.yml` skips it (`paths-ignore`). That
+  is could-not-check for everything else, not green: the local gate stands in,
+  and `git diff --name-only main..HEAD` must be docs-only before the merge.
 - Before committing non-trivial work, run an adversarial review pass (subagents)
   that hunts for real defects and adds missing tests, with the lenses the change
   needs. After ANY workflow that could have touched the tree, run `git status`:
@@ -82,7 +89,7 @@ sandbox). Never run two gates against the sandbox at once.
 - `pyproject.toml` is the ONLY place the version lives; `logalert.__version__`
   derives from installed metadata. Never add a second copy.
 - An editable install snapshots `pyproject.toml` metadata at install time -- run
-  `pip install -e ".[dev]"` again after a version bump (refreshes the dev
+  `pip install -e ".[dev,docs]"` again after a version bump (refreshes the dev
   `--version`), a `[project.scripts]` change (the new console script is
   otherwise missing from `.venv/Scripts/`), or a `dependencies` change.
 - `requires-python`, the `Programming Language :: Python :: 3.x` classifiers and
@@ -208,7 +215,8 @@ ever will not serve.
 
 Two venvs with two jobs -- never mix them:
 
-- **Dev:** `.venv/` in the source tree, editable (`pip install -e ".[dev]"`);
+- **Dev:** `.venv/` in the source tree, editable (`pip install -e ".[dev,docs]"`
+  -- the gate's mypy and the render test need the `docs` extra too);
   always invoke its interpreter by explicit path, never bare `python`/`pytest`.
 - **Deployment:** `/opt/logalert-venv`, installed from the release wheel,
   created with a **versioned** interpreter, holding nothing but the venv, with a

@@ -180,4 +180,4 @@ Contributors use a separate, **editable** venv inside the source tree — see
 [README.md](README.md). Never deploy that pattern, and never develop in the
 deployment one. If `logalert --version` in the dev venv shows an old number
 after a version bump, the editable install's metadata snapshot is stale — run
-`.venv/bin/python -m pip install -e ".[dev]"` again.
+`.venv/bin/python -m pip install -e ".[dev,docs]"` again.

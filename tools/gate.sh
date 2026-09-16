@@ -12,7 +12,8 @@
 #
 # Run it with the venv's interpreter first on PATH (Git Bash: export PATH="$PWD/.venv/Scripts:$PATH"
 # on Windows, "$PWD/.venv/bin:$PATH" on Linux), with ruff, mypy and pytest installed into that
-# venv (`python -m pip install -e ".[dev]"` -- the `dev` extra in pyproject.toml is that list; on
+# venv (`python -m pip install -e ".[dev,docs]"` -- the `dev` extra in pyproject.toml is that
+# list, `docs` what the changelog renderer and its stubs need for mypy and the render test; on
 # this Windows host mypy must be the `--no-binary mypy` build, see pyproject.toml). Every
 # third-party tool runs as `python -m <tool>` and the project's own scripts
 # as `python <path>`, never a bare console script: a bare `ruff` resolves off PATH and can be a
@@ -114,6 +115,9 @@ else
   skip_stage "markdown width" "no markdown yet"
 fi
 stage "changelog refs" python tools/check_changelog_refs.py
+# The structure the file's About section defines (one category, every entry tagged, the
+# heading shapes): the same parse the Pages build runs, here before the entry is committed.
+stage "changelog structure" python tools/render_changelog.py --check
 
 # -- code
 stage "ruff"   ruff_strict

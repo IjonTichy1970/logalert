@@ -3,7 +3,8 @@
 
 ## Why this exists
 
-`CHANGELOG.md`'s header says "everything gets an entry", and `/ship` step 3 writes one per issue.
+`CHANGELOG.md`'s About section says "everything gets an entry", and `/ship` writes one per
+issue.
 Both are conventions, and on 2026-08-21 -- cutting 0.6.6 -- **seven merged issues had no entry**:
 #147, #149, #150, #161, #164, #169 and #174.
 
@@ -198,8 +199,8 @@ def main() -> int:
         for n in sorted(missing):
             print(f"  #{n}  {missing[n][:88]}", file=sys.stderr)
         print(
-            "\nEvery merged issue gets an entry (CHANGELOG.md's header says so). A missing one "
-            "also hides its tag from the release step's worklist scan, which is how a change "
+            "\nEvery merged issue gets an entry (CHANGELOG.md's About section says so). A missing "
+            "one also hides its tag from the release step's worklist scan, which is how a change "
             "other repos must mirror reaches them without anyone being told.",
             file=sys.stderr,
         )

@@ -27,3 +27,6 @@ gate.out
 .idea/
 .DS_Store
 Thumbs.db
+
+# The rendered changelog site (tools/render_changelog.py); built by the Pages workflow
+site/
