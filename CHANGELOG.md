@@ -800,4 +800,79 @@ new entry.
   The stage is what CI runs natively on the three legs under `required` from
   this commit on; the journal side is the check #13 deferred here.
 
+- `[contract]` **Usage documentation: `docs/USAGE.md`, the operator's reference,
+  pinned to the package by a test** (#15). One document for the operator, in the
+  order the questions come: a synopsis with the first run walked through
+  (`--check-config`, `--test-mail`, `-n`, then the cron line, as the user that
+  will own the state, never root); every option with its default and one
+  sentence, and which modes refuse the run-only flags (`--check-config`,
+  `--reset-state` and `--test-mail`; `--example-config` prints and exits before
+  they are examined); the exit codes -- 0 ran and printed nothing, 1 exactly one
+  stderr line with its grammar, 2 nothing ran, 130 Ctrl-C -- and what
+  "cron-quiet" means, with the one deliberate exception (the activity log's
+  fallback line); the configuration reference (the file's rules, every
+  `[logalert]` key and every watch key with its default and the decided
+  semantics, the two files logalert writes and what they may not be -- the
+  config, the state, the lock, anything under the venv -- and the whole example,
+  verbatim); position tracking and rotation for an operator (the first run at
+  the end and the warning that records it, what the state holds, how a rotation
+  is followed and every naming style and compression recognised, `.zst` on
+  Python 3.14+ only, the "no rotated copy holds the saved position" warning in
+  the log's own words and what to do about each cause, `--reset-state`,
+  `--from-start`, `state_ttl`); running it (the cron line with `MAILTO` and why
+  the absolute path, the oneshot service and timer, the lock's two verdicts);
+  mail (the MTA requirement and the error that says what to install, SMTP,
+  `--test-mail`'s three answers, "accepted for queueing" is not "delivered" and
+  where a queued message is found, the From and when to set it, what an alert
+  looks like down to the report's vocabulary, the attachment's name, how the
+  body travels and what a control character in a log line becomes); logging
+  (where the journal and the syslog files are, the record shapes, the other
+  destinations, every fallback line, `--log`, `-n` to stderr, `--debug`); a
+  troubleshooting table in `INSTALL.md`'s style. Two departures from the issue's
+  text, decided and recorded on the issue: under a systemd timer the document
+  keeps the default `log = syslog` rather than the `log = stderr` the issue
+  named -- the records then reach the journal tagged `logalert` with their own
+  priority, whereas stderr under a unit lands under the same tag but at a single
+  priority, so `journalctl -p warning` would miss the warnings and the one line
+  of a failed run would be there twice; and the example config is not pasted but
+  included verbatim AND pinned: `tests/test_usage_doc.py` asserts the fenced
+  block equals `example_config()` byte for byte, that every option of
+  `build_parser()` and every key of `GLOBAL_KEYS` and `WATCH_KEYS` heads a row
+  of its table (the first cell, followed by a metavar or the closing backtick,
+  so `--from` is not satisfied by `--from-start`), and that the exit-code table
+  names all four codes -- a dropped row, a renamed option or an edited example
+  reddens the gate. ⭐ The review -- three verification slices against the
+  module docstrings, a reader lens following the document in the sandbox as an
+  operator (`nobody` for the service user, a temp tree for `/etc` and
+  `/var/lib`, the fake sendmail), a coverage lens against the issue,
+  `INSTALL.md`, `README.md` and this changelog, and a skeptic per finding --
+  held 180 claims and faulted 29; the skeptics refuted two (the
+  sendmail-packaging premise, and a README pointer that is #16's), and the 27
+  that stood were all corrected before this entry: the troubleshooting row for a
+  stale lock said a killed run can leave one and told the operator to remove the
+  `lock` file, when the lock is an OS lock that dies with its holder, the file
+  keeps the last holder's line by design, and removing it under a live holder
+  lets the next run overlap the stuck one; the delivery-failure row quoted
+  `--test-mail`'s line as a run's symptom and promised a re-send a test message
+  never gets; the line cap was described backwards (a physical line is matched
+  and shown WHOLE up to eight 2000-byte fragments, and ` [cut]` marks only what
+  lay beyond); the "likely causes" paragraph did not match the list the warning
+  prints; a leading `-` in an address is refused as `starts with '-'`, not as
+  `is not a bare local@domain address`; `journalctl -t postfix` finds nothing
+  (Postfix tags `postfix/<daemon>`: `journalctl -u 'postfix*'`); a plain
+  continue is a DEBUG record; `/var/log/messages` "and the BSDs" was unmeasured,
+  and the sentence now says the facility and severity the records carry. Added
+  on the same round: the refusals the loader and `main` apply to `state_file`
+  and a `file:` log, the two halves of the state rule the document had skipped
+  (a zero-match file moves on after a failed delivery; a partial refusal counts
+  as delivered), the attachment name's reduction and 40-character cap, the IPv6
+  spelling of `udp:`, the full set of fallback lines, the wire encoding (7-bit
+  clean means quoted-printable or base64 once a line passes 78 characters, and
+  what `grep` over a mailbox then sees), the fate of control characters and
+  non-UTF-8 bytes in a log line, and the first-run shape of the root refusal.
+  The document wraps at 80 columns (the `markdown width` stage; tables and the
+  two quoted lines in fences are exempt); with the test beside it the change is
+  not docs-only, so CI runs it. Windows 560 passed / 21 skips. `README.md` and
+  `INSTALL.md` do not yet point at the document: #16 owns that.
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main
