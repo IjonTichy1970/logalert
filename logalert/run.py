@@ -13,12 +13,25 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     state file (a corrupt one is a hard error naming ``--reset-state``), and expiry of the
     entries unseen for ``state_ttl`` days. ``--dry-run`` takes no lock and needs no writable
     directory: it reads the state if there is one and never writes.
-  * Per section, in file order, per file: ``open_source`` -- a file that cannot be read is a
-    failed item and its cursor stays where it was, the section continues; a file absent this
-    run is nothing to do (its cursor and its ``last_seen`` stay, so it expires in time); a
-    source is scanned with the section's context (or ``-c``) and its ``max_lines`` cap, its
-    cursor taken after the read. A first sight starts at the end of the file unless
-    ``--from-start`` or ``start = beginning``.
+  * Per section, in file order, each glob expanded in its place (``logalert.globs``: sorted,
+    regular files only, rotated copies left out unless ``include_archives``; a directory
+    that cannot be listed is a failed item, a glob matching nothing is nothing to do), each
+    path read once however often the list names it, per file: ``open_source`` -- a file
+    that cannot be read is a failed item and its cursor stays where it was, the section
+    continues; a file absent this run is nothing to do (its cursor and its ``last_seen``
+    stay, so it expires in time); a source is scanned with the section's context (or
+    ``-c``) and its ``max_lines`` cap, its cursor taken after the read. A first sight starts
+    at the end of the file unless ``--from-start`` or ``start = beginning`` -- or, for a
+    path a glob matched, the NEW-FILE RULE (issue #18): some glob that matched it has a
+    recorded moment (the start of the last saved run that listed its directories without
+    error) and the file's mtime is not older than it -- a new daily file is all new
+    content -- and then it is read from 0. The moments are written with the section's
+    cursors (``state.record_run``), so a glob added to the list first-sights every match at
+    the end, a section whose delivery failed reads the same new file from 0 again next
+    run, and a glob whose directory was away or unlistable keeps its moment, so a file
+    created during the outage is read whole once the directory is back. A listed path is
+    never new, wherever a glob also matches it: its first sight is #7's, unchanged; a
+    path is one path however it is spelled (``normcase``, ``normpath``).
   * The section's outcome: nothing matched -> its cursors move and the state is saved; a
     match -> ONE message composed and delivered; accepted (a partial refusal is accepted --
     the recipient who got it must not get it twice -- with the refused ones as failed items)
@@ -49,15 +62,26 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
 """
 
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from logalert.config import Config, ConfigError, Watch
+from logalert.globs import expand, is_glob
 from logalert.lock import LockBusy, RunLock
 from logalert.mail import Mail, clean_header, compose
 from logalert.match import FileReport, scan
 from logalert.rotation import open_source
-from logalert.state import Cursor, State, StateError, check_state_dir, load_state, lock_path
+from logalert.state import (
+    Cursor,
+    State,
+    StateError,
+    check_state_dir,
+    load_state,
+    lock_path,
+    parse_timestamp,
+)
 from logalert.transport import DeliveryError, choose, deliver, resolve_sender
 
 log = logging.getLogger("logalert.run")
@@ -113,6 +137,7 @@ def run(config: Config, options: Options) -> int:
     config file itself, for every mode."""
     log.info("start: %s, %d section(s)%s", config.path, len(config.watches),
              " (dry run)" if options.dry_run else "")
+    started = datetime.now(UTC)  # the run record's moment: a file created from here on is newer
     state_file = options.state_file or config.settings.state_file
     try:
         choose(config.settings)
@@ -156,8 +181,14 @@ def run(config: Config, options: Options) -> int:
             log.info("[%s] %s: %s, unseen for %d days", section, file,
                      "would be forgotten" if options.dry_run else "forgotten",
                      config.settings.state_ttl_days)
+        for section in state.expire_runs(config.settings.state_ttl_days,
+                                         configured=[w.name for w in config.watches]):
+            log.debug("[%s] the last-run record %s: not configured, no run saved for %d days",
+                      section,
+                      "would be forgotten" if options.dry_run else "forgotten",
+                      config.settings.state_ttl_days)
         for watch in config.watches:
-            _section(watch, config, options, sender, state, outcome)
+            _section(watch, config, options, sender, state, outcome, started)
     finally:
         if lock is not None:
             lock.release()
@@ -173,16 +204,24 @@ def _finish(outcome: Outcome) -> int:
 
 
 def _section(watch: Watch, config: Config, options: Options, sender: str, state: State,
-             outcome: Outcome) -> None:
+             outcome: Outcome, started: datetime) -> None:
     """One section: read its files, mail once when anything matched, move its state."""
     context = options.context if watch.context is None else watch.context
     reports: list[FileReport] = []
     cursors: dict[str, Cursor] = {}
-    for path in watch.files:
+    paths, seen = _files(watch, outcome)
+    for path, globs in paths:
+        saved = state.get(watch.name, path)
+        from_start = options.from_start or watch.start == "beginning"
+        if globs and saved is None and not from_start:
+            pattern = _new_file(watch.name, globs, path, state)
+            if pattern is not None:
+                log.info("[%s] %s: new since the last run (%s); reading from the beginning",
+                         watch.name, path, pattern)
+                from_start = True
         try:
-            source = open_source(watch.name, path, state.get(watch.name, path),
-                                 archive_dir=watch.archive_dir,
-                                 from_start=options.from_start or watch.start == "beginning")
+            source = open_source(watch.name, path, saved, archive_dir=watch.archive_dir,
+                                 from_start=from_start)
         except OSError as exc:
             outcome.fail(f"[{watch.name}] {path}: {_reason(exc, path)}")
             continue
@@ -201,7 +240,7 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
         reports.append(report)
 
     if not any(report.matched for report in reports):
-        _advance(watch, state, cursors, options, outcome, delivered=False)
+        _advance(watch, state, cursors, options, outcome, started, seen, delivered=False)
         return
     outcome.due += 1
     mail = compose(watch, reports, sender=sender, settings=config.settings,
@@ -228,7 +267,64 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
     outcome.sent += 1
     for recipient, answer in delivery.refused:
         outcome.fail(f"[{watch.name}] refused: {recipient} -- {answer}")
-    _advance(watch, state, cursors, options, outcome, delivered=True)
+    _advance(watch, state, cursors, options, outcome, started, seen, delivered=True)
+
+
+def _files(watch: Watch, outcome: Outcome) -> tuple[list[tuple[str, tuple[str, ...]]],
+                                                  set[str]]:
+    """The paths to read this run, in the list's order with each glob expanded in its
+    place, each once, with every glob that matched it -- none for a path the list names
+    itself, wherever it stands: a name the operator wrote is a listed file -- and the set
+    of globs looked into (their directories listed, without error), for the record."""
+    listed = {_same(entry) for entry in watch.files if not is_glob(entry)}
+    paths: dict[str, tuple[str, list[str]]] = {}  # normalised -> (spelling, globs)
+    seen: set[str] = set()
+    for entry in watch.files:
+        if not is_glob(entry):
+            paths.setdefault(_same(entry), (entry, []))
+            continue
+        found = expand(entry, include_archives=watch.include_archives)
+        if found.listed and not found.errors:
+            seen.add(entry)
+        for error in found.errors:
+            outcome.fail(f"[{watch.name}] {entry}: {error}")
+        if found.archives:
+            names = [os.path.basename(p) for p in found.archives]
+            log.debug("[%s] %s: left out %d rotated %s: %s", watch.name, entry, len(names),
+                      "copy" if len(names) == 1 else "copies", ", ".join(names[:10])
+                      + (", ..." if len(names) > 10 else ""))
+        for path, what in found.skipped:
+            log.debug("[%s] %s: passed over %s (%s)", watch.name, entry, path, what)
+        if not found.files and not found.errors:
+            log.debug("[%s] %s: matches nothing this run", watch.name, entry)
+        for path in found.files:
+            key = _same(path)
+            if key not in listed:
+                paths.setdefault(key, (path, []))[1].append(entry)
+            else:
+                paths.setdefault(key, (path, []))
+    return [(path, tuple(globs)) for path, globs in paths.values()], seen
+
+
+def _same(path: str) -> str:
+    """One key for the spellings of one path, so the list's ``x//y`` and a glob's ``x/y``
+    are read once; the state keeps the first spelling."""
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _new_file(section: str, globs: tuple[str, ...], path: str, state: State) -> str | None:
+    """The new-file rule: the glob among ``globs`` whose recorded moment the file is not
+    older than, or None (the moment is whole seconds, so a file from the same second
+    counts as newer: it was not there to be matched then)."""
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return None  # the open will say why
+    for glob in globs:
+        at = state.last_run(section, glob)
+        if at is not None and mtime >= parse_timestamp(at).timestamp():
+            return glob
+    return None
 
 
 def _reason(exc: OSError, path: str) -> str:
@@ -237,11 +333,13 @@ def _reason(exc: OSError, path: str) -> str:
 
 
 def _advance(watch: Watch, state: State, cursors: dict[str, Cursor], options: Options,
-             outcome: Outcome, *, delivered: bool) -> None:
+             outcome: Outcome, started: datetime, seen: set[str], *,
+             delivered: bool) -> None:
     if options.dry_run:
         return
     for path, cursor in cursors.items():
         state.set(watch.name, path, cursor)
+    state.record_run(watch.name, watch.files, seen, started)
     _save(state, watch.name, outcome, delivered=delivered)
 
 

@@ -875,4 +875,120 @@ new entry.
   not docs-only, so CI runs it. Windows 560 passed / 21 skips. `README.md` and
   `INSTALL.md` do not yet point at the document: #16 owns that.
 
+- `[contract]` **Globs in `files`: expanded at every run, rotated copies left
+  out, a new file read from its beginning, links never followed** (#18). A
+  `files` entry containing `*`, `?` or `[` is a glob (`/var/log/*.log`,
+  `/var/log/hosts/*/messages`), expanded by `logalert/globs.py` at each run with
+  the shell's rules -- a wildcard within one directory level, a name starting
+  with `.` only for a component that starts with one, `[[]` a literal bracket,
+  the platform's case -- and the state is keyed by each expanded path, spelled
+  as the pattern spells its directory. The #6 rule (glob characters refused, so
+  a glob is never silently a literal path) is superseded for `files` only:
+  `archive_dir`, `state_file`, `sendmail_path` and a `file:` log stay one path
+  each (`contains a glob character; only files may be a glob` -- the `file:` log
+  was not checked for one before; it is now, in `check_log`), and a `files`
+  entry may neither contain `**` (`is not supported; name the directories`:
+  measured, `glob` without the recursive flag reads it as ONE level) nor end in
+  a separator (`ends in a separator; name the file`: `hosts/*/` means
+  directories to the shell); elsewhere `**` is a glob character like any other.
+  The walker is logalert's own, over `os.scandir`, for one reason: a directory
+  the glob cannot list is a FAILED ITEM (`[section] <glob>: cannot list <dir>
+  (Permission denied)`, exit 1), where `glob.glob` returns nothing, silently
+  (measured as `nobody` over a 0000 directory), and a watch gone quiet because
+  of a permission would look like a watch with nothing to say; a directory that
+  does not exist, or a component that is not a directory, matches nothing (a
+  DEBUG line). A glob matches regular files only -- a directory, FIFO, device or
+  socket it names is passed over, where a listed entry naming one stays an error
+  -- and never through a symbolic link: a link it matches, and a link where a
+  wildcard directory component would descend, is passed over (`a symbolic link;
+  list it by name`), since a link is a name the operator never wrote; hard links
+  one glob matches are read once, under the first name in sort order; a file
+  whose `stat` fails otherwise is kept, so its open fails the way a listed
+  file's does. The matches are read in name order (a daily directory in date
+  order), and a section's list is read once per path however often it names one,
+  literally or by a glob, compared by normalised path (`x//y.log` beside
+  `x/*.log`) -- which ends #12's "a file listed twice is read twice". Rotated
+  copies are left out unless the new watch key `include_archives = yes` says
+  otherwise, by SHAPE (`rotation.archive_suffix`: a numeric or dated rotation
+  suffix per the catch-up's own recognition when what precedes it does not end
+  in a digit, so `router.log.1`, `router.log-20260915.gz`,
+  `access_log.1726358400` and `app.2024` are copies and `192.0.2.1`,
+  `2026-09-15`, `python3.12` are files; a copy's suffix `.bak`, `.old`, `.orig`,
+  `.save`, `-old`, `-bak`; a bare compression extension, `messages.gz` -- each
+  with an optional compression extension after it, live file present or not) and
+  by KIN (a numeric or dated rotation of another name matched in the same
+  directory, `router1.2` beside `router1`; never the catch-up's `other` style,
+  because `fw-dmz` beside `fw` and `router1.example.net` beside `router1` are
+  hosts): otherwise `/var/log/router*` would read `router.log.1.gz` as a file of
+  its own and mail every alert twice after each rotation. `yes` is for
+  directories where the dated names ARE the live files (Apache's `rotatelogs`);
+  on a rotating log it mails the rotated content twice, and the document says
+  so. The NEW-FILE RULE: a file a glob matches for the first time is read from 0
+  -- not first-sighted at the end -- when that glob has a recorded moment the
+  file's mtime is not older than (`new since the last run (<glob>); reading from
+  the beginning`), and the moments live in the state file as `"runs":
+  {"<section>": {"<glob>": "<UTC seconds>"}}` (schema version still 1: an older
+  logalert reads the file correctly and drops the key on save). A glob's moment
+  is the START of the last run that saved the section's cursors AND listed the
+  glob's directories without error; it never moves on a failed delivery (the
+  re-run reads the same new file from 0 again), on an outage (a file created
+  while the directory was away or unlistable is read whole once it is back), or
+  under `-n`; a glob never yet listed has none, so a share mounted or a
+  permission granted after the first run does not mail every live log in it
+  whole; a glob just added to the list first-sights every match at the end
+  (widening `error.log` to `*.log` never mails a long-lived file whole); every
+  glob that matched the path is asked, not the first in the list; a listed path
+  is never new, wherever a glob also matches it -- #7's first sight is unchanged
+  for every existing configuration; `--reset-state` forgets a section's moments
+  with its cursors, so its promise holds and a file appearing between the reset
+  and the next run is a plain first sight; records of sections no longer
+  configured expire after `state_ttl`, a configured section's never. Decided
+  against: birth time (measured, Python on Linux 3.10-3.12 has no
+  `st_birthtime`; ext4 has it), and a size heuristic. The residual, documented
+  with its bound: old content under a fresh mtime (`cp` without `-p`; a file the
+  glob matched but could not open for a while) is read whole once, at most
+  `max_lines` matching lines in one mail. `--check-config` expands each glob and
+  names what it matched, left out and passed over (`[web] files: /var/log/web/*
+  -> 2 file(s), 1 rotated copy left out, 1 passed over (not regular files)`,
+  then `[web] <path>`, `[web] left out: <path>`, `[web] passed over: <path> (a
+  directory)`, twenty of each kind then `... and N more`; `-> matches nothing`;
+  `-> cannot list <dir> (<reason>)`, still exit 0) and the section line ends
+  `include_archives: no|yes`; names from a directory listing are header-cleaned
+  there and in `--reset-state`'s "the state file knows" hint, so a file name
+  with a line break in it forges no line. `--reset-state` takes an expanded path
+  as `--check-config` lists it; given the glob itself it says `is a glob;
+  --reset-state takes one of its matches`. Measured for the design: rename,
+  `gzip`, `xz` and `bzip2` keep the old file's mtime and logrotate's `create`
+  gives the new live file a fresh one (so a renamed or compressed copy is never
+  "new"); ext4 mtimes tick at about 4 ms in the sandbox. Listed in #19 as
+  deferred beyond 0.1.0; pulled in before the first release on the owner's word.
+  ⭐ The adversarial review (four lenses -- reproduction, spec fidelity and
+  consumers, mutation testing, safety -- then two skeptics per judgment-level
+  finding) made 32 findings, 30 of them reproduced with scripts, and reshaped
+  the map: the map's per-section record (the run's start plus the whole `files`
+  list) wrote the moment for a glob whose directory was unlistable or absent, so
+  the first successful listing read every live log in it from 0 (a 200-line mail
+  with `... and 100 more`), and moved the moment past a run whose listing
+  failed, so a daily file created during the outage was first-sighted at the END
+  afterwards -- the exact loss the rule exists to prevent; a glob followed a
+  symbolic link planted by `nobody` in a watched directory and a root run mailed
+  a root-only file the pattern never named (`fs.protected_symlinks` does not
+  cover it), and a link beside its target was two cursors and every line twice;
+  the shape tier called every file named by an address a rotated copy and the
+  kin tier's `other` style made `fw-dmz` a copy of `fw`, so a per-host syslog
+  directory read nothing for those hosts; a hand `gzip` of a live log was a "new
+  file" read whole and then mailed again by the catch-up; `--check-config`
+  counted the copies left out but never named them, though the document said it
+  did; a literal component behind a regular file was a failed item on POSIX only
+  (`NotADirectoryError`, which the Windows-real tests could not see); a file
+  name with a line break forged a second `--check-config` line; and the new
+  logrotate test compared fresh mtimes with `<`, which the coarse clock made a
+  coin toss (one run in three). Two findings were refuted by both skeptics. 32
+  mutants killed, the three that only POSIX tests pin natively as root and as
+  `nobody`, and the EACCES-on-stat one as `nobody` (it survives as root, whose
+  stat is never refused). Windows 657 passed / 26 skips; native 685 / 7 (the
+  expected counts in `CLAUDE.md` are now 26 and 6). `docs/USAGE.md` gains a
+  `Globs` section, the `files` and `include_archives` rows and two
+  troubleshooting rows; the example config documents both.
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main

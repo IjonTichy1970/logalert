@@ -319,13 +319,51 @@ def test_relative_paths(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("char", ["*", "?", "["])
-def test_glob_characters_are_refused_in_files_and_archive_dir(tmp_path: Path, char: str) -> None:
+def test_glob_characters_are_accepted_in_files_and_refused_elsewhere(
+    tmp_path: Path, char: str
+) -> None:
+    """Issue #18: a ``files`` entry may be a glob, kept as written for the run to expand;
+    every other path is one path."""
     glob = (tmp_path / f"router{char}.log").as_posix()
-    msg = error(tmp_path, watch(tmp_path, files=glob))
-    assert msg.startswith("[router-disk] files:") and "glob character" in msg
+    (w,) = load_config(write(tmp_path, watch(tmp_path, files=glob))).watches
+    assert w.files == (glob,) and w.include_archives is False
     archive = (tmp_path / f"arch{char}").as_posix()
     msg = error(tmp_path, watch(tmp_path, f"archive_dir = {archive}\n"))
     assert msg.startswith("[router-disk] archive_dir:") and "glob character" in msg
+    msg = error(tmp_path, f"[logalert]\nstate_file = {archive}/state.json\n" + watch(tmp_path))
+    assert msg.startswith("[logalert] state_file:") and "only files may be a glob" in msg
+    msg = error(tmp_path, f"[logalert]\nsendmail_path = {archive}\n" + watch(tmp_path))
+    assert msg.startswith("[logalert] sendmail_path:") and "glob character" in msg
+    msg = error(tmp_path, f"[logalert]\nlog = file:{archive}/activity.log\n" + watch(tmp_path))
+    assert msg == (f"[logalert] log: {archive + '/activity.log'!r} contains a glob character; "
+                   f"only files may be a glob")
+
+
+def test_recursive_glob_is_refused(tmp_path: Path) -> None:
+    """``**`` would be one level to ``glob`` (measured) and the whole tree with the flag."""
+    deep = (tmp_path / "**" / "router.log").as_posix()
+    msg = error(tmp_path, watch(tmp_path, files=deep))
+    assert msg == f"[router-disk] files: {deep!r}: ** is not supported; name the directories"
+
+
+def test_a_files_entry_ending_in_a_separator_is_refused(tmp_path: Path) -> None:
+    """``hosts/*/`` means directories to the shell; here it would read the files one level
+    up, which the operator did not mean (measured in review)."""
+    trailing = (tmp_path / "hosts" / "*").as_posix() + "/"
+    msg = error(tmp_path, watch(tmp_path, files=trailing))
+    assert msg == f"[router-disk] files: {trailing!r} ends in a separator; name the file"
+    plain = (tmp_path / "router.log").as_posix() + "/"
+    msg = error(tmp_path, watch(tmp_path, files=plain))
+    assert msg.endswith("ends in a separator; name the file")
+
+
+def test_include_archives_is_a_watch_boolean(tmp_path: Path) -> None:
+    (w,) = load_config(write(tmp_path, watch(tmp_path, "include_archives = yes\n"))).watches
+    assert w.include_archives is True
+    msg = error(tmp_path, watch(tmp_path, "include_archives = sometimes\n"))
+    assert msg == "[router-disk] include_archives: expected yes or no, got 'sometimes'"
+    msg = error(tmp_path, "[logalert]\ninclude_archives = yes\n" + watch(tmp_path))
+    assert msg.startswith("[logalert] include_archives: this is a watch key")
 
 
 @pytest.mark.parametrize(

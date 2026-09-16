@@ -17,8 +17,9 @@ Format rules (decided, and pinned by tests/test_config.py):
   * A pattern line may start with a priority tag -- exactly ``[high] ``, ``[medium] `` or
     ``[low] ``. Any other bracketed prefix is part of the literal. The priority system is OFF
     unless a section sets ``priority`` or a pattern carries a tag.
-  * Paths are absolute, on the platform logalert runs on. Glob characters are rejected in
-    0.1.0 so a glob is never silently taken for a literal path.
+  * Paths are absolute, on the platform logalert runs on. A ``files`` entry may be a glob
+    (``*``, ``?``, ``[``; ``**`` is refused), expanded at run time by ``logalert.globs``;
+    every other path is one path, and a glob character in it is an error.
   * Addresses are bare ``local@domain`` in 0.1.0: ASCII, no display name, no leading ``-``
     (every sendmail implementation would read it as an option), no whitespace.
   * A continuation line that begins with ``#`` or ``;`` is dropped by configparser as a
@@ -36,11 +37,13 @@ import os
 import re
 import socket
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from importlib import resources
 from os import path as ospath
 from typing import Literal, cast
+
+from logalert.globs import Expansion, expand, is_glob
 
 if sys.platform != "win32":
     import pwd
@@ -68,6 +71,7 @@ WATCH_KEYS: frozenset[str] = frozenset(
         "patterns", "ipatterns", "regex", "iregex",
         "exclude", "iexclude", "exclude_regex", "iexclude_regex",
         "priority", "report", "context", "max_lines", "start", "archive_dir",
+        "include_archives",
     }
 )
 PATTERN_KEYS: tuple[str, ...] = ("patterns", "ipatterns", "regex", "iregex")
@@ -80,7 +84,6 @@ GLOBAL_KEYS: frozenset[str] = frozenset(
     }
 )
 
-_GLOB_CHARS = frozenset("*?[")
 _PRIORITY_TAG = re.compile(r"^\[(high|medium|low)\] (.+)$", re.S)
 # Bare address: an RFC 5322 dot-atom local part (no quotes, no display name, no angle
 # brackets) and a domain of letters, digits, dots and hyphens. Deliberately narrower than
@@ -123,6 +126,7 @@ class Watch:
     max_lines: int
     start: Literal["end", "beginning"]
     archive_dir: str | None
+    include_archives: bool = False  # a glob reads rotated copies as files of their own
 
 
 @dataclass(frozen=True)
@@ -248,6 +252,9 @@ def check_log(label: str, log: str) -> None:
         if not target or not ospath.isabs(target):
             raise ConfigError(f"{label}: file: needs an absolute path, got {target!r}")
         _no_nul(label, target)
+        if is_glob(target):  # one path, like every path but files (issue #18)
+            raise ConfigError(f"{label}: {target!r} contains a glob character; only files may "
+                              f"be a glob")
         _outside_venv(label, target)
         return
     if log.startswith("udp:"):
@@ -345,7 +352,7 @@ def _load_watch(name: str, section: configparser.SectionProxy, warnings: list[st
 
     files = tuple(_list(where, section, "files", required=True))
     for file in files:
-        _check_path(where, "files", file)
+        _check_path(where, "files", file, glob=True)
 
     section_priority = _enum(where, section, "priority", PRIORITIES, None)
     patterns: list[Pattern] = []
@@ -380,6 +387,7 @@ def _load_watch(name: str, section: configparser.SectionProxy, warnings: list[st
             Literal["end", "beginning"], _enum(where, section, "start", START_MODES, "end")
         ),
         archive_dir=archive_dir,
+        include_archives=_bool(where, section, "include_archives", False),
     )
 
 
@@ -531,14 +539,20 @@ def _abs_path(where: str, section: configparser.SectionProxy, key: str, default:
     return value
 
 
-def _check_path(where: str, key: str, value: str) -> None:
+def _check_path(where: str, key: str, value: str, *, glob: bool = False) -> None:
+    """An absolute path; a glob only where ``glob`` says so (``files``), and never a
+    recursive one: ``glob`` would read ``**`` as one level (measured), and the whole tree
+    is not what a log watcher should walk."""
     _no_nul(f"{where} {key}", value)
     if not ospath.isabs(value):
         raise ConfigError(f"{where} {key}: {value!r} is not an absolute path")
-    if any(char in _GLOB_CHARS for char in value):
+    if glob and "**" in value:
+        raise ConfigError(f"{where} {key}: {value!r}: ** is not supported; name the directories")
+    if glob and value.endswith(tuple(sep for sep in (os.sep, os.altsep) if sep)):
+        raise ConfigError(f"{where} {key}: {value!r} ends in a separator; name the file")
+    if not glob and is_glob(value):
         raise ConfigError(
-            f"{where} {key}: {value!r} contains a glob character; globs are not supported "
-            f"in this release, list each file"
+            f"{where} {key}: {value!r} contains a glob character; only files may be a glob"
         )
 
 
@@ -643,12 +657,42 @@ def _sendmail_note(path: str) -> str:
     return "NOT FOUND -- install an MTA or set transport = smtp"
 
 
+LIST_CAP = 20  # names of one kind, per glob, that --check-config lists
+
+
+def _listing(section: str, label: str, names: list[str]) -> list[str]:
+    """One indented line per name under a glob's line, ``LIST_CAP`` of them at most."""
+    lines = [f"[{section}]   {label}{name}" for name in names[:LIST_CAP]]
+    if len(names) > LIST_CAP:
+        lines.append(f"[{section}]   {label}... and {len(names) - LIST_CAP} more")
+    return lines
+
+
+def _expansion_note(found: Expansion) -> str:
+    """What a glob matched, in one clause: counts, what was left out, what failed."""
+    parts: list[str] = []
+    if found.files:
+        parts.append(f"{len(found.files)} file(s)")
+    elif not found.errors:
+        parts.append("matches nothing")
+    if found.archives:
+        n = len(found.archives)
+        parts.append(f"{n} rotated {'copy' if n == 1 else 'copies'} left out")
+    if found.skipped:
+        parts.append(f"{len(found.skipped)} passed over (not regular files)")
+    parts += found.errors
+    return ", ".join(parts)
+
+
 def describe(config: Config, sender: str | None = None, state_file: str | None = None,
-             log: str | None = None) -> str:
+             log: str | None = None, *, clean: Callable[[str], str] = str) -> str:
     """The effective settings, one ASCII line each, for ``--check-config``; ``sender`` is
     ``--from`` and ``state_file`` is ``--state-file``, each of which wins over the config
     for the run it is given to; ``log`` is the destination as ``activity.describe`` resolves
-    it (with `` (--log)`` when the command line chose it), else the setting is printed."""
+    it (with `` (--log)`` when the command line chose it), else the setting is printed.
+    ``clean`` is applied to every name that comes from a directory listing (``main`` passes
+    ``mail.clean_header``, which this module cannot import): a file name with a line break
+    in it must not forge a line."""
     settings = config.settings
     out: list[str] = [f"config: {config.path}"]
     if settings.transport == "auto":
@@ -688,7 +732,16 @@ def describe(config: Config, sender: str | None = None, state_file: str | None =
         out.append(f"[{watch.name}] subject: {watch.subject}")
         out.append(f"[{watch.name}] to: {', '.join(watch.to)}")
         for file in watch.files:
-            out.append(f"[{watch.name}] file: {file}")
+            if not is_glob(file):
+                out.append(f"[{watch.name}] file: {file}")
+                continue
+            found = expand(file, include_archives=watch.include_archives)
+            note = clean(_expansion_note(found))
+            out.append(f"[{watch.name}] files: {file} -> {note}")
+            out += _listing(watch.name, "", [clean(p) for p in found.files])
+            out += _listing(watch.name, "left out: ", [clean(p) for p in found.archives])
+            out += _listing(watch.name, "passed over: ",
+                            [f"{clean(p)} ({what})" for p, what in found.skipped])
         out.append(f"[{watch.name}] patterns: {literal} literal, {regex} regex "
                    f"({nocase} case-insensitive, {tagged} with a priority tag); "
                    f"excludes: {len(watch.excludes)}")
@@ -696,7 +749,8 @@ def describe(config: Config, sender: str | None = None, state_file: str | None =
         context = "from -c" if watch.context is None else str(watch.context)
         out.append(f"[{watch.name}] priority: {priority}; report: {watch.report}; "
                    f"context: {context}; max_lines: {watch.max_lines}; start: {watch.start}"
-                   + (f"; archive_dir: {watch.archive_dir}" if watch.archive_dir else ""))
+                   + (f"; archive_dir: {watch.archive_dir}" if watch.archive_dir else "")
+                   + f"; include_archives: {'yes' if watch.include_archives else 'no'}")
     for warning in config.warnings:
         out.append(f"warning: {warning}")
     return "\n".join(out)

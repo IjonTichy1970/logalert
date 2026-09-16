@@ -11,6 +11,7 @@ from logalert.config import (
     RESERVED_SECTION,
     Config,
     ConfigError,
+    Watch,
     check_log,
     check_log_target,
     describe,
@@ -18,6 +19,7 @@ from logalert.config import (
     is_address,
     load_config,
 )
+from logalert.globs import expand, is_glob
 from logalert.lock import LockBusy, RunLock
 from logalert.mail import clean_header, compose_test
 from logalert.run import Options, run
@@ -104,9 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     modes.add_argument(
         "--reset-state", nargs="?", const=RESET_ALL, default=None, metavar="PATH",
-        help="forget where every section left off in PATH (spelled as in the config), or "
-        "in every file when PATH is omitted, and exit; the next run treats those files "
-        "as first sight",
+        help="forget where every section left off in PATH (spelled as in the config, or "
+        "as --check-config lists a glob's match), or in every file when PATH is omitted, "
+        "and exit; the next run treats those files as first sight",
     )
     modes.add_argument(
         "--test-mail", default=None, metavar="SECTION",
@@ -169,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
     with activity.attach(log_spec, debug=args.debug, to_stderr=to_stderr):
         if args.check_config:
             resolved = activity.describe(log_spec) + (" (--log)" if args.log else "")
-            print(describe(config, args.sender, state_file, log=resolved))
+            print(describe(config, args.sender, state_file, log=resolved, clean=clean_header))
             try:
                 choose(config.settings)  # auto with no sendmail is a configuration error
                 resolve_sender(config.settings, args.sender)  # a From the run would refuse
@@ -271,6 +273,13 @@ def reset_state(config: Config, target: str, path: str) -> int:
         lock.release()
 
 
+def _names(watch: Watch, target: str) -> bool:
+    """Whether the section's list names ``target`` as a file: as written, or by a glob's
+    expansion now (an archive a glob leaves out is not named; nor is the glob itself)."""
+    return any(target in expand(entry, include_archives=watch.include_archives).files
+               if is_glob(entry) else entry == target for entry in watch.files)
+
+
 def _reset(config: Config, path: str, target: str) -> int:
     try:
         state = load_state(path)
@@ -290,10 +299,15 @@ def _reset(config: Config, path: str, target: str) -> int:
     else:
         count = state.forget(target)
         if count == 0:
+            if is_glob(target) and any(target in watch.files for watch in config.watches):
+                print(f"logalert: {target} is a glob; --reset-state takes one of its matches, "
+                      f"spelled as --check-config lists them (or no PATH, to forget every "
+                      f"file)", file=sys.stderr)
+                return EXIT_ATTENTION
             # 1, not 2: whether an entry exists depends on the state (expired, never seen,
             # already reset), not on the command line; the listing says what would match
-            known = sorted({file for _, file in state.entries})
-            configured = any(target in watch.files for watch in config.watches)
+            known = sorted({clean_header(file) for _, file in state.entries})
+            configured = any(_names(watch, target) for watch in config.watches)
             print(f"logalert: no entry for {target}; the state file knows "
                   + (", ".join(known) if known else "no files")
                   + ("" if configured else " -- and no section lists that file"),

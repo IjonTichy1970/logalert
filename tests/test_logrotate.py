@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from logalert.cursor import Line
+from logalert.globs import expand
 from logalert.rotation import CatchUpSource, open_source
 from logalert.state import Cursor
 
@@ -193,3 +194,31 @@ def test_olddir(tmp_path: Path) -> None:
     append(path, LIVE)
     _, lines, _ = run(path, saved, archive_dir=old)
     assert lines == ["since 1", "since 2", "live 1"]
+
+
+def test_a_glob_over_the_rotating_log_keeps_matching_the_live_file_only(tmp_path: Path) -> None:
+    """Issue #18: through three real rotations ``router*`` expands to the live file alone --
+    the renamed and the compressed copies are left out by shape, and would be by mtime as
+    well (rename and gzip keep the old file's), so nothing is ever mailed twice."""
+    path = tmp_path / "router.log"
+    path.write_bytes(OLD)
+    pattern = str(tmp_path / "router*")
+    stamps: list[int] = []  # the live file's mtime before each rotation, oldest first
+    for round_number in (1, 2, 3):
+        append(path, f"round {round_number}\n".encode("ascii"))
+        stamps.append(path.stat().st_mtime_ns)
+        logrotate(tmp_path, path, "    create\n    compress\n    delaycompress\n")
+        found = expand(pattern)
+        assert found.files == (str(path),), found
+        assert [Path(a).name for a in found.archives] == sorted(
+            p.name for p in tmp_path.glob("router.log.*"))
+        assert found.skipped == () and found.errors == ()
+    assert [Path(a).name for a in found.archives] == ["router.log.1", "router.log.2.gz",
+                                                       "router.log.3.gz"]
+    copies = expand(pattern, include_archives=True)
+    assert [Path(p).name for p in copies.files] == ["router.log", "router.log.1",
+                                                    "router.log.2.gz", "router.log.3.gz"]
+    # rename and gzip keep the old file's mtime: the copies carry the stamps, newest first
+    # (the live file's own stamp is not compared: the kernel's coarse clock can give the
+    # renamed copy and the created live file the same mtime -- measured in review)
+    assert [Path(p).stat().st_mtime_ns for p in copies.files[1:]] == stamps[::-1]

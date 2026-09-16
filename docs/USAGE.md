@@ -59,7 +59,7 @@ run unable to read it, so logalert refuses with `state file ... belongs to
 | `--log DEST` | `log =` in the config | Write the activity log to `syslog`, `stderr`, `file:/absolute/path` or `udp:host:port` for this run, in every mode. |
 | `--check-config` | | Validate the configuration, print the effective settings, and exit: 0 usable, 2 not. Never touches state or the log destination. |
 | `--example-config` | | Print the complete, commented example configuration that ships inside the package, and exit. |
-| `--reset-state [PATH]` | | Forget the saved position in `PATH` (spelled as in the config) for every section that watches it, or in every file when `PATH` is omitted; the next run treats those files as first sight. |
+| `--reset-state [PATH]` | | Forget the saved position in `PATH` (spelled as in the config, or as `--check-config` lists a glob's match) for every section that watches it, or in every file when `PATH` is omitted; the next run treats those files as first sight, at the end (or the beginning per `start`) -- a section's new-file rule for globs is forgotten with them and resumes after its next run. |
 | `--test-mail SECTION` | | Send a one-line test message to that section's recipients through the configured transport, print the transport's answer, and exit: 0 accepted, 1 not delivered, 2 configuration. |
 | `--version` | | Print the version and exit. |
 | `-h`, `--help` | | Print the options and exit. |
@@ -114,8 +114,10 @@ The file's rules:
   would match every line. A list line beginning with `#` or `;` is dropped by
   the parser as a comment -- to match text that starts with one of those, use a
   regex with an escape (`\#`, `\;`).
-- Paths are absolute. Globs (`*`, `?`, `[`) are refused in this release so a
-  glob is never silently taken for a literal path; list each file.
+- Paths are absolute. A `files` entry may be a glob (`*`, `?`, `[...]`; see
+  [Globs](#globs)); every other path is one path, and a glob character in it
+  is refused. `**` is refused everywhere, and a `files` entry may not end in
+  a separator.
 - Addresses are bare `local@domain`: no display name, no `<>`, no leading `-`
   (every sendmail implementation would read it as an option). Duplicates in `to`
   are sent once.
@@ -155,7 +157,7 @@ The file's rules:
 | --- | --- | --- |
 | `subject` | required | The Subject of the alert, verbatim (plus the suffix above). |
 | `to` | required | The recipients, one per line or comma-separated. |
-| `files` | required | The log files to read, absolute, one per line. Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly. A file listed twice is read twice. |
+| `files` | required | The log files to read, absolute, one per line; an entry with `*`, `?` or `[` is a glob, expanded at every run ([Globs](#globs)). Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly. A file the list names more than once, or a glob matches after it was named, is read once. |
 | `patterns` | | Literal text, matched case-SENSITIVELY against the whole line. A line matches when any pattern of any of the four shapes is found in it. |
 | `ipatterns` | | Literal text, case-insensitive. |
 | `regex` | | Python regular expressions (`re.search`), case-sensitive. |
@@ -167,6 +169,7 @@ The file's rules:
 | `max_lines` | `200` | At most this many MATCHING lines per email, each with its context, then one trailer `... and N more matching line(s)` with the exact remainder. |
 | `start` | `end` | Where the first run of a file begins: `end` (no flood of old news) or `beginning`. |
 | `archive_dir` | the log's own directory | Where rotated copies live when they are not beside the log: logrotate's `olddir`, newsyslog's `-a`. |
+| `include_archives` | `no` | Whether a glob reads rotated copies as files of their own ([Globs](#globs)). `yes` is for directories where the dated names ARE the live files (Apache's `rotatelogs`), never for a rotating log. |
 
 A physical line is matched and shown whole up to 16000 bytes (eight 2000-byte
 fragments); what lies beyond is neither matched nor shown, and the report line
@@ -251,7 +254,12 @@ to =
     noc@example.net
 
 # Log files to read: absolute paths, one per line. Compressed files (.gz,
-# .bz2, .xz) may be listed directly. No wildcards in this release.
+# .bz2, .xz) may be listed directly. An entry may be a glob (* ? [...], the
+# shell's rules: a wildcard stays within one directory level, names starting
+# with a dot need a pattern that starts with one, [[] is a literal bracket; **
+# is refused), expanded at every run: /var/log/hosts/*/messages. A glob reads
+# regular files only, never through a symbolic link (list a link by name),
+# and leaves rotated copies out (see include_archives).
 files =
     /var/log/router.log
 
@@ -313,6 +321,17 @@ patterns =
 # Where rotated archives live when they are not beside the log (logrotate's
 # olddir, newsyslog's -a). Default: the log's own directory.
 #archive_dir = /var/log/archive
+
+# Whether a glob in files reads rotated copies (router.log.1,
+# router.log-20260915.gz, router.log.bak, messages.gz) as files of their
+# own. Default no: a rotation would otherwise mail every alert twice. yes
+# is for directories where the dated names ARE the live files (Apache's
+# rotatelogs), never for a rotating log. A file a glob first matches is read
+# from its beginning when it is newer than the section's last run over that
+# glob (a new daily file is all new content); otherwise its first sight
+# starts at the end, like a listed file's. logalert --check-config lists
+# what a glob matches and what it leaves out.
+#include_archives = no
 
 # ---------------------------------------------------------------------------
 # A second watch, on a compressed log, with case-insensitive matching.
@@ -404,6 +423,82 @@ file nothing can read is refused by the run with `fix it or start over with
 --reset-state`; `--reset-state` without a path replaces it with an empty one.
 `state_ttl` forgets the position of a file not seen for that many days on its
 own.
+
+## Globs
+
+A `files` entry containing `*`, `?` or `[` is expanded at every run, with the
+shell's rules: a wildcard stays within one directory level (`/var/log/*.log`,
+`/var/log/hosts/*/messages`), a name starting with `.` is matched only by a
+pattern component that starts with one, `[[]` is a literal bracket, and the
+platform decides case. `**` is refused, and so is an entry ending in `/`. A
+glob matches regular files only, and never through a symbolic link: a link it
+matches, and a link where a wildcard directory component would descend, is
+passed over (a link is a name you never wrote, and a run with more privilege
+than whoever planted it would otherwise mail a file outside the directory);
+list a link by name, which is your own choice. A directory, FIFO or device the
+glob names is passed over too (`/var/log/*` names directories nobody wants
+read), where a listed entry naming one is an error; hard links to one file are
+read once, under the first name in sort order. The matches are read in name
+order, so a daily directory reads in date order, and each match is one file
+with its own position in the state, spelled as `--check-config` lists it --
+that spelling is what `--reset-state` takes (given the glob itself,
+`--reset-state` says so and takes nothing). A file the list names and a glob
+also matches is read once, under the listed spelling.
+
+**Rotated copies are left out** unless the section sets `include_archives =
+yes`. Three shapes of name are copies wherever they stand, live file present or
+not: a rotation suffix the rotation rules recognise (see
+[above](#position-tracking-and-rotation)), numeric or dated, compressed or not,
+when what precedes it does not end in a digit (`router.log.1`,
+`router.log-20260915.gz`, `access_log.1726358400`, `app.2024` -- but
+`192.0.2.1`, `2026-09-15` and `python3.12` are files); a copy's suffix
+(`.bak`, `.old`, `.orig`, `.save`, `-old`, `-bak`, with or without a
+compression extension); and a bare compression extension (`messages.gz`, a
+hand-made `gzip` of a live log). A fourth is judged against the other matches
+in the same directory: a numeric or dated rotation of another matched name
+whose base ends in a digit (`router1.2` beside `router1`). Nothing else is:
+`fw-dmz` beside `fw`, `router1.example.net` beside `router1`, `syslog.log`
+beside `syslog` are hosts and logs of their own. Otherwise `/var/log/router*`
+would read `router.log.1.gz` as a file of its own and mail every alert twice
+after each rotation. `--check-config` lists what a glob matched, what it left
+out and what it passed over, by name; a file left out that is wanted is listed
+by name. `include_archives = yes` reads every match: for directories where the
+dated names are the live files, as Apache's `rotatelogs` writes them; on a
+rotating log it mails the rotated content twice, because the renamed copy gets
+a position of its own and the next rotation replaces it.
+
+**A new file is read from its beginning.** A file a glob matches for the first
+time is read from 0, not from its end, when the section has run before with
+that glob in its `files`, that run listed the glob's directories, and the file's
+modification time is not older than the start of that run: a new daily file is
+all new content, and starting at its end would lose what was written before
+the run that found it. The activity log says `new since the last run (<glob>);
+reading from the beginning`. Everything else is a plain first sight at the
+end: a glob just added to the configuration (so widening `error.log` to
+`*.log` never mails a long-lived file whole), a glob whose directory has never
+yet been listed (a share mounted or a permission granted after the first run
+does not mail every live log in it whole), a file older than the section's last
+run (a copy restored with its timestamps, a rotated copy under
+`include_archives = yes` -- `rename`, `gzip`, `xz` and `bzip2` keep the
+original's modification time), and every listed path, whose first sight is
+unchanged. A glob's moment is recorded when the section's positions are saved
+-- never when its delivery failed, so the re-run reads the same new file from
+0 again, and never for a glob whose directory was away or could not be listed
+that run, so a file created during the outage is read whole once the directory
+is back. `--reset-state` forgets the section's moments with the positions: a
+file that appears between the reset and the next run is a plain first sight
+at the end, so reset right before a run, or preview with `-n`. One consequence
+to know: a file the glob matched but could not open for a while (a `Permission
+denied` failed item each run) is read from 0 once it can be, since it was never
+matched before; a fresh modification time on old content (`cp` without `-p`)
+reads the same way, at most `max_lines` matching lines in one mail; `-n` first
+shows what that would send.
+
+A glob that matches nothing is nothing to do (a DEBUG line; the directory may
+not exist yet). A directory the glob needs to list but cannot is a failed item
+(`[section] /var/log/hosts/*/messages: cannot list /var/log/hosts (Permission
+denied)`, exit 1): a watch that went quiet because of a permission must not
+look like a watch with nothing to say.
 
 ## Running it
 
@@ -599,4 +694,6 @@ configured destination still gets INFO and above.
 | `'...' is not a bare local@domain address` (exit 2; as `[logalert] from:`, `[<section>] to:` or `--from:`) | A display name, angle brackets or spaces in an address; a leading `-` is refused separately as `'...' starts with '-'` | Bare addresses only |
 | A pattern starting with `#` or `;` never matches | The parser drops such a continuation line as a comment | A regex with the escape: `\#`, `\;` |
 | `no rotated copy holds the saved position ...` in the log after every rotation | The archives are elsewhere, or fewer are kept than rotations happen between runs | Set `archive_dir`, or run logalert more often than the rotation |
-| `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config, or the file was never seen | Use the exact configured path; `--reset-state` with no path forgets everything |
+| `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config (or as `--check-config` lists a glob's match), or the file was never seen; given the glob itself it says `is a glob` | Use the exact path; `--reset-state` with no path forgets everything |
+| A glob mails nothing, or a file it should read is missing from `--check-config` | The glob matches nothing where it looks (`matches nothing`), or the file is left out as a rotated copy (`left out:` -- a name ending in `.N` or a date such as `app.2024`, a `.bak` or `.gz` twin), or it is not a regular file or is a symbolic link (`passed over:`) | `logalert --check-config` names every match and everything left out; list a wanted file by name, or set `include_archives = yes` for a directory of dated live files |
+| `[section] /var/log/hosts/*/messages: cannot list /var/log/hosts (Permission denied)` (exit 1) | The running user cannot list a directory the glob needs to look into; the files of the section that were reachable were processed | Grant read and search permission on the directory, or run as a user that has it |

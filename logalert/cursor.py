@@ -103,7 +103,7 @@ def open_log(path: str) -> BinaryStream:
     Only a regular file: a FIFO with no writer would block ``open(2)`` for good, and a
     device or socket has no byte offsets to remember. ``FileNotFoundError`` propagates.
     """
-    kind = _special_kind(os.stat(path).st_mode)
+    kind = special_kind(os.stat(path).st_mode)
     if kind is not None:
         raise OSError(f"{path}: not a regular file (a {kind})")
     suffix = compressed_suffix(path)
@@ -124,7 +124,9 @@ def open_log(path: str) -> BinaryStream:
     return open(path, "rb")
 
 
-def _special_kind(mode: int) -> str | None:
+def special_kind(mode: int) -> str | None:
+    """What a non-regular file is, for a message, or None for a regular file; what a glob
+    passes over (``logalert.globs``) and what ``open_log`` refuses."""
     if stat.S_ISREG(mode):
         return None
     if stat.S_ISDIR(mode):

@@ -71,7 +71,12 @@ to =
     noc@example.net
 
 # Log files to read: absolute paths, one per line. Compressed files (.gz,
-# .bz2, .xz) may be listed directly. No wildcards in this release.
+# .bz2, .xz) may be listed directly. An entry may be a glob (* ? [...], the
+# shell's rules: a wildcard stays within one directory level, names starting
+# with a dot need a pattern that starts with one, [[] is a literal bracket; **
+# is refused), expanded at every run: /var/log/hosts/*/messages. A glob reads
+# regular files only, never through a symbolic link (list a link by name),
+# and leaves rotated copies out (see include_archives).
 files =
     /var/log/router.log
 
@@ -133,6 +138,17 @@ patterns =
 # Where rotated archives live when they are not beside the log (logrotate's
 # olddir, newsyslog's -a). Default: the log's own directory.
 #archive_dir = /var/log/archive
+
+# Whether a glob in files reads rotated copies (router.log.1,
+# router.log-20260915.gz, router.log.bak, messages.gz) as files of their
+# own. Default no: a rotation would otherwise mail every alert twice. yes
+# is for directories where the dated names ARE the live files (Apache's
+# rotatelogs), never for a rotating log. A file a glob first matches is read
+# from its beginning when it is newer than the section's last run over that
+# glob (a new daily file is all new content); otherwise its first sight
+# starts at the end, like a listed file's. logalert --check-config lists
+# what a glob matches and what it leaves out.
+#include_archives = no
 
 # ---------------------------------------------------------------------------
 # A second watch, on a compressed log, with case-insensitive matching.

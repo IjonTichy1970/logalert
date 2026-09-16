@@ -66,7 +66,9 @@ def test_reset_everything(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     assert load_state(str(state_file)).entries == {}
     with RunLock(lock_path(str(state_file)), 3600):  # released after the reset
         pass
-    assert json.loads(state_file.read_text(encoding="utf-8")) == {"version": 1, "entries": {}}
+    assert json.loads(state_file.read_text(encoding="utf-8")) == {
+        "version": 1, "entries": {}, "runs": {},
+    }
 
 
 def test_reset_one_file_forgets_every_section_for_it(

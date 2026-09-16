@@ -21,12 +21,26 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
   * A run as root against a state file another user owns is refused up front: ``mkstemp``
     plus ``os.replace`` would hand the file to root, and that user's next cron run could
     not read it. The remedy is named (``sudo -u <owner>``), never applied by chown.
+  * ``runs`` (issue #18) records, per section and per glob in its ``files``, the start of
+    the last SUCCESSFUL run that looked into that glob: what the run's new-file rule
+    compares a first sight against. A glob's moment moves when the section's cursors move
+    and the glob's directories were listed without error -- never when its delivery
+    failed, and never for a glob whose directory was away or unlistable that run, so a
+    file created during the outage is still newer than the moment when the directory is
+    back; a glob never looked into has none. ``forget`` drops a section's record with its
+    cursors so ``--reset-state``'s promise (the next run starts at the end, or the
+    beginning per ``start``) stays true; a record whose section left the configuration
+    expires after ``state_ttl`` days, a configured section's never (its next saved run
+    refreshes it). A file without ``runs`` is from before #18 and reads as if no section
+    had run. The schema version stays 1: an older logalert reads such a file correctly and
+    drops the record on save.
 """
 
 import json
 import os
 import sys
 import tempfile
+from collections.abc import Collection, Iterable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -58,6 +72,9 @@ class Cursor:
     line: int | None = None  # complete lines before offset; None in a file from before #9
 
 
+RunRecord = dict[str, str]  # glob, as written in ``files`` -> ISO 8601 UTC seconds, the run START
+
+
 def timestamp(now: datetime | None = None) -> str:
     """The ``last_seen`` form: ``2026-09-14T23:51:38Z``. ``now`` must be timezone-aware."""
     return _aware(now).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -83,9 +100,11 @@ def lock_path(state_file: str) -> str:
 class State:
     """The cursors of one state file, in memory; ``save`` writes them back atomically."""
 
-    def __init__(self, path: str, entries: dict[tuple[str, str], Cursor] | None = None) -> None:
+    def __init__(self, path: str, entries: dict[tuple[str, str], Cursor] | None = None,
+                 runs: dict[str, RunRecord] | None = None) -> None:
         self.path = path
         self.entries: dict[tuple[str, str], Cursor] = dict(entries or {})
+        self.runs: dict[str, RunRecord] = dict(runs or {})
         self.dirty = False
 
     def get(self, section: str, file: str) -> Cursor | None:
@@ -102,12 +121,35 @@ class State:
             self.entries[(section, file)] = replace(cursor, last_seen=timestamp(now))
             self.dirty = True
 
+    def record_run(self, section: str, files: Iterable[str], seen: Iterable[str],
+                   started: datetime | None = None) -> None:
+        """The section ran to a saved state: the globs in ``seen`` (looked into this run)
+        get the run's start as their moment, the other globs of ``files`` keep the moment
+        they had, and a glob no longer in ``files`` is dropped."""
+        previous = self.runs.get(section, {})
+        moment = timestamp(started)
+        wanted = set(seen)
+        self.runs[section] = {
+            glob: moment if glob in wanted else previous[glob]
+            for glob in files if glob in wanted or glob in previous
+        }
+        self.dirty = True
+
+    def last_run(self, section: str, glob: str) -> str | None:
+        """When the last saved run that looked into ``glob`` started, or None."""
+        return self.runs.get(section, {}).get(glob)
+
     def forget(self, file: str | None = None) -> int:
-        """Drop every entry (``file`` None) or every section's entry for one file."""
+        """Drop every entry (``file`` None) or every section's entry for one file -- and the
+        run record of each section that lost an entry, so its next first sight is a plain
+        one (see the module docstring); returns the number of entries dropped."""
         keys = [k for k in self.entries if file is None or k[1] == file]
         for key in keys:
             del self.entries[key]
-        if keys:
+            self.runs.pop(key[0], None)
+        if file is None:
+            self.runs.clear()
+        if keys or file is None:
             self.dirty = True
         return len(keys)
 
@@ -124,11 +166,32 @@ class State:
             self.dirty = True
         return dropped
 
+    def expire_runs(self, ttl_days: int, now: datetime | None = None, *,
+                    configured: Collection[str] = ()) -> list[str]:
+        """Drop the run records of sections that are not in the configuration and whose
+        newest moment is older than ``ttl_days``; returns their names. A configured
+        section's record is kept however old: its next saved run refreshes it, and losing
+        it would silently turn the section's next new file into a first sight at the end."""
+        moment = _aware(now)
+        dropped: list[str] = []
+        for section, record in list(self.runs.items()):
+            if section in configured:
+                continue
+            newest = max((parse_timestamp(at) for at in record.values()), default=moment)
+            if (moment - newest).total_seconds() > ttl_days * 86400 or not record:
+                del self.runs[section]
+                dropped.append(section)
+        if dropped:
+            self.dirty = True
+        return dropped
+
     def to_json(self) -> dict[str, Any]:
         entries: dict[str, dict[str, dict[str, Any]]] = {}
         for (section, file), cursor in sorted(self.entries.items()):
             entries.setdefault(section, {})[file] = asdict(cursor)
-        return {"version": STATE_VERSION, "entries": entries}
+        runs = {section: dict(sorted(record.items()))
+                for section, record in sorted(self.runs.items())}
+        return {"version": STATE_VERSION, "entries": entries, "runs": runs}
 
     def save(self) -> None:
         """Write the file atomically; see the module docstring. Clears ``dirty``."""
@@ -153,12 +216,37 @@ def load_state(path: str) -> State:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise StateError(f"state file {path}: not valid JSON ({exc}) -- {RESET_HINT}") from exc
-    return State(path, _entries(path, data))
+    return State(path, _entries(path, data), _runs(path, data))
+
+
+def _corrupt(path: str, what: str) -> StateError:
+    return StateError(f"state file {path}: {what} -- {RESET_HINT}")
+
+
+def _runs(path: str, data: dict[str, Any]) -> dict[str, RunRecord]:
+    """The ``runs`` records; absent in a file from before #18, which is not an error."""
+    sections = data.get("runs", {})
+    if not isinstance(sections, dict):
+        raise _corrupt(path, "'runs' is not an object")
+    runs: dict[str, RunRecord] = {}
+    for section, moments in sections.items():
+        where = f"runs[{section!r}]"
+        if not isinstance(moments, dict):
+            raise _corrupt(path, f"{where} is not an object")
+        for glob, at in moments.items():
+            if not isinstance(at, str):
+                raise _corrupt(path, f"{where}[{glob!r}] is not a string")
+            try:
+                parse_timestamp(at)
+            except ValueError:
+                raise _corrupt(path, f"{where}[{glob!r}] is not a UTC timestamp") from None
+        runs[section] = dict(moments)
+    return runs
 
 
 def _entries(path: str, data: Any) -> dict[tuple[str, str], Cursor]:
     def corrupt(what: str) -> StateError:
-        return StateError(f"state file {path}: {what} -- {RESET_HINT}")
+        return _corrupt(path, what)
 
     if not isinstance(data, dict):
         raise corrupt("the top level is not an object")
