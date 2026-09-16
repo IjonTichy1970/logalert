@@ -30,6 +30,10 @@ its notes.
   left `0644` by 0.1.0 is tightened by the next run; the gone-holder line points
   at `fuser` instead of a dead PID.
 
+- `[contract]` **A `state_file` that is a symbolic link is refused** (#39). A
+  link never worked as a redirect: the first save replaced the link itself with
+  a regular file, silently, and the root-refusal rule judged the link's target.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

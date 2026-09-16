@@ -21,6 +21,10 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
   * A run as root against a state file another user owns is refused up front: ``mkstemp``
     plus ``os.replace`` would hand the file to root, and that user's next cron run could
     not read it. The remedy is named (``sudo -u <owner>``), never applied by chown.
+  * A ``state_file`` that is a symbolic link is refused (issue #39): ``os.replace`` would
+    replace the link itself with a regular file on the first save, silently, and the owner
+    rule would judge the link's target -- whatever the link's planter chose. The check and
+    the owner rule ``lstat``; the lock is ``O_NOFOLLOW`` and the ``file:`` log ``lstat``s.
   * ``runs`` (issue #18) records, per section and per glob in its ``files``, the start of
     the last SUCCESSFUL run that looked into that glob: what the run's new-file rule
     compares a first sight against. A glob's moment moves when the section's cursors move
@@ -38,6 +42,7 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
 
 import json
 import os
+import stat
 import sys
 import tempfile
 from collections.abc import Collection, Iterable
@@ -318,7 +323,16 @@ def check_state_dir(state_file: str) -> None:
                          f"would send everything again next time") from exc
     os.close(fd)
     os.unlink(temp)
-    if os.path.exists(state_file) and not os.path.isfile(state_file):
+    # lstat, never stat (issue #39): a link at state_file was silently replaced by a regular
+    # file on the first save (os.replace replaces the link itself), and the owner rule below
+    # would have judged the link's target, which is whatever the link's planter chose
+    try:
+        mode = os.lstat(state_file).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and stat.S_ISLNK(mode):
+        raise StateError(f"state file {state_file} is a symbolic link -- name the real path")
+    if mode is not None and not stat.S_ISREG(mode):
         raise StateError(f"state file {state_file} is not a regular file")
     if sys.platform == "win32" and os.path.isfile(state_file) and not os.access(
             state_file, os.W_OK):
@@ -346,7 +360,7 @@ def _foreign_owner(state_file: str) -> str | None:
         if os.geteuid() != 0:
             return None
         try:
-            uid = os.stat(state_file).st_uid
+            uid = os.lstat(state_file).st_uid  # the file itself, never a link's target
         except FileNotFoundError:
             uid = os.stat(os.path.dirname(state_file) or ".").st_uid
         if uid == 0:
