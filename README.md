@@ -71,8 +71,9 @@ and a troubleshooting table.
 - [docs/USAGE.md](docs/USAGE.md) -- options, configuration reference, position
   tracking and rotation, running it, mail, logging, troubleshooting.
 - [INSTALL.md](INSTALL.md) -- installing, configuring, scheduling, upgrading.
-- [CHANGELOG.md](CHANGELOG.md) -- every change, with the decisions behind it;
-  rendered at <https://ijontichy1970.github.io/logalert/>.
+- [CHANGELOG.md](CHANGELOG.md) -- every change, each linked to the issue that
+  holds the decisions behind it; rendered at
+  <https://ijontichy1970.github.io/logalert/>.
 
 ## Development
 

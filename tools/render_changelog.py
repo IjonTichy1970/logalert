@@ -7,13 +7,15 @@ The changelog's `## About this changelog` section, last in the file, is the only
 of its format: a title and one paragraph first, then `## [Unreleased]` and `## [x.y.z] -- date
 -- label` version headings (em dashes), one `### Nitty Gritty` per version, entries `- ` +
 the tag in backticks + an optional marker + a bold headline + `(#N)` + a period + the body
-wrapped with two-space continuation, then the About section, then the footer links. This
-tool parses that STRUCTURE
-itself and hands only the text to `markdown` for rendering. The same parse is the changelog's
-structural gate: the doctrine's "an untagged entry stops the release" was enforced by reading
-until now, and the Pages build (and `tools/gate.sh`, via `--check`) now refuse:
+wrapped with two-space continuation, the whole entry at most `MAX_ENTRY_LINES` lines (#60:
+one bold sentence, then at most three short sentences), then the About section, then the
+footer links. This tool parses that STRUCTURE itself and hands only the text to `markdown`
+for rendering. The same parse is the changelog's structural gate: the doctrine's "an untagged
+entry stops the release" was enforced by reading until now, and the Pages build (and
+`tools/gate.sh`, via `--check`) refuse:
 
   * an entry without a `[contract]` / `[internal]` tag, or without `**headline** (#N).`
+  * an entry of more than `MAX_ENTRY_LINES` lines (the reasoning belongs on the issue)
   * an entry outside a `### Nitty Gritty` section, or a second `### Nitty Gritty` in one version
   * a `##` heading that is not a version heading, or a released version without a date
   * no `## [Unreleased]` first, a version heading twice, released versions not descending, or
@@ -47,6 +49,9 @@ SITE = REPO_ROOT / "site"
 ISSUES = "https://github.com/IjonTichy1970/logalert/issues/"
 TITLE = "logalert changelog"
 CATEGORY = "### Nitty Gritty"
+# One bold sentence, then at most three short sentences (#60): a two-line headline and three
+# sentences of 60-80 characters is five lines at 80 columns; the sixth is for code spans.
+MAX_ENTRY_LINES = 6
 ABOUT = "## About this changelog"
 
 EXIT_OK = 0
@@ -153,6 +158,10 @@ def parse(text: str, name: str = "CHANGELOG.md") -> Changelog:
                             pending[0])
             raise where(pending_line, "an entry without a [contract] / [internal] tag",
                         pending[0])
+        if len(pending) > MAX_ENTRY_LINES:
+            raise where(pending_line, f"an entry of {len(pending)} lines: at most"
+                        f" {MAX_ENTRY_LINES} (one bold sentence, then at most three short"
+                        " sentences; reflow the block first)", pending[0])
         refs = tuple(int(ref[1:]) for ref in match.group("refs").split(", "))
         current.entries.append(Entry(pending_line, match.group("tag"), match.group("marker"),
                                      match.group("headline"), refs, match.group("body").strip()))
@@ -218,11 +227,11 @@ def parse(text: str, name: str = "CHANGELOG.md") -> Changelog:
                 raise where(number, f"an entry outside {CATEGORY}", line)
             pending, pending_line = [line], number
             continue
+        if line.strip() == "":  # before the continuation test: two spaces alone are a blank
+            flush()
+            continue
         if pending and line.startswith("  "):
             pending.append(line)
-            continue
-        if line.strip() == "":
-            flush()
             continue
         if line.startswith("#"):
             flush()

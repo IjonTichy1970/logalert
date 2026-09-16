@@ -11,8 +11,9 @@ attention it prints one line to stderr, which cron mails to `MAILTO`.
 This document covers the command, the configuration file, position tracking and
 rotation, running it from cron or a systemd timer, mail, logging and
 troubleshooting. Installation (the venv, the `/usr/local/bin` symlink, upgrades)
-is in [INSTALL.md](../INSTALL.md); every decision behind the behaviour described
-here is recorded in [CHANGELOG.md](../CHANGELOG.md).
+is in [INSTALL.md](../INSTALL.md); every change to the behaviour described here
+is in [CHANGELOG.md](../CHANGELOG.md), and the issue each entry links to holds
+the decision behind it.
 
 Linux is what CI tests. The BSDs are expected to work (the syslog socket paths
 and the `newsyslog` naming styles are handled) but are not gated.
