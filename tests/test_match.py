@@ -276,9 +276,21 @@ def test_cap_bounds_what_is_stored_but_not_what_is_counted(tmp_path: Path) -> No
     stream = lines(*(["MATCH"] * 5 + ["x", "LAST MATCH"]))
     report = scan(FILE, stream, watch, context=1, cap=3)
     assert len(report.matches) == 3 and len(report.entries) == 3
-    assert report.matched == 6 and report.omitted == 4  # two more matches, x, LAST
+    assert report.matched == 6  # three more matches were counted, not stored
     assert report.priority == "high"  # from a match that was not stored
     assert report.lines == 7
+
+
+def test_cap_counts_matching_lines_and_keeps_the_last_ones_context(tmp_path: Path) -> None:
+    # the unit of max_lines is matching lines: with context, the cap-th match keeps its
+    # trailing context and the next match is where storing stops (an entry-count cap of
+    # the same number would have cut the context of the second match)
+    watch = make_watch(tmp_path, "patterns =\n    MATCH\n")
+    stream = lines("MATCH 1", "a", "b", "MATCH 2", "c", "d", "MATCH 3", "e", "MATCH 4")
+    report = scan(FILE, stream, watch, context=3, cap=2)
+    assert [e.text for e in report.entries] == ["MATCH 1", "a", "b", "MATCH 2", "c", "d"]
+    assert [m.text for m in report.matches] == ["MATCH 1", "MATCH 2"]
+    assert report.matched == 4
 
 
 def test_section_default_is_each_untagged_patterns_priority(tmp_path: Path) -> None:

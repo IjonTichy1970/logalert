@@ -148,6 +148,36 @@ def classify(name: str, base: str) -> tuple[Style, tuple[int, ...], str, bool] |
     return "other", (), rest, compressed
 
 
+COPY_SUFFIXES: tuple[str, ...] = (".bak", ".old", ".orig", ".save", "-old", "-bak")
+
+
+def archive_suffix(name: str) -> str | None:
+    """The suffix that makes ``name`` the shape of a copy of SOME log, judged without knowing
+    which, or None -- what a glob leaves out under ``include_archives = no`` (issue #18), so
+    that ``router.log.1`` is never read as a file of its own, live file present or not:
+    a numeric or dated rotation suffix per ``classify`` whose base does not end in a digit
+    (``192.0.2.1`` is a host's file, not a copy of ``192.0.2``; ``2026-09-15`` is a daily
+    file); a hand-made copy's suffix (``COPY_SUFFIXES``); a bare compression extension
+    (``messages.gz`` beside, or instead of, ``messages``) -- each with an optional
+    compression extension after it. The ``other`` style needs a base and is not a shape.
+    The longest rotation suffix that is one: what ``classify`` would name with the log's
+    own base."""
+    for index in range(1, len(name)):
+        if name[index] not in ".-" or name[index - 1].isdigit():
+            continue
+        found = classify(name, name[:index])
+        if found is not None and found[0] != "other":
+            return found[2]
+    ext = _EXT.search(name)
+    stem = name[:ext.start()] if ext else name
+    for suffix in COPY_SUFFIXES:
+        if stem.endswith(suffix) and len(stem) > len(suffix):
+            return suffix
+    if ext and stem:
+        return ext.group(0)
+    return None
+
+
 def _plausible_date(fields: list[int]) -> bool:
     """Whether a dated key names a real moment: ``-2026091412`` is a date with an hour,
     ``-1789440820`` (logrotate ``dateformat -%s``) is an epoch that only looks like one."""

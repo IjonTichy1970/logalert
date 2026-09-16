@@ -312,33 +312,431 @@ fi
 #     `re.search`, because a search cannot answer an "all" question
 # shellcheck disable=SC2329 # invoked by the EXIT trap, not by name
 cleanup() {
-  :  # undo every mutation run_native_checks() makes -- unconditionally
+  # Everything the checks create lives under $T; a run they left in the background is
+  # killed first so the tree is not removed under it. Unconditional: on a long-lived
+  # sandbox a restore that runs only on the happy path leaves the next run measuring
+  # this run's wreckage.
+  if [ -n "${BG_PID:-}" ]; then
+    # the subshell's child is `timeout`, which forwards the signal down to the run (measured:
+    # killing the subshell alone left the run to log 'state not saved' under the removed tree)
+    pkill -TERM -P "$BG_PID" 2>/dev/null
+    wait "$BG_PID" 2>/dev/null
+  fi
+  [ -n "${T:-}" ] && rm -rf "$T"
 }
 trap cleanup EXIT
 
-run_native_checks() {
-  echo "-- example check"
-  # Replace this block. It exists so the template can be run end to end as-is.
-  local out rc pid1
-  out="$(bounded "$BOUND_CMD" uname -sr 2>&1)"; rc=$?
-  if [ "$rc" -eq 124 ]; then
-    skip "uname did not finish within ${BOUND_CMD}s -- the kernel was not asked"
-  elif [ "$rc" -ne 0 ]; then
-    fail "uname exited $rc: $out" "uname"
+# The checks (issue #14): properties of the INSTALLED script on a real Linux host, as the
+# service user, over a fixture nobody else can see. Every assertion is keyed on $T so a
+# leftover from an earlier session can neither satisfy nor break one; nothing on the host
+# outside $T is touched (pip's cache included: PIP_CACHE_DIR points into $T), and the only
+# residue is this run's records in the host's logs: the journal, the syslog file rsyslog
+# mirrors it into, and runuser's session lines in auth.log.
+T=""
+BG_PID=""
+SVC="${LOGALERT_STAGE_USER:-nobody}"   # the service user: exists everywhere, owns nothing
+BOUND_BUILD="${LOGALERT_BOUND_BUILD:-240}"   # the wheel build and install: a cold pip cache fetches setuptools
+
+# as_svc <tag> <args...>: the installed script as the service user, the fake's directory
+# in its environment; stdout and stderr captured to $T/<tag>.out and $T/<tag>.err (the
+# lock check runs two at once), the exit code returned.
+as_svc() {
+  local tag="$1"; shift
+  bounded "$BOUND_CMD" runuser -u "$SVC" -- env LOGALERT_FAKE_DIR="$T/fake" "${SVC_ENV[@]}" \
+    "$T/bin/logalert" "$@" > "$T/$tag.out" 2> "$T/$tag.err"
+}
+SVC_ENV=()
+fake_calls() { find "$T/fake" -name 'call-*-argv.json' 2>/dev/null | wc -l; }
+last_argv()  { find "$T/fake" -name 'call-*-argv.json' | sort | tail -1; }
+# last_body: the latest mail's text, DECODED (a body with any line over 78 characters
+# travels quoted-printable, where `==>` is `=3D=3D>`), into $T/body.txt
+last_body() {
+  bounded "$BOUND_CMD" "$T/venv/bin/python" "$T/body.py" "$(find "$T/fake" -name 'call-*-stdin.bin' | sort | tail -1)" > "$T/body.txt" 2>&1
+}
+# quiet <tag>: nothing on either stream
+quiet() { [ ! -s "$T/$1.out" ] && [ ! -s "$T/$1.err" ]; }
+# first_err <tag>: the first stderr line, for a failure message
+first_err() { head -1 "$T/$1.err"; }
+
+# check_journal: the journal side of the syslog check, in its own function so a skip
+# (journalctl gone, hung or refusing) ends this check and not the ones after it.
+check_journal() {
+  local out rc journald=""
+  if command -v journalctl >/dev/null 2>&1; then
+    journald="$(bounded "$BOUND_CMD" systemctl is-active systemd-journald 2>/dev/null)"; rc=$?
+    [ "$rc" -eq 124 ] && journald="no answer from systemctl within ${BOUND_CMD}s"
+  fi
+  if [ "$journald" = "active" ]; then
+    # Every journalctl call is read through a file with its exit code FIRST: a query that
+    # hangs or refuses must not be read as 'the journal holds 0 records' (a red against the
+    # syslog handler) -- measured, a pipe into the filter did exactly that.
+    bounded "$BOUND_CMD" journalctl --sync >/dev/null 2>&1; rc=$?
+    if [ "$rc" -eq 124 ]; then
+      skip "journalctl --sync did not finish within ${BOUND_CMD}s -- the journal side was not checked"; return
+    fi
+    bounded "$BOUND_CMD" journalctl -t logalert --no-pager -o json --since "-30min" > "$T/journal.jsonl" 2> "$T/journal.err"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+      skip "journalctl did not answer within ${BOUND_CMD}s -- the journal side was not checked"; return
+    elif [ "$rc" -ne 0 ]; then
+      skip "journalctl exited $rc ($(head -1 "$T/journal.err")) -- the journal side was not checked"; return
+    fi
+    out="$(bounded "$BOUND_CMD" "$T/venv/bin/python" "$T/journal.py" "$T" "$(id -u "$SVC")" < "$T/journal.jsonl" 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+      fail "the journal filter exited $rc: $out" "journal-filter"
+    else
+      set -- $out
+      if [ "$1" -lt 4 ]; then
+        fail "the journal holds $1 record(s) naming this run; the runs above should have left at least 4" "journal-records"
+      elif [ "$2" -ne "$1" ]; then
+        fail "$(( $1 - $2 )) of $1 journal records lack SYSLOG_IDENTIFIER=logalert or the service user's _UID" "journal-ident"
+      elif [ "$3" -ne 0 ]; then
+        fail "the --log stderr run left $3 record(s) in the journal" "journal-stderr"
+      else
+        ok "$1 journal records name this run, every one tagged logalert with _UID $(id -u "$SVC"); the --log stderr run left none"
+      fi
+    fi
+  elif [ -r /var/log/syslog ]; then
+    n="$(grep -c "logalert\[[0-9]*\]: .*$T/logalert.conf" /var/log/syslog)"
+    if [ "$n" -lt 1 ]; then
+      fail "/var/log/syslog holds no 'logalert[pid]:' line naming this run" "syslog-file"
+    elif grep -q "logalert\[[0-9]*\]: .*$T/conf2/" /var/log/syslog; then
+      fail "the --log stderr run left lines in /var/log/syslog" "syslog-stderr"
+    else
+      ok "$n /var/log/syslog lines carry logalert[pid] for this run; none from the --log stderr run"
+    fi
   else
-    ok "running natively on: $out"
+    skip "neither journald nor /var/log/syslog here -- the syslog side was not checked"
+  fi
+}
+
+run_native_checks() {
+  local out rc pyx version want shebang before after body argv n lines
+  T="$(mktemp -d)"; rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$T" ] || [ ! -d "$T" ]; then
+    # every path below is "$T/..."; an empty T would lay the tree out at / as root
+    T=""
+    skip "mktemp -d failed (TMPDIR=${TMPDIR:-unset}) -- no private tree to work in"; return
+  fi
+  # The caller's umask is not ours: sudo carries a hardened 027 or 077 into the re-exec, and
+  # everything below must be readable (the venv, the confs, the fixture) and the console
+  # script executable by $SVC. mktemp gives 0700 whatever the umask.
+  umask 022
+  chmod 755 "$T"
+  mkdir -p "$T/bin" "$T/logs" "$T/fake" "$T/conf2"
+  # Two helpers the checks run through the temp venv's interpreter: the latest mail's
+  # text decoded, and the offset the state file holds for one file.
+  cat > "$T/body.py" <<'EOF'
+import email, email.policy, sys
+msg = email.message_from_binary_file(open(sys.argv[1], "rb"), policy=email.policy.default)
+for part in msg.walk():
+    if part.get_content_type() == "text/plain":
+        sys.stdout.write(part.get_content())
+EOF
+  cat > "$T/offset.py" <<'EOF'
+import json, sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+entry = state["entries"].get(sys.argv[2], {}).get(sys.argv[3])
+print(entry["offset"] if entry else -1)
+EOF
+
+  echo "-- preconditions"
+  # A VERSIONED interpreter is INSTALL.md's rule for the venv; python3 names its own minor.
+  pyx="$(bounded "$BOUND_CMD" python3 -c 'import sys; print("python3.%d" % sys.version_info[1])' 2> "$T/python3.err")"; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    skip "python3 did not answer within ${BOUND_CMD}s -- no interpreter to build with"; return
+  fi
+  if [ -z "$pyx" ]; then
+    # an interpreter that starts and dies (a loader error once sudo has dropped LD_LIBRARY_PATH)
+    # is not a PATH problem; say what it said
+    skip "python3 exited $rc without naming its minor: $(head -1 "$T/python3.err")"; return
+  fi
+  if ! command -v "$pyx" >/dev/null 2>&1; then
+    skip "no versioned interpreter $pyx on PATH -- cannot create the venv INSTALL.md prescribes"; return
+  fi
+  local missing=""
+  for tool in runuser logrotate gzip; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+  done
+  if [ -n "$missing" ]; then
+    skip "missing on this host:$missing -- the service-user, rotation and lock checks need them"; return
+  fi
+  if ! id "$SVC" >/dev/null 2>&1; then
+    skip "no user '$SVC' on this host (set LOGALERT_STAGE_USER)"; return
+  fi
+  ok "$pyx, runuser, logrotate, gzip and user $SVC are here"
+
+  echo "-- install: the wheel from the checkout into a versioned temp venv, the symlink"
+  # The checkout is read-only in the sandbox (9p) and pip builds in-tree: copy the source
+  # first. The copy is the one operation that reads /mnt, so it is bounded like a probe.
+  mkdir -p "$T/src"
+  bounded "$BOUND_CMD" cp -r "$REPO_ROOT/logalert" "$REPO_ROOT/pyproject.toml" "$REPO_ROOT/README.md" \
+    "$REPO_ROOT/INSTALL.md" "$REPO_ROOT/CHANGELOG.md" "$REPO_ROOT/LICENSE" "$REPO_ROOT/MANIFEST.in" \
+    "$REPO_ROOT/tests/fake_sendmail.py" "$T/src/" 2>&1; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    skip "copying the checkout did not finish within ${BOUND_CMD}s (stale mount?)"; return
+  elif [ "$rc" -ne 0 ]; then
+    fail "copying the checkout exited $rc" "copy"; return
+  fi
+  find "$T/src" -name __pycache__ -type d -prune -exec rm -rf {} +
+  out="$(bounded "$BOUND_BUILD" "$pyx" -m venv "$T/venv" 2>&1)"; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    skip "$pyx -m venv did not finish within ${BOUND_BUILD}s"; return
+  elif [ "$rc" -ne 0 ]; then
+    fail "$pyx -m venv exited $rc: $out" "venv"; return
+  fi
+  # The venv's own pip builds the wheel with what the checkout says (setuptools>=77, an
+  # isolated build, so this needs the network once) -- the way pip install would on the box.
+  out="$(bounded "$BOUND_BUILD" env PIP_CACHE_DIR="$T/pipcache" "$T/venv/bin/python" -m pip wheel -q --no-deps \
+    -w "$T/dist" "$T/src" 2>&1)"; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    skip "the wheel build did not finish within ${BOUND_BUILD}s (no network for setuptools?)"; return
+  elif [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q -e "Could not find a version that satisfies the requirement setuptools" \
+      -e "Failed to establish a new connection" -e "NewConnectionError" -e "Temporary failure in name resolution"; then
+    # pip said no about the network, not about the checkout: could-not-check, never a pass
+    skip "the isolated build could not fetch setuptools (no network?): $(printf '%s' "$out" | tail -1 | head -c 120)"; return
+  elif [ "$rc" -ne 0 ]; then
+    fail "the wheel build exited $rc: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')" "wheel"; return
+  fi
+  out="$(bounded "$BOUND_BUILD" env PIP_CACHE_DIR="$T/pipcache" "$T/venv/bin/python" -m pip install -q --no-deps \
+    "$T"/dist/logalert-*.whl 2>&1)"; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    skip "pip install did not finish within ${BOUND_BUILD}s"; return
+  elif [ "$rc" -ne 0 ]; then
+    fail "pip install exited $rc: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')" "install"; return
+  fi
+  ln -s "$T/venv/bin/logalert" "$T/bin/logalert"
+  want="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$T/src/pyproject.toml")"
+  version="$(bounded "$BOUND_CMD" "$T/bin/logalert" --version 2>&1)"; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    skip "logalert --version did not answer within ${BOUND_CMD}s"; return
+  elif [ "$version" != "logalert $want" ]; then
+    fail "--version through the symlink printed '$version', pyproject.toml says '$want'" "version"
+  else
+    ok "logalert --version == pyproject.toml ($want) through the symlink"
+  fi
+  shebang="$(head -1 "$T/venv/bin/logalert")"
+  case "$shebang" in
+    "#!$T/venv/bin/python"*) ok "the console script's shebang is the venv interpreter ($shebang)" ;;
+    *) fail "the console script's shebang is '$shebang', not the venv's interpreter" "shebang" ;;
+  esac
+
+  echo "-- service user: a run as $SVC over a fixture log, quiet on exit 0, one mail per match"
+  # The fake MTA (tests/fake_sendmail.py) under the venv's shebang; a config the service
+  # user can read over a log it can read; a state directory it owns.
+  { printf '#!%s\n' "$T/venv/bin/python"; cat "$T/src/fake_sendmail.py"; } > "$T/bin/sendmail"
+  chmod 755 "$T/bin/sendmail"
+  chown "$SVC" "$T/fake"
+  install -d -m 750 -o "$SVC" "$T/state"
+  # a line that MATCHES sits in the file before the first run: first sight starts at the
+  # end, so it must never be mailed (a run from the beginning would mail it)
+  printf 'boot\ndisk failure zero\nquiet\n' > "$T/logs/router.log"
+  chmod 644 "$T/logs/router.log"
+  cat > "$T/logalert.conf" <<EOF
+[logalert]
+sendmail_path = $T/bin/sendmail
+state_file = $T/state/state.json
+from = alerts@example.net
+[router-disk]
+subject = Router disk failure
+to = noc@example.net
+files = $T/logs/router.log
+patterns =
+    disk failure
+EOF
+  chmod 644 "$T/logalert.conf"
+  as_svc r1 -f "$T/logalert.conf"; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    skip "the first run did not finish within ${BOUND_CMD}s"; return
+  elif [ "$rc" -ne 0 ] || ! quiet r1; then
+    fail "the first run (first sight) exited $rc with $(wc -c < "$T/r1.out")/$(wc -c < "$T/r1.err") bytes on stdout/stderr: $(first_err r1)" "first-sight"
+  elif [ "$(fake_calls)" -ne 0 ]; then
+    fail "the first run mailed $(fake_calls) time(s); first sight starts at the end" "first-sight"
+  else
+    ok "first sight: exit 0, nothing on either stream, no mail"
+  fi
+  echo "disk failure one" >> "$T/logs/router.log"
+  as_svc r2 -f "$T/logalert.conf"; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    skip "the second run did not finish within ${BOUND_CMD}s"; return
+  elif [ "$rc" -ne 0 ] || ! quiet r2; then
+    fail "the run with a match exited $rc with $(wc -c < "$T/r2.out")/$(wc -c < "$T/r2.err") bytes on stdout/stderr: $(first_err r2)" "match-run"
+  elif [ "$(fake_calls)" -ne 1 ]; then
+    fail "the run with a match made $(fake_calls) sendmail call(s), not 1" "match-run"
+  else
+    argv="$(last_argv)"
+    if ! grep -q '"alerts@example.net"' "$argv" || ! grep -q '"noc@example.net"' "$argv"; then
+      fail "the envelope is not from alerts@example.net to noc@example.net: $(tr -d '\n' < "$argv" | head -c 300)" "envelope"
+    elif ! last_body || ! grep -q 'disk failure one' "$T/body.txt"; then
+      fail "the mail does not carry the matching line: $(head -c 200 "$T/body.txt" | tr '\n' '|')" "mail-body"
+    else
+      ok "a match: exit 0, nothing on either stream, one mail from alerts@example.net to noc@example.net with the line"
+    fi
+  fi
+  out="$(bounded "$BOUND_CMD" "$T/venv/bin/python" "$T/offset.py" "$T/state/state.json" router-disk "$T/logs/router.log" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "the state file could not be read: $out" "state-read"
+  elif [ "$out" != "$(wc -c < "$T/logs/router.log")" ]; then
+    fail "the state's offset for router.log is $out, the file is $(wc -c < "$T/logs/router.log") bytes" "state-advance"
+  else
+    ok "the state advanced to the end of the file ($out bytes)"
   fi
 
-  echo "-- systemd is PID 1"
-  # Bounded like the check above, and 124 read FIRST: a killed `ps` prints
-  # nothing, and "not systemd" would be the wrong reading of no answer.
-  pid1="$(bounded "$BOUND_CMD" ps -p 1 -o comm= 2>/dev/null)"; rc=$?
+  echo "-- rotation: a real logrotate -f with compress between two matching lines"
+  cat > "$T/logrotate.conf" <<EOF
+$T/logs/router.log {
+    rotate 3
+    compress
+    missingok
+}
+EOF
+  chmod 644 "$T/logrotate.conf"
+  echo "disk failure before rotation" >> "$T/logs/router.log"
+  out="$(bounded "$BOUND_CMD" logrotate -f -s "$T/logrotate.state" "$T/logrotate.conf" 2>&1)"; rc=$?
   if [ "$rc" -eq 124 ]; then
-    skip "ps did not finish within ${BOUND_CMD}s -- PID 1 was not asked"
-  elif [ "$pid1" = "systemd" ]; then
-    ok "systemd is PID 1 -- unit checks are possible here"
+    skip "logrotate did not finish within ${BOUND_CMD}s"; return
+  elif [ "$rc" -ne 0 ] || [ ! -f "$T/logs/router.log.1.gz" ]; then
+    fail "logrotate exited $rc and left: $(ls "$T/logs" | tr '\n' ' ') -- $out" "logrotate"; return
+  fi
+  echo "disk failure after rotation" >> "$T/logs/router.log"
+  chmod 644 "$T/logs/router.log"   # logrotate recreated it under our umask; be explicit
+  before="$(fake_calls)"
+  as_svc r3 -f "$T/logalert.conf"; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    skip "the run after the rotation did not finish within ${BOUND_CMD}s"; return
+  fi
+  last_body
+  body="$T/body.txt"
+  if [ "$rc" -ne 0 ] || ! quiet r3; then
+    fail "the run after the rotation exited $rc with output: $(first_err r3)" "rotation-run"
+  elif [ "$(( $(fake_calls) - before ))" -ne 1 ]; then
+    fail "the run after the rotation made $(( $(fake_calls) - before )) mail(s), not 1" "rotation-run"
+  elif [ ! -s "$body" ]; then
+    fail "the mail after the rotation could not be decoded" "rotation-body"
+  elif [ "$(grep -c 'disk failure before rotation' "$body")" -ne 1 ] || [ "$(grep -c 'disk failure after rotation' "$body")" -ne 1 ] \
+      || [ "$(grep -c 'disk failure one' "$body")" -ne 0 ]; then
+    fail "the mail after the rotation carries the pre-rotation line $(grep -c 'disk failure before rotation' "$body") time(s), the post-rotation line $(grep -c 'disk failure after rotation' "$body") time(s) and the line mailed BEFORE the rotation $(grep -c 'disk failure one' "$body") time(s); once, once and never is the contract" "rotation-lines"
+  elif [ "$(grep -n '^==> ' "$body" | head -1 | grep -c 'router.log.1.gz')" -ne 1 ]; then
+    fail "the report does not open with the rotated copy: $(grep '^==> ' "$body" | tr '\n' ' ')" "rotation-order"
   else
-    skip "systemd is not PID 1 (${pid1:-no answer}) -- cannot start a unit (wsl.conf needs [boot] systemd=true)"
+    ok "both lines mailed once, the rotated copy read before the live file"
+  fi
+
+  echo "-- lock: two runs at once, the second turned away quietly"
+  echo "disk failure race" >> "$T/logs/router.log"
+  before="$(fake_calls)"
+  # A holds the lock while its fake sendmail sleeps; B is launched once the fake has recorded
+  # the call (so A is inside its delivery, not a fixed sleep's guess), with its own log so
+  # the turn-away is OBSERVED rather than inferred from one mail and two quiet exits, which
+  # an uncontended pair would also produce
+  SVC_ENV=(LOGALERT_FAKE_SLEEP=3)
+  ( as_svc lockA -f "$T/logalert.conf"; echo "$?" > "$T/rcA" ) &
+  BG_PID=$!
+  SVC_ENV=()
+  n=0
+  while [ "$(fake_calls)" -le "$before" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+  as_svc lockB -f "$T/logalert.conf" --log "file:$T/fake/lockB.log"; rc=$?
+  wait "$BG_PID"
+  BG_PID=""
+  if [ "$n" -ge 100 ]; then
+    skip "the lock holder never reached its delivery within 10 s -- the lock was not exercised"
+  elif [ "$rc" -eq 124 ] || [ "$(cat "$T/rcA")" = "124" ]; then
+    skip "a run in the lock check did not finish within ${BOUND_CMD}s"
+  elif [ "$rc" -ne 0 ] || ! quiet lockB; then
+    fail "the second run exited $rc with output: $(first_err lockB)" "lock-second"
+  elif ! grep -q 'this run exits quietly' "$T/fake/lockB.log" 2>/dev/null; then
+    skip "the two runs did not overlap (no turn-away in the second run's log) -- the lock was not exercised"
+  elif [ "$(cat "$T/rcA")" -ne 0 ] || ! quiet lockA; then
+    fail "the first run (the lock holder) exited $(cat "$T/rcA"): $(first_err lockA)" "lock-first"
+  elif [ "$(( $(fake_calls) - before ))" -ne 1 ]; then
+    fail "the two runs together mailed $(( $(fake_calls) - before )) time(s), not 1" "lock-mail"
+  else
+    ok "the holder mailed once; the second run, launched during that delivery, was turned away: exit 0, nothing on either stream, the holder named in its log"
+  fi
+
+  echo "-- syslog: the identifier in the journal, nothing there under --log stderr"
+  cat "$T/logalert.conf" > "$T/conf2/logalert.conf"
+  as_svc stderr -f "$T/conf2/logalert.conf" --log stderr; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    skip "the --log stderr run did not finish within ${BOUND_CMD}s"; return
+  elif [ "$rc" -ne 0 ] || ! grep -q "^logalert: start: $T/conf2/logalert.conf" "$T/stderr.err"; then
+    fail "the --log stderr run exited $rc; stderr: $(first_err stderr)" "log-stderr"
+  else
+    ok "--log stderr: the records are on stderr"
+  fi
+  cat > "$T/journal.py" <<'EOF'
+import json, sys
+key, uid, tag = sys.argv[1], sys.argv[2], 0
+named = other = 0
+for line in sys.stdin:
+    r = json.loads(line)
+    m = r.get("MESSAGE")
+    if not isinstance(m, str) or key not in m:
+        continue
+    if "/conf2/" in m:
+        other += 1
+        continue
+    named += 1
+    if r.get("SYSLOG_IDENTIFIER") == "logalert" and str(r.get("_UID")) == uid:
+        tag += 1
+print(named, tag, other)
+EOF
+  check_journal
+
+  echo "-- permission: a 0600 root-owned log in a section, the readable sibling still processed"
+  printf 'up\n' > "$T/logs/fw.log"
+  chmod 644 "$T/logs/fw.log"
+  printf 'secret DENY\n' > "$T/logs/root-only.log"
+  chmod 600 "$T/logs/root-only.log"
+  cat >> "$T/logalert.conf" <<EOF
+[firewall]
+subject = Firewall denies
+to = noc@example.net
+files =
+    $T/logs/fw.log
+    $T/logs/root-only.log
+patterns =
+    DENY
+EOF
+  as_svc p1 -f "$T/logalert.conf"; rc=$?   # first sight of fw.log; the root-only file fails
+  if [ "$rc" -eq 124 ]; then
+    skip "the permission run did not finish within ${BOUND_CMD}s"; return
+  fi
+  echo "DENY 192.0.2.9" >> "$T/logs/fw.log"
+  before="$(fake_calls)"
+  as_svc p2 -f "$T/logalert.conf"; rc=$?
+  lines="$(wc -l < "$T/p2.err")"
+  if [ "$rc" -eq 124 ]; then
+    skip "the permission run did not finish within ${BOUND_CMD}s"; return
+  elif [ "$rc" -ne 1 ]; then
+    fail "a section with an unreadable file exited $rc, not 1: $(first_err p2)" "permission-exit"
+  elif [ "$lines" -ne 1 ] || [ -s "$T/p2.out" ] || ! grep -q "root-only.log: Permission denied" "$T/p2.err"; then
+    fail "expected exactly one stderr line naming root-only.log: got $lines line(s): $(head -2 "$T/p2.err" | tr '\n' '|')" "permission-line"
+  elif [ "$(( $(fake_calls) - before ))" -ne 1 ] || ! last_body || ! grep -q 'DENY 192.0.2.9' "$T/body.txt"; then
+    fail "the readable sibling's match was not mailed ($(( $(fake_calls) - before )) mail(s))" "permission-sibling"
+  else
+    out="$(bounded "$BOUND_CMD" "$T/venv/bin/python" "$T/offset.py" "$T/state/state.json" firewall "$T/logs/fw.log" 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+      fail "the state file could not be read: $out" "permission-state"
+    elif [ "$out" != "$(wc -c < "$T/logs/fw.log")" ]; then
+      fail "the readable sibling's state did not advance (offset $out)" "permission-state"
+    else
+      ok "exit 1, one stderr line naming the unreadable file, the sibling mailed and its state advanced"
+    fi
+  fi
+
+  echo "-- modes: the state file and the lock the service user left behind"
+  local st lk dr
+  st="$(stat -c '%a %U' "$T/state/state.json" 2>/dev/null)"
+  lk="$(stat -c '%a %U' "$T/state/lock" 2>/dev/null)"
+  dr="$(stat -c '%a %U' "$T/state" 2>/dev/null)"
+  if [ "$st" != "600 $SVC" ]; then
+    fail "the state file is '$st', not '600 $SVC'" "mode-state"
+  elif [ "$lk" != "644 $SVC" ]; then
+    fail "the lock is '$lk', not '644 $SVC'" "mode-lock"
+  elif [ "$dr" != "750 $SVC" ]; then
+    fail "the state directory is '$dr' after the runs, not the '750 $SVC' it was created with" "mode-dir"
+  else
+    ok "state file 600, lock 644, directory 750, all owned by $SVC"
   fi
 }
 

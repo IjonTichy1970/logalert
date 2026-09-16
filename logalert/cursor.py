@@ -16,7 +16,7 @@ will actually read, and decides how the saved cursor applies:
     devices; that never declares a rotation by itself)
   * no cursor -> FIRST SIGHT: start at the current end of the file, on a line boundary, so
     the first run is not a flood of old news; ``start = beginning`` / ``--from-start`` read
-    from 0. Nothing is emitted; the skipped byte count is logged.
+    from 0. Nothing is emitted; the skipped byte count is logged, as a WARNING.
 
 On its own a ``LogFile`` reads a ROTATED or TRUNCATED live file from 0; ``logalert.rotation``
 wraps it to read the rotated copy first, found by the inode and the fingerprint saved here.
@@ -103,7 +103,7 @@ def open_log(path: str) -> BinaryStream:
     Only a regular file: a FIFO with no writer would block ``open(2)`` for good, and a
     device or socket has no byte offsets to remember. ``FileNotFoundError`` propagates.
     """
-    kind = _special_kind(os.stat(path).st_mode)
+    kind = special_kind(os.stat(path).st_mode)
     if kind is not None:
         raise OSError(f"{path}: not a regular file (a {kind})")
     suffix = compressed_suffix(path)
@@ -124,7 +124,9 @@ def open_log(path: str) -> BinaryStream:
     return open(path, "rb")
 
 
-def _special_kind(mode: int) -> str | None:
+def special_kind(mode: int) -> str | None:
+    """What a non-regular file is, for a message, or None for a regular file; what a glob
+    passes over (``logalert.globs``) and what ``open_log`` refuses."""
     if stat.S_ISREG(mode):
         return None
     if stat.S_ISDIR(mode):
@@ -381,8 +383,9 @@ class LogFile:
         where = f"[{self.section}] {self.path}"
         if self.verdict == "first-sight":
             if self.skipped:
-                log.info("%s: first sight; starting at the end, %d bytes skipped",
-                         where, self.skipped)
+                # a WARNING (issue #13): the one time lines are deliberately never mailed
+                log.warning("%s: first sight; starting at the end, %d bytes skipped",
+                            where, self.skipped)
             else:
                 log.info("%s: first sight; reading from the beginning", where)
         elif self.note and self.verdict == "continue":

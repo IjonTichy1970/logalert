@@ -253,4 +253,755 @@ new entry.
   hook answering from an archive that had yielded nothing -- fixed and pinned,
   with the reviewer's tests that named their mutations merged into the suite.
 
+- `[contract]` **Alert email composition: one 7-bit-clean message per section, a
+  summary in both modes, the report inline or attached, the priority headers
+  only when configured** (#10). `logalert/mail.py` is the single home of the
+  message's shape: `compose()` turns a section's reports into a `Mail`, and the
+  transports (#11) and the run loop (#12) consume it. The message is built under
+  `email.policy.default.clone(cte_type="7bit")`, so `set_content` picks `7bit`
+  for ASCII lines of at most 78 characters and quoted-printable or base64
+  otherwise -- no wire line ever exceeds 78 bytes whatever a log line holds (dma
+  rejects an unencoded line over 998 bytes, and nothing folds one);
+  `max_line_length` stays at 78 because at 998 a non-ASCII subject folded into
+  one 280-character encoded-word (RFC 2047 caps them at 75). Headers, in this
+  order and all before the content: `From`, `To`, `Subject`, `Date` (the local
+  time with its offset), `Message-ID` (the From's domain, no lookup),
+  `Auto-Submitted: auto-generated`, `X-Prepared-By: logalert <version>`,
+  `X-Logalert-Section`; then ONLY when the section or a matched tag set a
+  priority -- the system is off by default -- `X-Logalert-Priority:
+  high|medium|low` with the conventional `X-Priority: 1|3|5` and `Importance:
+  high|normal|low`, carrying the highest across the mail's matches, stored or
+  not. The subject is the section's `subject` then ` -- N match(es)` (the
+  literal a filter can key on) unless `subject_suffix = no`. The body opens with
+  a summary in both modes -- the subject, the count, the host and the run time
+  on one line, then `Section:`, `Priority:` (when set), one `Files:` row per
+  file read with its match count, the lines read and any dropped by an exclude,
+  and the `Message-ID:` the activity log will carry, so an alert can be traced
+  to its run. `report = inline` continues with the report; `report = attachment`
+  (or `--attach`, wired in #12) attaches it as `text/plain` named
+  `<section>-<YYYYmmddTHHMM>.txt`, the section name reduced to `[A-Za-z0-9._-]`,
+  never starting with `-` (an option to a shell tool in the download directory)
+  or `.` (hidden), at most 40 characters -- measured, from 48 the stdlib folds
+  the name into RFC 2231 continuations some clients show as `ATT00001.txt`. The
+  report is `grep -n -C`'s vocabulary as measured for #9: a `tail`-style `==>
+  file <==` header per physical file (the archive's tail before the live file
+  after a rotation), `N: text` for a match, `N- text` for context, `--` for
+  omitted lines, the fragments of a cut line as one line ending in ` [cut]` when
+  the cap dropped the rest. `max_lines` is applied here, in its documented unit:
+  at most that many MATCHING lines per email across the section's files in
+  order, each with its context, then one trailer `... and N more matching
+  line(s)` with the exact remainder; after the last budgeted match only its own
+  after-window follows -- a NUL-only line the reader skipped inside that window
+  does not end it, a change of physical file does, as it does the scan's (the
+  verification of this entry reproduced the live file's header and two of its
+  lines printed before the trailer, and it is pinned). For that, #9's
+  `scan(cap=)` changes unit -- it stored the first `cap` report ENTRIES and now
+  stores the first `cap` matching lines with the context of each (an entry cap
+  of 200 cut the window of match 26 at `-c 3`); `FileReport` records its
+  `context` width and loses `omitted` (`matched - len(matches)` says it).
+  Sanitised before composition: a lone surrogate becomes `?` (`set_content`
+  raises on one), CR is removed (a bare CR is a line break to the encoder),
+  every other C0 control except TAB and LF, and DEL, become U+FFFD (measured: a
+  NUL and a form feed ride through `7bit` to the relay untouched); in a header
+  value TAB and the line boundaries that pass that -- LF, and NEL, LS and PS --
+  become a space. ⭐ The review reproduced why that last rule exists: U+0085,
+  U+2028 and U+2029 are one line to `configparser` and to the loader's
+  single-line rule, survive a C0-only sanitiser, and are exactly what
+  `EmailMessage` refuses in a header -- a `ValueError` on every run for a
+  section whose subject carried one, before any transport. The From must be the
+  bare `local@domain` the loader accepts, now a public `config.is_address()`
+  that `--from` (#11/#12) applies too; anything else is refused with a
+  `ValueError` naming the fix (`set from = in [logalert]`). ⭐ The native run
+  decided that: Python 3.12.10 on the dev host renders a From of `x@` as `<>`,
+  and 3.12.3 in the sandbox -- Ubuntu 24.04's -- raises `IndexError` from the
+  header parser on the same input; a tolerant path would have depended on the
+  patch level. `Mail.flatten("sendmail"|"smtp")` produces the exact bytes once
+  per transport and caches them -- LF for the sendmail pipe, CRLF
+  (`email.policy.SMTP`) for SMTP DATA, one byte per line apart -- and `len()` of
+  the one handed over is the size the log reports; a header added after a
+  transport's `flatten` never reaches that transport's wire. `Mail.preview()` is
+  what `--dry-run` (#12) prints: the headers decoded, the body as a reader sees
+  it, each attachment's text under its name -- never the quoted-printable wire.
+  Three review lenses (wire fidelity against `BytesParser` round trips, 300
+  random streams against `grep -n -C` and 400 against an independent budget
+  reference; specification fidelity and the #11/#12/#13 consumers; mutation
+  testing and hostile input) also reproduced the Message-ID domain cut from the
+  raw sender, the RFC 2231 threshold and the after-window gap above -- all
+  fixed, 18 deliberate mutations reddened by the merged tests. Recorded for the
+  issues that own them: the loader accepts a duplicate entry in `files` and has
+  no address length cap (a 1000-character local part puts a 1013-byte `To` line
+  on the wire, over RFC 5322's 998), an unreadable file is absent from the
+  summary, and nothing but `max_lines` x the context x `MAX_FRAGMENTS` x
+  `LINE_CAP` bounds a mail's size (about 23 MB worst case at the defaults).
+
+- `[contract]` **Mail delivery: the sendmail pipe and SMTP with a timeout on
+  everything that can hang, the effective From, `--test-mail`** (#11).
+  `logalert/transport.py` is the single home of the transport rules; `deliver()`
+  hands a composed mail over and returns a `Delivery` (the recipients accepted,
+  those the server refused with its answer, the bytes handed over, the
+  transport's one-line answer) or raises `DeliveryError` whose message IS the
+  transport's answer -- a returned `Delivery` always means the message left the
+  box. `transport = auto` (the default) is sendmail when `sendmail_path` is a
+  regular, executable file, else a configuration error that says what to do:
+  `transport = auto but /usr/sbin/sendmail does not exist: install an MTA
+  (Ubuntu: apt install postfix, dma or msmtp-mta; FreeBSD 14+: dma is in base)
+  or set transport = smtp and smtp_host` (a fresh Ubuntu server image has no
+  sendmail at all; a directory or a non-executable file gets the same shape);
+  `--check-config` now exits 2 on it, and on a From the run would refuse, where
+  it used to print `NOT FOUND` and exit 0. The sendmail argv is `[sendmail_path,
+  "-i", "-f", <From>, <recipient>...]` with the message piped in as the exact LF
+  bytes, the child bounded by `mail_timeout` and, on POSIX, leading its own
+  process group so a `sudo`- or `runuser`-style wrapper dies with its children
+  at the deadline. ⭐ Measured against dma 0.13 in the sandbox (installed for
+  the measurement and purged): `-oi`, the classic spelling its own man page
+  calls a synonym, is a no-op in dma -- only `-i` keeps a body line that is a
+  single `.` from ending the message silently with exit 0; its line limit is 997
+  bytes, headers included, and one longer line (unless it is the last, without a
+  newline) is the whole message refused with exit 65 and `sendmail: bad mail
+  input format: ...` (#10's quoted-printable bodies are what keeps every alert
+  under it); a recipient beginning with `-` is an option wherever it sits in
+  argv, and a lone `-bp` prints the queue, discards the alert and exits 0 (the
+  loader's rule on addresses is the guard; no `--`, not every sendmail honours
+  it); exit 0 arrives in 20 ms and means ACCEPTED FOR QUEUEING, never delivered
+  -- dma never returns 75, its temporary failures are exit 0 plus a queue entry,
+  `mailq` is the tell. A non-zero exit is reported as `sendmail exit 65
+  (EX_DATAERR): <its first stderr line>` (the sysexits names are a table of our
+  own: `os.EX_*` is absent on Windows), a timeout as `sendmail did not finish
+  within 60 s` with what the child said before hanging, a binary that cannot
+  start as `could not execute <path>: <reason>` -- naming the path ourselves,
+  since Windows leaves `exc.filename` empty, and saying when the file exists but
+  its `#!` interpreter does not; what an MTA writes to stderr on exit 0
+  (Postfix's `postdrop` with the daemon stopped) is kept in the answer and
+  logged as a WARNING. SMTP: `smtplib.SMTP(host, port, local_hostname=<the
+  From's host>, timeout=mail_timeout)` -- without `local_hostname` smtplib runs
+  its own `getfqdn()`, which stalled 20 s on a host with dead DNS --
+  `smtp_starttls = yes` requests STARTTLS with a default SSL context (the
+  certificate is verified against `smtp_host`, so it must be a name) and lets
+  `SMTPNotSupportedError` be the loud failure; the exact CRLF bytes go through
+  the low-level `sendmail()`, which adds one byte per line starting with `.` and
+  nothing else. One refused recipient is a per-recipient failure logged as a
+  WARNING with the others delivered; every recipient refused, a session the
+  server closed at RCPT (the recipients it never tried are named as such), a
+  refused sender, a rejected DATA, a dropped connection, a silent server and a
+  refused connection are `DeliveryError`, each naming what happened -- the
+  exception type where there is one, the server's reply where it gave one. ⚠️
+  smtplib's `timeout` bounds each socket operation, not the session: a slow
+  relay can hold a run for about eight times `mail_timeout` and still succeed,
+  and resolving `smtp_host` is the system resolver's bound -- bounded, not
+  forever; a timeout after DATA says the server may still deliver what it read.
+  `mail_timeout` is capped at 3600 s by the loader: above about 25 days the
+  platform's own timeouts overflow into a traceback. The effective From is
+  `--from ADDR`, else `from =`, else the user logalert runs as at this host (the
+  only branch that may consult a resolver), and must be the bare `local@domain`
+  the loader accepts -- `config.is_address()`, from #10 -- because dma accepts
+  anything without a newline as `-f` and smtplib puts a space or a `>` on the
+  wire in one line; a From with no domain or a local-only one gets the standing
+  warning. `--test-mail SECTION` sends one real message to that section's
+  recipients through the configured transport and prints `sent via sendmail
+  (/usr/sbin/sendmail): accepted for queueing (exit 0)`, `to: ...`, `size: N
+  bytes; Message-ID: <...>` (0), or `logalert: not delivered via smtp
+  (host:port): <answer>` on stderr (1), or the configuration error (2); a
+  partial refusal prints the accepted lines, `refused: <recipient> -- <reply>`
+  on stderr, and exits 1. Two test doubles ship in `tests/`: an ESMTP stub on
+  127.0.0.1 port 0 (banner, EHLO with SIZE / 8BITMIME / optional STARTTLS, a
+  configurable 550 per recipient, 552 on DATA, drops, silence, per-verb replies,
+  every command and DATA payload recorded -- verbs matched case-insensitively,
+  since 3.12 already sends them in lowercase while `STARTTLS` and the context
+  manager's `QUIT` are uppercase) and a fake sendmail that records its argv and
+  its stdin bytes, honours `-i` as dma does, sleeps or exits as told; the
+  end-to-end tests reach the fake through `sendmail_path` behind a `.cmd`
+  wrapper on Windows and a shebang copy on POSIX. ⭐ Four review lenses and a
+  refute pass reproduced nine defects the tests had not: a QUIT answered with
+  anything but 221 after the DATA 250 raised out of smtplib's context manager --
+  the message was queued, and the run loop would have re-sent it every run (the
+  farewell is ours now; the outcome is decided at DATA); a recipient listed
+  twice let DATA go out to nobody, since smtplib decides "all refused" by
+  counting (the loader deduplicates `to`, and nothing accepted raises); a
+  relay's multi-line or control-laden reply reached the log and the console as
+  forged extra lines (`mail.clean_header` folds every reply and stderr line); a
+  `mail_timeout` of 35 days was an uncaught `OverflowError`; a directory as
+  `sendmail_path` passed the transport while `--check-config` printed NOT FOUND
+  and exited 0 (one shared judgement now, `config.sendmail_problem()`);
+  `--check-config` never resolved the From it printed; from a real console a
+  refused recipient printed twice through `logging.lastResort`, which pytest's
+  own handler had hidden (the library `NullHandler` is in place); and a forking
+  wrapper's grandchild survived the timeout and queued the mail `deliver()` had
+  reported undelivered; and a 421 mid-RCPT named only the recipients smtplib had
+  tried (the untried ones are named as such now). Eight judgment-level findings
+  were refuted by two skeptics each; the three that would recur are recorded on
+  the issue: a 4xx per recipient stays a per-recipient failure (greylisting
+  refuses every recipient on first contact, which is a `DeliveryError` and the
+  next run's retry), and the SMTP answer stays `accepted by host:port` because
+  `sendmail()` discards the relay's DATA reply -- the Message-ID is the
+  correlation key. Noted for #16: `mailq`, `journalctl -t dma`,
+  `/var/log/mail.log`, a wrapper that `setsid`s itself, the per-operation SMTP
+  timeout.
+
+- `[contract]` **The run: every section read, one message per section that
+  matched, the state moved after each section, nothing said on exit 0** (#12).
+  `logalert/run.py` is the single home of the run's rules;
+  `logalert/__main__.py` parses the command line and dispatches there. A bare
+  `logalert` IS the run now (the #1 test that a bare invocation prints the help
+  is retired -- the help is `--help` -- and a missing config is exit 2 with
+  `logalert: <path>: config file not found or not readable`). The order, each
+  step before anything irreversible: the transport and the effective From are
+  settled first (a configuration error is exit 2 with its own line before a file
+  is read); then, unless `--dry-run`, the state directory (#7's
+  `check_state_dir`) BEFORE the lock -- ⭐ the map had the lock first, and the
+  review reproduced as `nobody` and as root what that costs: a root run refused
+  for another user's state had already created a root-owned `lock`, so the
+  remedy the refusal names (`sudo -u <user> logalert ...`) then failed forever
+  on that lock, and a missing directory arrived as the lock's raw ENOENT instead
+  of `does not exist -- create it, owned by the user logalert runs as`; then the
+  lock (a holder younger than `lock_stale` is exit 0 with an INFO line, `another
+  run (PID N) has held the lock <path> for Ns; this run exits quietly` -- cron
+  overlap is normal -- and an older one exit 1, named as `stale lock: ...`; a
+  lock file that cannot be opened is `state directory: <reason> (<lock>) -- the
+  lock file must belong to the user logalert runs as`); then the state file (a
+  corrupt one is exit 1 naming `--reset-state`, nothing read) and the expiry of
+  entries unseen for `state_ttl` days, each logged as `forgotten` (`would be
+  forgotten` under `-n`). Then per section, in file order: a file that cannot be
+  opened is a failed item (`[section] <path>: <reason>`), its cursor stays and
+  the section continues; a file absent this run is nothing to do (cursor and
+  `last_seen` stay, so it expires in time; a configured file never seen is exit
+  0 with a DEBUG line); each source read is scanned with the section's `context`
+  (else `-c N`) and its `max_lines`, its cursor taken after the read, and logged
+  as `[section] <path>: N line(s) read, M matched`; a first sight starts at the
+  end unless `--from-start` or `start = beginning`. Nothing matched: the cursors
+  move. Anything matched: ONE message composed (#10) and delivered (#11).
+  Accepted: the cursors move (🔶 a partial refusal is accepted -- the recipient
+  who got it must not get it twice -- with each refused recipient a failed item,
+  `[section] refused: <recipient> -- <reply>`). Refused: `[section] <the
+  transport's answer>` is the failed item, logged at ERROR with the Message-ID,
+  and the files that contributed to the message keep their place so the re-run
+  re-sends them -- ⭐ while a file that was read and matched nothing moves
+  anyway: the map's rule was "touch every file read", `touch` is a no-op for a
+  file with no entry, so a file at its first sight in a section whose delivery
+  failed (any file added to the section that run, every file under
+  `--from-start`) was first-sighted AGAIN next run and skipped to its new end,
+  every line written in between silently lost, against #8's owner criterion;
+  none of a zero-match file's lines is in the message (the summary still names
+  it, `<file> -- no match in N line(s) read`), and context never crosses files,
+  so its cursor is safe to move. Every file read is `touch`ed so it never
+  expires while its mail keeps failing. The state is saved after EACH section,
+  never once at the end; a save that fails is `[section] state not saved:
+  <reason>` and, when the mail went out, an ERROR line saying the next run
+  re-sends it unless a later save in this run succeeds. Exit codes: 0 ran and
+  wrote NOTHING to stdout or stderr -- cron mails every byte -- matches
+  included, a match being the normal outcome; 1 with exactly one stderr line
+  naming every failed item, `logalert: 2 of 3 sections sent; failed:
+  [router-disk] sendmail exit 75 (EX_TEMPFAIL); see the log` (the count clause
+  only when some section had something to send, `section` singular for one,
+  `would be sent` under `-n`; header-clean, so a relay's or a file name's
+  control characters cannot forge a second line); 2 a usage or configuration
+  error, argparse's own included, nothing ran; 130 on Ctrl-C, one line
+  `logalert: interrupted` instead of a traceback, the lock released. The
+  options, all of them the run's: `-c/--context N` (like `grep -C`, for sections
+  that set no `context` of their own; a negative N is exit 2), `--attach` (every
+  report as an attachment this run, whatever the sections say), `--from-start`,
+  `-n/--dry-run` (reads and matches, prints each message that would be sent to
+  stdout as `Mail.preview()` renders it, takes no lock, needs no writable
+  directory, writes nothing; exit 0 or 1 by the same rule), `-d/--debug` (the
+  activity log at DEBUG on stderr for this call only, every record one
+  header-clean line -- breaking cron-quiet on purpose), `--state-file PATH`
+  (absolute; wins over `state_file =` in every mode: the run, `--reset-state`,
+  and `--check-config`, which prints `state_file: PATH (--state-file)`), and
+  `--from ADDR` from #11. ⭐ The run-only flags refuse the modes: `-n
+  --reset-state` wiped the state under a flag whose help promised to leave it
+  untouched, and `-n --test-mail` sent a real message; `-n`, `--attach`,
+  `--from-start` and `-c` with `--check-config`, `--reset-state` or
+  `--test-mail` are argparse's exit 2 now; and `--reset-state` reset the
+  configured file while `--state-file` kept its cursors (it takes the override
+  now). A `state_file` that is the config file itself is refused for every mode,
+  exit 2 (`state_file: <path> is the config file itself` -- `--reset-state`'s
+  replace-an-unparseable-file escape hatch would have overwritten the config); a
+  directory or any other non-regular file is exit 1 (`state file <path> is not a
+  regular file`); nothing is created either way. What root may not do, one step
+  earlier than #7 drew it: the lock is opened with `O_NOFOLLOW` (⭐ a `lock`
+  symlink planted in a directory another user owns was truncated and written
+  through by a root run -- reproduced), and when the state file does not exist
+  yet #7's foreign-owner rule applies to the state DIRECTORY, so a root first
+  run into the cron user's empty directory is refused (`state directory <dir>
+  belongs to <user>; a run as root would leave the state and the lock root-owned
+  and unusable by that user -- run as that user instead: sudo -u <user> logalert
+  ...`) instead of leaving root-owned state and lock there; on Windows a
+  read-only state file is refused up front (`state file <path> is read-only --
+  nothing was sent`: the directory probe passed, the mail went out, the save
+  failed, the next run double-sent). The activity log, on the `logalert.*`
+  loggers (the library's `NullHandler` swallows it until #13 wires `log =` and
+  `--log DEST`, which move there): the start line (config path, section count,
+  `(dry run)`) first of all and `end: exit N` last on every exit the run returns
+  (0, 1 and 2 -- the transport or From configuration error and a fresh lock
+  holder included; a killed run, Ctrl-C's 130 among them, leaves no end line) --
+  every failed item once at ERROR where it is collected, every expired entry,
+  per file the lines read and matched, per section the delivery or the failure
+  with the transport's answer and the Message-ID; ⭐ before the review a failed
+  delivery, a stale lock, an unwritable directory and a corrupt state left no
+  WARNING-or-above record at all. Also from the review's 27 reproduced findings
+  (four lenses, 39 shapes across both hosts, two real processes racing on the
+  lock and a run killed mid-delivery among them; #14's service-user rehearsal
+  run in the sandbox as `nobody` -- the state file lands `0600` from `mkstemp`,
+  the lock `0644`, exit 0 with 0 bytes on both streams): `clean_text` now folds
+  the C1 range too (a raw CSI is live on a terminal that honours C1; NEL stays
+  the boundary `clean_header` folds), and an OSError from our own `open_log` no
+  longer repeats the path. Five judgment-level findings were refuted by two
+  skeptics each and stand as designed: a configured file absent and never seen
+  is exit 0 (nothing to do); the loader's unknown-key warnings are
+  `--check-config`'s, not the run's; a file listed twice in one section is read
+  twice (the loader's rule, noted since #10); an unexpected exception inside a
+  section propagates with its traceback (a bug must be loud; the `finally`
+  releases the lock). `tests/test_run.py` (52 tests, the reviewers' 17 merged;
+  three POSIX-only, two of those also skipped in the root sandbox, one
+  Windows-only) drives the run end to end through a two-section config and the
+  fake sendmail, which now records every call in order (`call-NNNN-argv.json`,
+  `call-NNNN-stdin.bin`) and can fail for one recipient
+  (`LOGALERT_FAKE_EXIT_IF_RCPT`) so that one section of a run fails; 37
+  deliberate mutations, 36 reddened on Windows and the 37th (the directory-owner
+  rule) pinned by a POSIX-only test. Noted for #13: the record set above is what
+  its destinations carry, and `__main__`'s one-line formatter is the shape every
+  destination should use; for #15/#16: the exit-code table, the line shape, `-n`
+  semantics, `--from-start` on first sight only, `--state-file` absolute, the
+  lock's two verdicts, expiry.
+
+- `[contract]` **The activity log: syslog with the identifier, stderr, a file or
+  UDP, `--log`, and a fallback that is never silent** (#13).
+  `logalert/activity.py` is the single home of where the records go, in what
+  shape, and what happens when the destination fails; the records themselves are
+  the ones #7-#12 emit on the `logalert.*` loggers (the start and end lines, per
+  file the lines read and matched and the identity line, per section `sent via
+  ...` with the recipients, the byte count and the Message-ID, or the failure
+  with the transport's answer, every failed item at ERROR, expiry, the lock at
+  DEBUG). `log = syslog` (the default) | `stderr` | `file:/absolute/path` |
+  `udp:host:port` in the config, `--log DEST` on the command line winning over
+  it in every mode, like `--state-file`. `syslog` probes `/dev/log`,
+  `/var/run/log` and `/var/run/syslog` in that order for a path that IS a socket
+  (`stat.S_ISSOCK`, never `exists()`: `/var/run/log` is a directory on Ubuntu
+  and a socket on FreeBSD) and that accepts a datagram, else a stream,
+  `connect()` of our own -- ⭐ measured, `SysLogHandler` constructs without
+  raising on a missing path or on a directory, holding a closed socket, and then
+  prints three chained tracebacks per record; a server that has gone with its
+  socket file left behind (journald stopped) is two tracebacks per record. The
+  handler's `ident` is `logalert[<pid>]: `, so journald records
+  `SYSLOG_IDENTIFIER=logalert` and `SYSLOG_PID`, `journalctl -t logalert` and
+  `journalctl -p warning -t logalert` find the runs (without the ident the
+  journal shows `_COMM=python` and no identifier; with the console script
+  `_COMM=logalert` too) and rsyslog's `/var/log/syslog` line reads `<time>
+  <host> logalert[<pid>]: <message>`; the facility is user. `--check-config`
+  prints what `syslog` resolves to here: `log: syslog (/dev/log)`, or `log:
+  syslog -- no usable socket (/dev/log: connection refused; /var/run/log: not a
+  socket; /var/run/syslog: missing); the run would log to stderr` (on Windows
+  `-- not available on this platform; ...`), with ` (--log)` when the command
+  line chose it; a check never touches the destination and creates nothing. The
+  fallback is ALWAYS stderr and ALWAYS loud: when the destination cannot be used
+  the first record on stderr is one WARNING in the log's own shape -- `no usable
+  syslog socket (...); logging to stderr`, `syslog is not available on this
+  platform; logging to stderr`, `cannot open the activity log
+  /var/log/logalert.log (Permission denied); logging to stderr`,
+  `udp:relay.example.net:514: cannot resolve the host (...); logging to stderr`,
+  or `udp:[2001:db8::1]:514: cannot open (...); logging to stderr` when the host
+  resolves but the socket cannot be created (an address family the host lacks)
+  -- and the run goes on with its exit code unchanged (cron mails that line,
+  which is the point; it is the one thing an exit 0 may now write to stderr). ⚠️
+  Never UDP as a fallback: measured on both platforms, three datagrams to a port
+  nobody listens on produce nothing anywhere, the "logs nowhere" fault; `udp:`
+  is built only when configured, an unresolvable host raises at construction and
+  takes the fallback, and `udp:[2001:db8::1]:514` is the IPv6 spelling (⭐ the
+  review found `[::1]` accepted by the loader and then unresolvable at run
+  time). A destination that fails later -- the syslog server gone, a full disk
+  -- is reported ONCE, `the activity log at syslog (/dev/log) failed
+  (ConnectionRefusedError: [Errno 111] Connection refused); logging to stderr
+  from here on`, the failed record and the rest of the call go to stderr, and
+  teardown stays quiet: ⭐ the review filled a 64 KiB tmpfs and found the run
+  mailing, saving its state and logging `end: exit 0` -- then `close()` flushing
+  the buffered bytes again, the `OSError` escaping `main()`, a 30-line traceback
+  in cron's mail and exit 1; the teardown now unwires every handler, suppresses
+  that second failure and resets the logger's level in its own `finally`.
+  `file:` is opened at setup, never lazily (⭐ measured,
+  `FileHandler(delay=True)` raises the open failure out of `logger.info()` into
+  the caller, which would have aborted a run at its first record with a
+  traceback), and by us, like the lock: ⭐ the review had `nobody` plant a
+  `logalert.log` symlink in a shared directory and a root run appended the
+  activity log into the file that user chose, and a FIFO as the destination
+  blocked `open(2)` for good before the lock so cron runs would pile up while
+  `--check-config` said nothing; now `lstat` first -- `is a symbolic link --
+  name the real path`, `is a directory`, `not a regular file` (a FIFO, a device:
+  `/dev/full` included) each take the loud fallback -- then `os.open` with
+  `O_NOFOLLOW` and an `fstat` behind it. The file is appended with `0644` under
+  the umask (it names files, sections, recipients and Message-IDs, never a log
+  line). ⭐ The state file, the run lock and the config file are refused as the
+  log, by the loader (`[logalert] log: <path> is the state file` / `the run
+  lock` / `the config file`, exit 2) and again in `main` for the effective paths
+  under `--log` and `--state-file`: measured, `log = file:<state_file>` wrote
+  `start: ...` into the state before every run read it (exit 1 forever, and
+  `--reset-state` replaced the state only for the next record to corrupt it
+  again, nothing naming `log =` as the cause), and `log = file:<config>` grew
+  the config by one stamped line per record until a doubled key made every mode
+  exit 2. A `file:` path or a `state_file` inside the running interpreter's venv
+  (`sys.prefix` when it differs from `sys.base_prefix`, by real path) is `is
+  inside the venv (/opt/logalert-venv), which the upgrade procedure wipes` --
+  the deployment constraint, applied to the state file too, which #7 had not; a
+  NUL in any path value is `contains a NUL character` instead of a `ValueError`
+  traceback from `realpath`. One line per record, whatever the destination: the
+  message, prefixed `warning: ` / `error: ` / `debug: ` for those levels and
+  nothing for INFO (journald and rsyslog carry the priority anyway; a file or a
+  cron mail needs the word), header-clean through `clean_header` (rsyslog writes
+  `#012` for a newline, a terminal honours a raw CSI); the destination's own
+  prefix is the ident for syslog (journald adds the time),
+  `2026-09-15T14:11:02-0600 logalert[<pid>]: ` for the file, `logalert: ` for
+  stderr -- which retires #12's `logalert: INFO logalert.run: ...` shape for
+  `--debug`. `--debug` adds a stderr handler at DEBUG and leaves the configured
+  destination at INFO (a debug session does not flood syslog); when the
+  destination IS stderr there is one handler, at DEBUG. 🔶 `--dry-run` logs to
+  stderr, not to the configured destination, unless `--log` is explicit: `-n`
+  promised to write nothing (#12), a `file:` log would be appended, and a dry
+  run's records (`start: ... (dry run)`, `would be forgotten`, the first-sight
+  line) belong in front of the operator, not in syslog as if they were a run's.
+  🔶 The first-sight skip (`first sight; starting at the end, N bytes skipped`)
+  is a WARNING now, as this issue lists it, where #7 logged it at INFO: the one
+  time lines are deliberately never mailed, and `journalctl -p warning` should
+  show it; `reading from the beginning` stays INFO. `--reset-state` writes its
+  own record (`forgot N cursor(s) for every file (--reset-state)`, and the
+  escape hatch's `...; replaced it with an empty state (--reset-state)` at
+  WARNING), `--test-mail`'s `sent via ...` is part of the trail, and both honour
+  `--log`. Two corrections to the issue's text, both settled during the #12
+  review: "bytes read" per file is not a well-defined number across a rotation
+  catch-up, so the per-file line stays `N line(s) read, M matched`; the identity
+  line is INFO when it says something and DEBUG for a plain continue. Rehearsed
+  end to end in the sandbox with the installed console script: as root and as
+  `nobody`, a run with the default lands in the journal under the identifier
+  with `PRIORITY` 4 for the first-sight warning and 6 for the rest, exit 0 with
+  0 bytes on both streams; `--check-config` prints `log: syslog (/dev/log)`; a
+  `file:` path in a missing directory is one warning line and the log on stderr,
+  no traceback. Four review lenses (correctness by reproduction on both hosts,
+  specification fidelity and the #14/#15/#16 consumers, 42 mutants against the
+  tests, operational safety as the cron user) reported 15 reproduced findings --
+  the ones above and: `--check-config` never touching the destination (a mutant
+  that made the check attach -- and create a `file:` log -- survived every test
+  on Linux; the map had the check attaching to an explicit `--log`, which would
+  have doubled the fallback line, corrected before the review), the
+  stream-socket branch, the dying-destination path under `--debug`, `--log` for
+  `--reset-state` and `--test-mail`, the teardown `close()` and the escape
+  hatch's record were unpinned -- all fixed and pinned; six judgment-level
+  findings were refuted by two skeptics each and stand (a `--test-mail` record
+  carries no marker; `--check-config` does not stat a `file:` destination's
+  directory; a record over rsyslog's 8 KiB default needs no cap: only a `sent
+  via` line with 160 recipients gets there, and the journal and the file keep it
+  whole). `tests/test_activity.py` (32 tests, the reviewers' 12 merged; seven
+  POSIX-only -- a datagram socket the test binds stands in for `/dev/log`, the
+  dead daemon, a stream socket, `/dev/full`, a FIFO, a planted symlink, the
+  socket a check names -- each saying so; the journal itself is #14's check, as
+  the issue says); the fixtures of the run, transport and reset-state tests set
+  `log = file:<tmp>/activity.log`, since the default falls back to stderr on
+  Windows. 22 mutations of the fix round, 20 reddened; the two race guards
+  (`O_NOFOLLOW` behind the `lstat` check, the pre-open regular-file check behind
+  the post-open one) are equivalent by design, and the map's claim that
+  `S_ISSOCK -> exists()` is a killable mutation was wrong for the same reason --
+  the connect probe is the guard. Noted for #14: the journal side is assertable
+  with `SYSLOG_IDENTIFIER`, `SYSLOG_PID`, `_UID` of the service user, `PRIORITY`
+  and `_COMM`; for #15/#16: the five fallback lines (a `udp:` destination has
+  two: `cannot resolve the host` and `cannot open`), the `--check-config`
+  resolutions, the level words, the file line shape, `--log`, `-n` to stderr,
+  and that a text syslog file may cut a very long `sent via` line where the
+  journal keeps it whole.
+
+- `[internal]` **Linux stage: the installed script proven on a real host -- as a
+  service user, through a real logrotate, into the journal, against the lock and
+  the mode bits** (#14). `tools/linux_stage.sh`'s `run_native_checks()` replaces
+  the kit template's two example checks (`uname`, `systemd is PID 1`) with eight
+  that assert properties of logalert, keyed on a `mktemp -d` tree its trap
+  removes, nothing on the host outside it touched (pip's cache is pointed into
+  it), no user created, no unit installed, nothing mailed anywhere (the "MTA" is
+  `tests/fake_sendmail.py` under the venv's shebang); the residue is this run's
+  records in the host's logs (the journal, the syslog file rsyslog mirrors it
+  into, `runuser`'s session lines in `auth.log`). Every host binary that can
+  stall (`python3`, `cp` over the 9p mount, the venv and its pip, the installed
+  script, `runuser`, `logrotate`, `journalctl`) sits behind `bounded
+  "$BOUND_..."` with its exit code read first, 124 a skip; the stage's own
+  helpers (`body.py`, `offset.py`, `journal.py` under the temp venv's
+  interpreter) are bounded too, but a 124 there is a red naming the mail, the
+  state or the filter -- never a pass -- and a `systemctl is-active` that does
+  not answer is treated as journald absent (the `/var/log/syslog` check runs
+  instead); every skip names its cause and is red under
+  `LOGALERT_CHECK_MODE=required` (CI), tolerated in auto mode (the Windows gate,
+  which delegates into the sandbox). The checks: **preconditions** -- `python3`
+  names its minor and that `python3.X` must be on PATH (a VERSIONED interpreter,
+  `INSTALL.md`'s rule), `runuser`, `logrotate`, `gzip`, the service user
+  (`nobody`, `LOGALERT_STAGE_USER` to choose another); **install** -- the source
+  copied out of the checkout (read-only over 9p in the sandbox; pip builds
+  in-tree) and built into a wheel by the temp venv's own pip (an isolated build
+  that fetches `setuptools>=77` once, so the network is needed; its absence is
+  could-not-check, not a red naming the wheel), installed with `--no-deps`, the
+  console script symlinked into a bin directory the way `INSTALL.md` prescribes:
+  `logalert --version` through the symlink equals `version = "..."` in
+  `pyproject.toml`, and the script's shebang is the venv's interpreter;
+  **service user** -- as `nobody`, over a fixture log that holds a MATCHING line
+  before the first run: first sight exits 0 with 0 bytes on both streams and
+  mails nothing (a run from the beginning would mail that line), a new matching
+  line is one mail from `alerts@example.net` to `noc@example.net` carrying it,
+  exit 0 and quiet, the state's offset for the file equal to its size;
+  **rotation** -- a matching line, a REAL `logrotate -f` with `compress`, a
+  matching line in the fresh file: one mail, the report opening with the rotated
+  copy's `==> ... <==` header, the pre- and post-rotation lines once each and
+  the line mailed BEFORE the rotation never (mail bodies are read decoded -- a
+  temp path makes a summary line longer than 78 characters, and the body then
+  travels quoted-printable where `==>` is `=3D=3D>`); **lock** -- the holder's
+  fake sendmail sleeps 3 s, the second run is launched once the fake has
+  recorded the call and runs with `--log file:` under the fake's directory, and
+  the turn-away must be OBSERVED there (`this run exits quietly`, #12's line) --
+  ⭐ the review found the first version's assertions (one mail, two quiet exits)
+  satisfied by two runs that never overlapped, and the mutation it named
+  reddening only by timing; an unobserved overlap is could-not-check now;
+  **syslog** -- after `journalctl --sync`, the records naming the temp tree
+  carry `SYSLOG_IDENTIFIER=logalert` and the service user's `_UID`, and a run
+  with `--log stderr` leaves its records on stderr and none in the journal
+  (`/var/log/syslog` when journald is absent; a skip when both are); ⭐ every
+  `journalctl` is read through a file with its exit code first -- through a
+  pipe, a query that hung or refused printed `the journal holds 0 record(s)`,
+  byte for byte the red the `ident dropped` mutation prints, so a journal-side
+  fault would have sent the reader to `activity.py`; **permission** -- a `0600`
+  root-owned log beside a readable one in a section: exit 1, exactly one stderr
+  line naming it with `Permission denied`, the sibling's match mailed and its
+  state advanced (the EACCES case pytest cannot establish on Windows or in the
+  root sandbox); **modes** -- the state file `600`, the lock `644`, the
+  directory still `750`, all the service user's. ⭐ Also from the review: the
+  tree inherited the caller's umask, so `sudo` from a dev user with 027 or 077
+  turned every service-user check red with `Permission denied` lines blaming the
+  product (`umask 022` first); an unchecked `mktemp -d` under an unwritable
+  `TMPDIR` left the tree variable empty and laid `/logs`, `/fake`, `/conf2` and
+  the two helper scripts out at the filesystem root as root (measured on a copy
+  stopped before the install; the real script's next lines head for `/venv`,
+  `/bin/sendmail` and `/state`), which the trap correctly refused to remove
+  (checked; a skip); `cleanup()` killed the lock check's subshell and not the
+  run beneath it, which logged `state not saved` under the removed tree (it
+  signals the `timeout` child, which forwards down the chain); the interpreter
+  probe discarded `python3`'s stderr, reporting a loader failure as a PATH
+  problem. Every check that asserts logalert (seven of the eight; preconditions
+  asserts the host) reddens under a mutation of logalert of one line (two for
+  the cursors never saved), applied to the checkout and measured through the
+  stage in the sandbox (the wheel is built from the checkout) -- `__version__`
+  hardcoded; the summary printed on exit 0; the cursors never saved; a rotated
+  file read as a plain continue; the archive re-read from offset 0; every first
+  sight from the beginning; a fresh lock holder as a failed item; the syslog
+  ident dropped; an unreadable file ending its section; the state file `0644`;
+  the lock `0600` -- eleven, every one naming its check in the verdict line.
+  Re-measured after the fixes: green under `required` in 8 s, green under `umask
+  077`, an unreachable index a skip in auto mode, a refusing `journalctl` named,
+  a SIGTERM mid-check leaving no process, no tree and no record.
+  `tests/test_linux_stage.py` gains the wiring guard the template asked for and
+  the kit never wrote: every listed binary (`runuser`, `logrotate`,
+  `journalctl`, `systemctl`, `cp` -- the one copy reads the 9p mount --
+  `python3`, and any command under the temp tree or the versioned interpreter,
+  however quoted) at a command position must be wrapped, prefixes (`if`, `!`,
+  `then`, `while`, a bare `VAR=x`, `env`) stripped on both sides of the bound,
+  heredoc bodies and comments dropped, the whole file scanned, and every listed
+  name found at least once so a rename cannot make the guard vacuous; the
+  delegation tests are unchanged. CLAUDE.md's expected-skips paragraph is
+  unchanged (the stage's own skips are announced in its output, not pytest's).
+  The stage is what CI runs natively on the three legs under `required` from
+  this commit on; the journal side is the check #13 deferred here.
+
+- `[contract]` **Usage documentation: `docs/USAGE.md`, the operator's reference,
+  pinned to the package by a test** (#15). One document for the operator, in the
+  order the questions come: a synopsis with the first run walked through
+  (`--check-config`, `--test-mail`, `-n`, then the cron line, as the user that
+  will own the state, never root); every option with its default and one
+  sentence, and which modes refuse the run-only flags (`--check-config`,
+  `--reset-state` and `--test-mail`; `--example-config` prints and exits before
+  they are examined); the exit codes -- 0 ran and printed nothing, 1 exactly one
+  stderr line with its grammar, 2 nothing ran, 130 Ctrl-C -- and what
+  "cron-quiet" means, with the one deliberate exception (the activity log's
+  fallback line); the configuration reference (the file's rules, every
+  `[logalert]` key and every watch key with its default and the decided
+  semantics, the two files logalert writes and what they may not be -- the
+  config, the state, the lock, anything under the venv -- and the whole example,
+  verbatim); position tracking and rotation for an operator (the first run at
+  the end and the warning that records it, what the state holds, how a rotation
+  is followed and every naming style and compression recognised, `.zst` on
+  Python 3.14+ only, the "no rotated copy holds the saved position" warning in
+  the log's own words and what to do about each cause, `--reset-state`,
+  `--from-start`, `state_ttl`); running it (the cron line with `MAILTO` and why
+  the absolute path, the oneshot service and timer, the lock's two verdicts);
+  mail (the MTA requirement and the error that says what to install, SMTP,
+  `--test-mail`'s three answers, "accepted for queueing" is not "delivered" and
+  where a queued message is found, the From and when to set it, what an alert
+  looks like down to the report's vocabulary, the attachment's name, how the
+  body travels and what a control character in a log line becomes); logging
+  (where the journal and the syslog files are, the record shapes, the other
+  destinations, every fallback line, `--log`, `-n` to stderr, `--debug`); a
+  troubleshooting table in `INSTALL.md`'s style. Two departures from the issue's
+  text, decided and recorded on the issue: under a systemd timer the document
+  keeps the default `log = syslog` rather than the `log = stderr` the issue
+  named -- the records then reach the journal tagged `logalert` with their own
+  priority, whereas stderr under a unit lands under the same tag but at a single
+  priority, so `journalctl -p warning` would miss the warnings and the one line
+  of a failed run would be there twice; and the example config is not pasted but
+  included verbatim AND pinned: `tests/test_usage_doc.py` asserts the fenced
+  block equals `example_config()` byte for byte, that every option of
+  `build_parser()` and every key of `GLOBAL_KEYS` and `WATCH_KEYS` heads a row
+  of its table (the first cell, followed by a metavar or the closing backtick,
+  so `--from` is not satisfied by `--from-start`), and that the exit-code table
+  names all four codes -- a dropped row, a renamed option or an edited example
+  reddens the gate. ⭐ The review -- three verification slices against the
+  module docstrings, a reader lens following the document in the sandbox as an
+  operator (`nobody` for the service user, a temp tree for `/etc` and
+  `/var/lib`, the fake sendmail), a coverage lens against the issue,
+  `INSTALL.md`, `README.md` and this changelog, and a skeptic per finding --
+  held 180 claims and faulted 29; the skeptics refuted two (the
+  sendmail-packaging premise, and a README pointer that is #16's), and the 27
+  that stood were all corrected before this entry: the troubleshooting row for a
+  stale lock said a killed run can leave one and told the operator to remove the
+  `lock` file, when the lock is an OS lock that dies with its holder, the file
+  keeps the last holder's line by design, and removing it under a live holder
+  lets the next run overlap the stuck one; the delivery-failure row quoted
+  `--test-mail`'s line as a run's symptom and promised a re-send a test message
+  never gets; the line cap was described backwards (a physical line is matched
+  and shown WHOLE up to eight 2000-byte fragments, and ` [cut]` marks only what
+  lay beyond); the "likely causes" paragraph did not match the list the warning
+  prints; a leading `-` in an address is refused as `starts with '-'`, not as
+  `is not a bare local@domain address`; `journalctl -t postfix` finds nothing
+  (Postfix tags `postfix/<daemon>`: `journalctl -u 'postfix*'`); a plain
+  continue is a DEBUG record; `/var/log/messages` "and the BSDs" was unmeasured,
+  and the sentence now says the facility and severity the records carry. Added
+  on the same round: the refusals the loader and `main` apply to `state_file`
+  and a `file:` log, the two halves of the state rule the document had skipped
+  (a zero-match file moves on after a failed delivery; a partial refusal counts
+  as delivered), the attachment name's reduction and 40-character cap, the IPv6
+  spelling of `udp:`, the full set of fallback lines, the wire encoding (7-bit
+  clean means quoted-printable or base64 once a line passes 78 characters, and
+  what `grep` over a mailbox then sees), the fate of control characters and
+  non-UTF-8 bytes in a log line, and the first-run shape of the root refusal.
+  The document wraps at 80 columns (the `markdown width` stage; tables and the
+  two quoted lines in fences are exempt); with the test beside it the change is
+  not docs-only, so CI runs it. Windows 560 passed / 21 skips. `README.md` and
+  `INSTALL.md` do not yet point at the document: #16 owns that.
+
+- `[contract]` **Globs in `files`: expanded at every run, rotated copies left
+  out, a new file read from its beginning, links never followed** (#18). A
+  `files` entry containing `*`, `?` or `[` is a glob (`/var/log/*.log`,
+  `/var/log/hosts/*/messages`), expanded by `logalert/globs.py` at each run with
+  the shell's rules -- a wildcard within one directory level, a name starting
+  with `.` only for a component that starts with one, `[[]` a literal bracket,
+  the platform's case -- and the state is keyed by each expanded path, spelled
+  as the pattern spells its directory. The #6 rule (glob characters refused, so
+  a glob is never silently a literal path) is superseded for `files` only:
+  `archive_dir`, `state_file`, `sendmail_path` and a `file:` log stay one path
+  each (`contains a glob character; only files may be a glob` -- the `file:` log
+  was not checked for one before; it is now, in `check_log`), and a `files`
+  entry may neither contain `**` (`is not supported; name the directories`:
+  measured, `glob` without the recursive flag reads it as ONE level) nor end in
+  a separator (`ends in a separator; name the file`: `hosts/*/` means
+  directories to the shell); elsewhere `**` is a glob character like any other.
+  The walker is logalert's own, over `os.scandir`, for one reason: a directory
+  the glob cannot list is a FAILED ITEM (`[section] <glob>: cannot list <dir>
+  (Permission denied)`, exit 1), where `glob.glob` returns nothing, silently
+  (measured as `nobody` over a 0000 directory), and a watch gone quiet because
+  of a permission would look like a watch with nothing to say; a directory that
+  does not exist, or a component that is not a directory, matches nothing (a
+  DEBUG line). A glob matches regular files only -- a directory, FIFO, device or
+  socket it names is passed over, where a listed entry naming one stays an error
+  -- and never through a symbolic link: a link it matches, and a link where a
+  wildcard directory component would descend, is passed over (`a symbolic link;
+  list it by name`), since a link is a name the operator never wrote; hard links
+  one glob matches are read once, under the first name in sort order; a file
+  whose `stat` fails otherwise is kept, so its open fails the way a listed
+  file's does. The matches are read in name order (a daily directory in date
+  order), and a section's list is read once per path however often it names one,
+  literally or by a glob, compared by normalised path (`x//y.log` beside
+  `x/*.log`) -- which ends #12's "a file listed twice is read twice". Rotated
+  copies are left out unless the new watch key `include_archives = yes` says
+  otherwise, by SHAPE (`rotation.archive_suffix`: a numeric or dated rotation
+  suffix per the catch-up's own recognition when what precedes it does not end
+  in a digit, so `router.log.1`, `router.log-20260915.gz`,
+  `access_log.1726358400` and `app.2024` are copies and `192.0.2.1`,
+  `2026-09-15`, `python3.12` are files; a copy's suffix `.bak`, `.old`, `.orig`,
+  `.save`, `-old`, `-bak`; a bare compression extension, `messages.gz` -- each
+  with an optional compression extension after it, live file present or not) and
+  by KIN (a numeric or dated rotation of another name matched in the same
+  directory, `router1.2` beside `router1`; never the catch-up's `other` style,
+  because `fw-dmz` beside `fw` and `router1.example.net` beside `router1` are
+  hosts): otherwise `/var/log/router*` would read `router.log.1.gz` as a file of
+  its own and mail every alert twice after each rotation. `yes` is for
+  directories where the dated names ARE the live files (Apache's `rotatelogs`);
+  on a rotating log it mails the rotated content twice, and the document says
+  so. The NEW-FILE RULE: a file a glob matches for the first time is read from 0
+  -- not first-sighted at the end -- when that glob has a recorded moment the
+  file's mtime is not older than (`new since the last run (<glob>); reading from
+  the beginning`), and the moments live in the state file as `"runs":
+  {"<section>": {"<glob>": "<UTC seconds>"}}` (schema version still 1: an older
+  logalert reads the file correctly and drops the key on save). A glob's moment
+  is the START of the last run that saved the section's cursors AND listed the
+  glob's directories without error; it never moves on a failed delivery (the
+  re-run reads the same new file from 0 again), on an outage (a file created
+  while the directory was away or unlistable is read whole once it is back), or
+  under `-n`; a glob never yet listed has none, so a share mounted or a
+  permission granted after the first run does not mail every live log in it
+  whole; a glob just added to the list first-sights every match at the end
+  (widening `error.log` to `*.log` never mails a long-lived file whole); every
+  glob that matched the path is asked, not the first in the list; a listed path
+  is never new, wherever a glob also matches it -- #7's first sight is unchanged
+  for every existing configuration; `--reset-state` forgets a section's moments
+  with its cursors, so its promise holds and a file appearing between the reset
+  and the next run is a plain first sight; records of sections no longer
+  configured expire after `state_ttl`, a configured section's never. Decided
+  against: birth time (measured, Python on Linux 3.10-3.12 has no
+  `st_birthtime`; ext4 has it), and a size heuristic. The residual, documented
+  with its bound: old content under a fresh mtime (`cp` without `-p`; a file the
+  glob matched but could not open for a while) is read whole once, at most
+  `max_lines` matching lines in one mail. `--check-config` expands each glob and
+  names what it matched, left out and passed over (`[web] files: /var/log/web/*
+  -> 2 file(s), 1 rotated copy left out, 1 passed over (not regular files)`,
+  then `[web] <path>`, `[web] left out: <path>`, `[web] passed over: <path> (a
+  directory)`, twenty of each kind then `... and N more`; `-> matches nothing`;
+  `-> cannot list <dir> (<reason>)`, still exit 0) and the section line ends
+  `include_archives: no|yes`; names from a directory listing are header-cleaned
+  there and in `--reset-state`'s "the state file knows" hint, so a file name
+  with a line break in it forges no line. `--reset-state` takes an expanded path
+  as `--check-config` lists it; given the glob itself it says `is a glob;
+  --reset-state takes one of its matches`. Measured for the design: rename,
+  `gzip`, `xz` and `bzip2` keep the old file's mtime and logrotate's `create`
+  gives the new live file a fresh one (so a renamed or compressed copy is never
+  "new"); ext4 mtimes tick at about 4 ms in the sandbox. Listed in #19 as
+  deferred beyond 0.1.0; pulled in before the first release on the owner's word.
+  ⭐ The adversarial review (four lenses -- reproduction, spec fidelity and
+  consumers, mutation testing, safety -- then two skeptics per judgment-level
+  finding) made 32 findings, 30 of them reproduced with scripts, and reshaped
+  the map: the map's per-section record (the run's start plus the whole `files`
+  list) wrote the moment for a glob whose directory was unlistable or absent, so
+  the first successful listing read every live log in it from 0 (a 200-line mail
+  with `... and 100 more`), and moved the moment past a run whose listing
+  failed, so a daily file created during the outage was first-sighted at the END
+  afterwards -- the exact loss the rule exists to prevent; a glob followed a
+  symbolic link planted by `nobody` in a watched directory and a root run mailed
+  a root-only file the pattern never named (`fs.protected_symlinks` does not
+  cover it), and a link beside its target was two cursors and every line twice;
+  the shape tier called every file named by an address a rotated copy and the
+  kin tier's `other` style made `fw-dmz` a copy of `fw`, so a per-host syslog
+  directory read nothing for those hosts; a hand `gzip` of a live log was a "new
+  file" read whole and then mailed again by the catch-up; `--check-config`
+  counted the copies left out but never named them, though the document said it
+  did; a literal component behind a regular file was a failed item on POSIX only
+  (`NotADirectoryError`, which the Windows-real tests could not see); a file
+  name with a line break forged a second `--check-config` line; and the new
+  logrotate test compared fresh mtimes with `<`, which the coarse clock made a
+  coin toss (one run in three). Two findings were refuted by both skeptics. 32
+  mutants killed, the three that only POSIX tests pin natively as root and as
+  `nobody`, and the EACCES-on-stat one as `nobody` (it survives as root, whose
+  stat is never refused). Windows 657 passed / 26 skips; native 685 / 7 (the
+  expected counts in `CLAUDE.md` are now 26 and 6). `docs/USAGE.md` gains a
+  `Globs` section, the `files` and `include_archives` rows and two
+  troubleshooting rows; the example config documents both.
+
+- `[internal]` **A typing slip in the syslog probe, caught by CI's mypy where
+  the host's could not see it** (#13). `SyslogProbe.found` carried the socket
+  type as `int`; `SysLogHandler` is typed for `socket.SocketKind`, and the one
+  place that passes it (`activity._open`) sits under `sys.platform != "win32"`.
+  🚨 The gate's `mypy` stage on the Windows host measures nothing in such a
+  branch: mypy narrows `sys.platform` and skips the whole block, so #13 shipped
+  through a green gate with an error CI's Linux mypy reports at once -- every
+  `sys.platform` branch in this package has that blind spot, and the first CI
+  run of the batch (PR #21, also the first run of the Linux stage, which passed)
+  was red on mypy alone. Fixed by typing the field as `socket.SocketKind`; mypy
+  2.3.1 natively in the sandbox is clean on all 40 files, and `CLAUDE.md` now
+  says that mypy must run natively before a `/ship` that touches a POSIX branch.
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main

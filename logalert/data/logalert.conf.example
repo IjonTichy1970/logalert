@@ -27,8 +27,12 @@
 # position: `logalert --reset-state /path/to/file` (every file: no path).
 #state_file = /var/lib/logalert/state.json
 
-# Where logalert writes its own activity: syslog (default), stderr,
-# file:/absolute/path, or udp:host:port (explicit only; never a fallback).
+# Where logalert writes its own activity: syslog (default: the first socket
+# of /dev/log, /var/run/log, /var/run/syslog, tagged `logalert` so that
+# `journalctl -t logalert` finds the runs), stderr, file:/absolute/path
+# (outside the venv), or udp:host:port (explicit only; never a fallback).
+# When the destination cannot be used the run says so once on stderr and
+# logs there. `--log DEST` overrides this for one run.
 #log = syslog
 
 # How alert emails leave the box: auto (default) uses the local sendmail
@@ -67,7 +71,12 @@ to =
     noc@example.net
 
 # Log files to read: absolute paths, one per line. Compressed files (.gz,
-# .bz2, .xz) may be listed directly. No wildcards in this release.
+# .bz2, .xz) may be listed directly. An entry may be a glob (* ? [...], the
+# shell's rules: a wildcard stays within one directory level, names starting
+# with a dot need a pattern that starts with one, [[] is a literal bracket; **
+# is refused), expanded at every run: /var/log/hosts/*/messages. A glob reads
+# regular files only, never through a symbolic link (list a link by name),
+# and leaves rotated copies out (see include_archives).
 files =
     /var/log/router.log
 
@@ -118,7 +127,8 @@ patterns =
 # command line's -c, which defaults to 0.
 #context = 0
 
-# Flood cap: at most this many matching lines per email ("... and N more").
+# Flood cap: at most this many matching lines per email, each with its
+# context; the rest is one trailer, "... and N more matching line(s)".
 #max_lines = 200
 
 # On the first run, where to begin in each file: end (default -- no flood of
@@ -128,6 +138,17 @@ patterns =
 # Where rotated archives live when they are not beside the log (logrotate's
 # olddir, newsyslog's -a). Default: the log's own directory.
 #archive_dir = /var/log/archive
+
+# Whether a glob in files reads rotated copies (router.log.1,
+# router.log-20260915.gz, router.log.bak, messages.gz) as files of their
+# own. Default no: a rotation would otherwise mail every alert twice. yes
+# is for directories where the dated names ARE the live files (Apache's
+# rotatelogs), never for a rotating log. A file a glob first matches is read
+# from its beginning when it is newer than the section's last run over that
+# glob (a new daily file is all new content); otherwise its first sight
+# starts at the end, like a listed file's. logalert --check-config lists
+# what a glob matches and what it leaves out.
+#include_archives = no
 
 # ---------------------------------------------------------------------------
 # A second watch, on a compressed log, with case-insensitive matching.

@@ -398,3 +398,85 @@ def test_a_bad_line_count_is_a_hard_error(tmp_path: Path, bad: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
     with pytest.raises(StateError, match="'line' is not a non-negative integer"):
         load_state(str(path))
+
+
+# -- the run records (issue #18) ---------------------------------------------------------
+
+
+GLOB = "/var/log/web/*.log"
+
+
+def test_run_records_round_trip_and_an_older_file_has_none(tmp_path: Path) -> None:
+    path = str(tmp_path / "state.json")
+    state = State(path)
+    state.set("web", "/var/log/web/a.log", cursor())
+    state.record_run("web", (GLOB, "/var/log/other.log"), {GLOB}, NOW)
+    assert state.dirty
+    state.save()
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert data["runs"] == {"web": {GLOB: "2026-09-14T12:00:00Z"}}  # listed paths: no moment
+    again = load_state(path)
+    assert again.last_run("web", GLOB) == "2026-09-14T12:00:00Z"
+    assert again.last_run("web", "/var/log/other.log") is None
+    assert again.last_run("other", GLOB) is None
+    Path(path).write_text('{"version": 1, "entries": {}}', encoding="utf-8")
+    assert load_state(path).runs == {}  # from before #18: as if no section had run
+
+
+def test_a_glob_not_looked_into_keeps_its_moment_and_a_dropped_glob_goes(tmp_path: Path) -> None:
+    """The outage rule: a glob whose directory was away or unlistable keeps the moment of the
+    last run that saw it; one never seen has none; one no longer configured is dropped."""
+    state = State(str(tmp_path / "state.json"))
+    other = "/var/log/hosts/*/messages"
+    state.record_run("web", (GLOB, other), {GLOB, other}, NOW - timedelta(hours=1))
+    state.record_run("web", (GLOB, other, "/var/log/new/*"), {GLOB}, NOW)
+    assert state.runs["web"] == {GLOB: timestamp(NOW), other: timestamp(NOW - timedelta(hours=1))}
+    state.record_run("web", (GLOB,), {GLOB}, NOW)
+    assert state.runs["web"] == {GLOB: timestamp(NOW)}
+    state.record_run("web", (GLOB,), set(), NOW)
+    assert state.runs["web"] == {GLOB: timestamp(NOW)}  # unchanged, still on record
+
+
+def test_forget_drops_the_records_of_the_sections_that_lost_an_entry(tmp_path: Path) -> None:
+    state = State(str(tmp_path / "state.json"))
+    for section, file in (("a", "/x"), ("b", "/x"), ("c", "/y")):
+        state.set(section, file, cursor())
+        state.record_run(section, (GLOB,), {GLOB}, NOW)
+    state.record_run("empty", (GLOB,), {GLOB}, NOW)  # a record without entries
+    assert state.forget("/x") == 2 and sorted(state.runs) == ["c", "empty"]
+    state.dirty = False
+    assert state.forget() == 1 and state.runs == {} and state.entries == {} and state.dirty
+
+
+def test_run_records_of_unconfigured_sections_expire_configured_ones_never(
+    tmp_path: Path
+) -> None:
+    state = State(str(tmp_path / "state.json"))
+    state.record_run("old", (GLOB,), {GLOB}, NOW - timedelta(days=31))
+    state.record_run("edge", (GLOB,), {GLOB}, NOW - timedelta(days=30))
+    state.record_run("kept", (GLOB,), {GLOB}, NOW - timedelta(days=400))
+    state.record_run("empty", (GLOB,), set(), NOW)  # never looked into: nothing to keep
+    state.dirty = False
+    assert state.expire_runs(30, NOW, configured=["kept"]) == ["old", "empty"]
+    assert sorted(state.runs) == ["edge", "kept"] and state.dirty
+    state.dirty = False
+    assert state.expire_runs(30, NOW, configured=["kept"]) == [] and not state.dirty
+
+
+@pytest.mark.parametrize(
+    ("runs", "fragment"),
+    [
+        ("[]", "'runs' is not an object"),
+        ('{"a": 5}', "runs['a'] is not an object"),
+        ('{"a": {"/x/*": 7}}', "runs['a']['/x/*'] is not a string"),
+        ('{"a": {"/x/*": "yesterday"}}', "runs['a']['/x/*'] is not a UTC timestamp"),
+    ],
+)
+def test_a_bad_run_record_is_a_hard_error_naming_the_remedy(
+    tmp_path: Path, runs: str, fragment: str
+) -> None:
+    path = tmp_path / "state.json"
+    path.write_text('{"version": 1, "entries": {}, "runs": ' + runs + "}", encoding="utf-8")
+    with pytest.raises(StateError, match="start over with --reset-state") as exc:
+        load_state(str(path))
+    assert fragment in str(exc.value)

@@ -68,7 +68,11 @@ class RunLock:
 
     def acquire(self, now: float | None = None) -> None:
         """Take the lock or raise ``LockBusy`` describing the holder. Never blocks."""
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
+        # O_NOFOLLOW: a planted symlink named lock in a directory another user owns would
+        # otherwise be truncated and written through by a root run
+        flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(self.path, flags, 0o644)
         try:
             _lock(fd)
         except OSError as exc:

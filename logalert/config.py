@@ -17,8 +17,9 @@ Format rules (decided, and pinned by tests/test_config.py):
   * A pattern line may start with a priority tag -- exactly ``[high] ``, ``[medium] `` or
     ``[low] ``. Any other bracketed prefix is part of the literal. The priority system is OFF
     unless a section sets ``priority`` or a pattern carries a tag.
-  * Paths are absolute, on the platform logalert runs on. Glob characters are rejected in
-    0.1.0 so a glob is never silently taken for a literal path.
+  * Paths are absolute, on the platform logalert runs on. A ``files`` entry may be a glob
+    (``*``, ``?``, ``[``; ``**`` is refused), expanded at run time by ``logalert.globs``;
+    every other path is one path, and a glob character in it is an error.
   * Addresses are bare ``local@domain`` in 0.1.0: ASCII, no display name, no leading ``-``
     (every sendmail implementation would read it as an option), no whitespace.
   * A continuation line that begins with ``#`` or ``;`` is dropped by configparser as a
@@ -36,11 +37,13 @@ import os
 import re
 import socket
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from importlib import resources
 from os import path as ospath
 from typing import Literal, cast
+
+from logalert.globs import Expansion, expand, is_glob
 
 if sys.platform != "win32":
     import pwd
@@ -68,6 +71,7 @@ WATCH_KEYS: frozenset[str] = frozenset(
         "patterns", "ipatterns", "regex", "iregex",
         "exclude", "iexclude", "exclude_regex", "iexclude_regex",
         "priority", "report", "context", "max_lines", "start", "archive_dir",
+        "include_archives",
     }
 )
 PATTERN_KEYS: tuple[str, ...] = ("patterns", "ipatterns", "regex", "iregex")
@@ -80,7 +84,6 @@ GLOBAL_KEYS: frozenset[str] = frozenset(
     }
 )
 
-_GLOB_CHARS = frozenset("*?[")
 _PRIORITY_TAG = re.compile(r"^\[(high|medium|low)\] (.+)$", re.S)
 # Bare address: an RFC 5322 dot-atom local part (no quotes, no display name, no angle
 # brackets) and a domain of letters, digits, dots and hyphens. Deliberately narrower than
@@ -123,6 +126,7 @@ class Watch:
     max_lines: int
     start: Literal["end", "beginning"]
     archive_dir: str | None
+    include_archives: bool = False  # a glob reads rotated copies as files of their own
 
 
 @dataclass(frozen=True)
@@ -180,6 +184,8 @@ def load_config(path: str) -> Config:
     for name in parser.sections():
         if name == RESERVED_SECTION:
             settings = _load_settings(parser[name], warnings)
+            check_log_target(f"[{RESERVED_SECTION}] log", settings.log,
+                             state_file=settings.state_file, config_path=path)
         elif name.lower() == RESERVED_SECTION:
             raise ConfigError(
                 f"[{name}]: the name is reserved for the global settings; spell it "
@@ -214,42 +220,113 @@ def _load_settings(section: configparser.SectionProxy, warnings: list[str]) -> S
         raise ConfigError(f"{where} smtp_host: required when transport = smtp")
 
     log = _optional(where, section, "log") or "syslog"
-    _check_log(where, log)
+    check_log(f"{where} log", log)
+    state_file = _abs_path(where, section, "state_file", DEFAULT_STATE_FILE)
+    _outside_venv(f"{where} state_file", state_file)
 
     return Settings(
         from_address=from_address,
-        state_file=_abs_path(where, section, "state_file", DEFAULT_STATE_FILE),
+        state_file=state_file,
         log=log,
         transport=cast(Literal["auto", "sendmail", "smtp"], transport),
         sendmail_path=_abs_path(where, section, "sendmail_path", DEFAULT_SENDMAIL_PATH),
         smtp_host=smtp_host,
         smtp_port=_int(where, section, "smtp_port", DEFAULT_SMTP_PORT, low=1, high=65535),
         smtp_starttls=_bool(where, section, "smtp_starttls", False),
-        mail_timeout=_number(where, section, "mail_timeout", DEFAULT_MAIL_TIMEOUT),
+        mail_timeout=_number(where, section, "mail_timeout", DEFAULT_MAIL_TIMEOUT,
+                             high=MAX_MAIL_TIMEOUT),
         lock_stale=_int(where, section, "lock_stale", DEFAULT_LOCK_STALE, low=1),
         state_ttl_days=_int(where, section, "state_ttl", DEFAULT_STATE_TTL_DAYS, low=1),
         subject_suffix=_bool(where, section, "subject_suffix", True),
     )
 
 
-def _check_log(where: str, log: str) -> None:
+def check_log(label: str, log: str) -> None:
+    """The activity log destination ``log =`` and ``--log`` (issue #13) accept: ``syslog``,
+    ``stderr``, ``file:/absolute/path`` outside the venv, ``udp:host:port``. ``label`` names
+    the setting in the error (``[logalert] log`` or ``--log``)."""
     if log in ("syslog", "stderr"):
         return
     if log.startswith("file:"):
         target = log[len("file:"):]
         if not target or not ospath.isabs(target):
-            raise ConfigError(f"{where} log: file: needs an absolute path, got {target!r}")
+            raise ConfigError(f"{label}: file: needs an absolute path, got {target!r}")
+        _no_nul(label, target)
+        if is_glob(target):  # one path, like every path but files (issue #18)
+            raise ConfigError(f"{label}: {target!r} contains a glob character; only files may "
+                              f"be a glob")
+        _outside_venv(label, target)
         return
     if log.startswith("udp:"):
-        host, sep, port = log[len("udp:"):].rpartition(":")
-        # isdigit() alone accepts digits int() rejects (superscripts, other scripts)
-        digits = port.isascii() and port.isdigit()
-        if not sep or not host or not digits or not 1 <= int(port) <= 65535:
-            raise ConfigError(f"{where} log: udp: needs host:port, got {log[4:]!r}")
+        try:
+            udp_address(log)
+        except ValueError:
+            raise ConfigError(f"{label}: udp: needs host:port, got {log[4:]!r}") from None
         return
     raise ConfigError(
-        f"{where} log: expected syslog, stderr, file:/absolute/path or udp:host:port, got {log!r}"
+        f"{label}: expected syslog, stderr, file:/absolute/path or udp:host:port, got {log!r}"
     )
+
+
+def _outside_venv(label: str, target: str) -> None:
+    """Configuration and state live outside the venv: the upgrade and uninstall procedures
+    in INSTALL.md wipe it whole. Only meaningful when this interpreter IS a venv
+    (``sys.prefix != sys.base_prefix``); compared by real path."""
+    if sys.prefix == sys.base_prefix:
+        return
+    venv = ospath.normcase(ospath.realpath(sys.prefix)).rstrip(os.sep)
+    real = ospath.normcase(ospath.realpath(target))
+    if real == venv or real.startswith(venv + os.sep):  # commonpath raises across drives
+        raise ConfigError(f"{label}: {target} is inside the venv ({sys.prefix}), which the "
+                          f"upgrade procedure wipes")
+
+
+def udp_address(log: str) -> tuple[str, int]:
+    """The ``(host, port)`` of a ``udp:host:port`` destination; ``udp:[2001:db8::1]:514`` is
+    the IPv6 spelling (the brackets are the address's, not the host's -- measured, glibc
+    cannot resolve ``[::1]``). ``ValueError`` when the shape is wrong."""
+    host, sep, port = log[len("udp:"):].rpartition(":")
+    if host[:1] == "[" and host[-1:] == "]":
+        host = host[1:-1]
+    # isdigit() alone accepts digits int() rejects (superscripts, other scripts)
+    digits = port.isascii() and port.isdigit()
+    if not sep or not host or not digits or not 1 <= int(port) <= 65535:
+        raise ValueError(log)
+    return host, int(port)
+
+
+def check_log_target(label: str, log: str, *, state_file: str, config_path: str) -> None:
+    """A ``file:`` destination must not be the state file, the run lock beside it or the
+    config file: measured, the log written into the state file corrupts it before every
+    run (and ``--reset-state`` writes a fresh state the next record overwrites), into the
+    config it doubles a key and every mode is exit 2 until the operator hand-edits it. Both
+    the loader and ``--log`` apply it, each with the paths it knows."""
+    if not log.startswith("file:"):
+        return
+    target = log[len("file:"):]
+    lock = ospath.join(ospath.dirname(state_file), "lock")  # state.lock_path, sans import
+    for other, what in ((state_file, "the state file"), (lock, "the run lock"),
+                        (config_path, "the config file")):
+        if _same_path(target, other):
+            raise ConfigError(f"{label}: {target} is {what}")
+
+
+def _same_path(a: str, b: str) -> bool:
+    """One path or two, for files that may not exist yet: real paths, case-folded where the
+    platform does; ``samefile`` for two that exist (a hard link, a bind mount)."""
+    try:
+        if ospath.samefile(a, b):
+            return True
+    except (OSError, ValueError):
+        pass
+    return ospath.normcase(ospath.realpath(a)) == ospath.normcase(ospath.realpath(b))
+
+
+def _no_nul(label: str, value: str) -> None:
+    # configparser passes U+0000 through; realpath and open raise ValueError on it, a
+    # traceback instead of exit 2
+    if chr(0) in value:
+        raise ConfigError(f"{label}: contains a NUL character")
 
 
 # -- watch sections --------------------------------------------------------------------------
@@ -267,13 +344,15 @@ def _load_watch(name: str, section: configparser.SectionProxy, warnings: list[st
 
     subject = _required(where, section, "subject")
 
-    to = tuple(_list(where, section, "to", required=True, split_commas=True))
+    # deduplicated in order: smtplib decides "all refused" by counting, and a recipient
+    # listed twice and refused once would let DATA go out to nobody
+    to = tuple(dict.fromkeys(_list(where, section, "to", required=True, split_commas=True)))
     for address in to:
         _check_address(where, "to", address)
 
     files = tuple(_list(where, section, "files", required=True))
     for file in files:
-        _check_path(where, "files", file)
+        _check_path(where, "files", file, glob=True)
 
     section_priority = _enum(where, section, "priority", PRIORITIES, None)
     patterns: list[Pattern] = []
@@ -308,6 +387,7 @@ def _load_watch(name: str, section: configparser.SectionProxy, warnings: list[st
             Literal["end", "beginning"], _enum(where, section, "start", START_MODES, "end")
         ),
         archive_dir=archive_dir,
+        include_archives=_bool(where, section, "include_archives", False),
     )
 
 
@@ -420,7 +500,11 @@ def _int(
     return number
 
 
-def _number(where: str, section: configparser.SectionProxy, key: str, default: float) -> float:
+MAX_MAIL_TIMEOUT = 3600.0  # seconds; at about 25 days subprocess and socket timeouts overflow
+
+
+def _number(where: str, section: configparser.SectionProxy, key: str, default: float, *,
+            high: float | None = None) -> float:
     value = _optional(where, section, key)
     if value is None:
         return default
@@ -430,6 +514,8 @@ def _number(where: str, section: configparser.SectionProxy, key: str, default: f
         raise ConfigError(f"{where} {key}: expected a number of seconds, got {value!r}") from exc
     if not math.isfinite(number) or number <= 0:
         raise ConfigError(f"{where} {key}: must be a positive number, got {value}")
+    if high is not None and number > high:
+        raise ConfigError(f"{where} {key}: must be at most {high:g} seconds, got {value}")
     return number
 
 
@@ -453,14 +539,27 @@ def _abs_path(where: str, section: configparser.SectionProxy, key: str, default:
     return value
 
 
-def _check_path(where: str, key: str, value: str) -> None:
+def _check_path(where: str, key: str, value: str, *, glob: bool = False) -> None:
+    """An absolute path; a glob only where ``glob`` says so (``files``), and never a
+    recursive one: ``glob`` would read ``**`` as one level (measured), and the whole tree
+    is not what a log watcher should walk."""
+    _no_nul(f"{where} {key}", value)
     if not ospath.isabs(value):
         raise ConfigError(f"{where} {key}: {value!r} is not an absolute path")
-    if any(char in _GLOB_CHARS for char in value):
+    if glob and "**" in value:
+        raise ConfigError(f"{where} {key}: {value!r}: ** is not supported; name the directories")
+    if glob and value.endswith(tuple(sep for sep in (os.sep, os.altsep) if sep)):
+        raise ConfigError(f"{where} {key}: {value!r} ends in a separator; name the file")
+    if not glob and is_glob(value):
         raise ConfigError(
-            f"{where} {key}: {value!r} contains a glob character; globs are not supported "
-            f"in this release, list each file"
+            f"{where} {key}: {value!r} contains a glob character; only files may be a glob"
         )
+
+
+def is_address(value: str) -> bool:
+    """The bare ``local@domain`` the loader accepts: what ``from``, ``to`` and ``--from``
+    (issue #12) must be. ``_check_address`` says which rule a rejected value broke."""
+    return value.isascii() and not value.startswith("-") and _ADDRESS.fullmatch(value) is not None
 
 
 def _check_address(where: str, key: str, value: str) -> None:
@@ -469,7 +568,7 @@ def _check_address(where: str, key: str, value: str) -> None:
     if not value.isascii():
         raise ConfigError(f"{where} {key}: {value!r} is not ASCII; non-ASCII addresses are not "
                           f"supported in this release")
-    if not _ADDRESS.match(value):
+    if not _ADDRESS.fullmatch(value):
         raise ConfigError(
             f"{where} {key}: {value!r} is not a bare local@domain address (no display "
             f"names, no angle brackets, no spaces)"
@@ -535,16 +634,65 @@ def from_warning(address: str) -> str | None:
 # -- --check-config --------------------------------------------------------------------------
 
 
-def _sendmail_note(path: str) -> str:
+def sendmail_problem(path: str) -> str | None:
+    """Why ``path`` cannot be run as sendmail, or None: the one judgement ``--check-config``
+    and the transport share (a directory passes exists + X_OK on both platforms)."""
+    if not ospath.exists(path):
+        return "does not exist"
     if not ospath.isfile(path):
-        return "NOT FOUND -- install an MTA or set transport = smtp"
+        return "is not a regular file"
     if not os.access(path, os.X_OK):
+        return "is not executable"
+    return None
+
+
+def _sendmail_note(path: str) -> str:
+    problem = sendmail_problem(path)
+    if problem is None:
+        return "found, executable"
+    if problem == "is not executable":
         return "found but NOT EXECUTABLE -- fix its mode or set transport = smtp"
-    return "found, executable"
+    if problem == "is not a regular file":
+        return "NOT A FILE -- point sendmail_path at the binary or set transport = smtp"
+    return "NOT FOUND -- install an MTA or set transport = smtp"
 
 
-def describe(config: Config) -> str:
-    """The effective settings, one ASCII line each, for ``--check-config``."""
+LIST_CAP = 20  # names of one kind, per glob, that --check-config lists
+
+
+def _listing(section: str, label: str, names: list[str]) -> list[str]:
+    """One indented line per name under a glob's line, ``LIST_CAP`` of them at most."""
+    lines = [f"[{section}]   {label}{name}" for name in names[:LIST_CAP]]
+    if len(names) > LIST_CAP:
+        lines.append(f"[{section}]   {label}... and {len(names) - LIST_CAP} more")
+    return lines
+
+
+def _expansion_note(found: Expansion) -> str:
+    """What a glob matched, in one clause: counts, what was left out, what failed."""
+    parts: list[str] = []
+    if found.files:
+        parts.append(f"{len(found.files)} file(s)")
+    elif not found.errors:
+        parts.append("matches nothing")
+    if found.archives:
+        n = len(found.archives)
+        parts.append(f"{n} rotated {'copy' if n == 1 else 'copies'} left out")
+    if found.skipped:
+        parts.append(f"{len(found.skipped)} passed over (not regular files)")
+    parts += found.errors
+    return ", ".join(parts)
+
+
+def describe(config: Config, sender: str | None = None, state_file: str | None = None,
+             log: str | None = None, *, clean: Callable[[str], str] = str) -> str:
+    """The effective settings, one ASCII line each, for ``--check-config``; ``sender`` is
+    ``--from`` and ``state_file`` is ``--state-file``, each of which wins over the config
+    for the run it is given to; ``log`` is the destination as ``activity.describe`` resolves
+    it (with `` (--log)`` when the command line chose it), else the setting is printed.
+    ``clean`` is applied to every name that comes from a directory listing (``main`` passes
+    ``mail.clean_header``, which this module cannot import): a file name with a line break
+    in it must not forge a line."""
     settings = config.settings
     out: list[str] = [f"config: {config.path}"]
     if settings.transport == "auto":
@@ -556,7 +704,10 @@ def describe(config: Config) -> str:
     else:
         tls = "STARTTLS" if settings.smtp_starttls else "plain"
         out.append(f"transport: smtp to {settings.smtp_host}:{settings.smtp_port} ({tls})")
-    if settings.from_address:
+    if sender is not None:
+        out.append(f"from: {sender} (--from)")
+        warning = from_warning(sender)
+    elif settings.from_address:
         out.append(f"from: {settings.from_address}")
         warning = from_warning(settings.from_address)
     else:
@@ -565,8 +716,11 @@ def describe(config: Config) -> str:
         warning = from_warning(address)
     if warning:
         out.append(f"warning: {warning}")
-    out.append(f"state_file: {settings.state_file}")
-    out.append(f"log: {settings.log}")
+    if state_file is not None and state_file != settings.state_file:
+        out.append(f"state_file: {state_file} (--state-file)")
+    else:
+        out.append(f"state_file: {settings.state_file}")
+    out.append(f"log: {log if log is not None else settings.log}")
     out.append(f"mail_timeout: {settings.mail_timeout:g}s; lock_stale: {settings.lock_stale}s; "
                f"state_ttl: {settings.state_ttl_days} days; "
                f"subject_suffix: {'yes' if settings.subject_suffix else 'no'}")
@@ -578,7 +732,16 @@ def describe(config: Config) -> str:
         out.append(f"[{watch.name}] subject: {watch.subject}")
         out.append(f"[{watch.name}] to: {', '.join(watch.to)}")
         for file in watch.files:
-            out.append(f"[{watch.name}] file: {file}")
+            if not is_glob(file):
+                out.append(f"[{watch.name}] file: {file}")
+                continue
+            found = expand(file, include_archives=watch.include_archives)
+            note = clean(_expansion_note(found))
+            out.append(f"[{watch.name}] files: {file} -> {note}")
+            out += _listing(watch.name, "", [clean(p) for p in found.files])
+            out += _listing(watch.name, "left out: ", [clean(p) for p in found.archives])
+            out += _listing(watch.name, "passed over: ",
+                            [f"{clean(p)} ({what})" for p, what in found.skipped])
         out.append(f"[{watch.name}] patterns: {literal} literal, {regex} regex "
                    f"({nocase} case-insensitive, {tagged} with a priority tag); "
                    f"excludes: {len(watch.excludes)}")
@@ -586,7 +749,8 @@ def describe(config: Config) -> str:
         context = "from -c" if watch.context is None else str(watch.context)
         out.append(f"[{watch.name}] priority: {priority}; report: {watch.report}; "
                    f"context: {context}; max_lines: {watch.max_lines}; start: {watch.start}"
-                   + (f"; archive_dir: {watch.archive_dir}" if watch.archive_dir else ""))
+                   + (f"; archive_dir: {watch.archive_dir}" if watch.archive_dir else "")
+                   + f"; include_archives: {'yes' if watch.include_archives else 'no'}")
     for warning in config.warnings:
         out.append(f"warning: {warning}")
     return "\n".join(out)

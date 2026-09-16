@@ -270,3 +270,77 @@ def test_bounded_passes_success_and_failure_through_unchanged() -> None:
     could-not-check' passes every other case in this file; `false` -> 1 is what reddens it."""
     assert _bounded_rc("bounded 5 true")[0] == 0
     assert _bounded_rc("bounded 5 false")[0] == 1
+
+
+# -- the checks (issue #14): every binary that can hang is bounded --------------------------------
+
+# The binaries run_native_checks() and its helpers call that talk to another process, the
+# network or a mount that can stall: each must sit behind `bounded "$BOUND_..."`. Coreutils over
+# files in the temp tree (cat, grep, stat, wc, find, sed, head, ls) are not listed: they cannot
+# block there. `cp` IS listed because the one copy reads the checkout, which is a 9p mount in
+# the sandbox -- exactly the operation that hangs. Any command under the temp tree ($T/...) or
+# the versioned interpreter ($pyx) is bounded whatever its spelling (_TREE_BINARY); the names
+# here are also the floor: each must be found at least once, so a rename cannot make the guard
+# vacuous.
+BOUNDED_BINARIES = ("runuser", "logrotate", "journalctl", "systemctl", "cp", "python3",
+                    '"$pyx"', '"$T/venv/bin/python"', '"$T/bin/logalert"')
+_TREE_BINARY = re.compile(r'^"?\$\{?(?:T|pyx)\}?"?(?:/\S*)?$')
+# where a command may begin: after these, the next word is at a command position
+_SEPARATORS = re.compile(r"\|\||&&|\||;|&|\$\(|\(|(?<!\$)\{|`")
+# what may precede a command without changing what runs: reserved words, `!`, nice/nohup/
+# exec/command/time, bare VAR=x assignments, `env [-flags] [VAR=x ...]`
+_PREFIX = re.compile(
+    r"^(?:(?:if|elif|while|until|then|do|else|!|nice|nohup|exec|command|time)\s+"
+    r"|[A-Za-z_][A-Za-z0-9_]*=\S*\s+"
+    r"|env(?:\s+-\S+)*(?:\s+[A-Za-z_][A-Za-z0-9_]*=\S*)*\s+)+")
+_BOUND = re.compile(r'^bounded\s+"\$BOUND_[A-Z]+"\s+')
+
+
+def _command_positions() -> list[tuple[str, bool]]:
+    """Every (binary, bounded?) occurrence at a command position anywhere in the script:
+    continuation lines joined, comments and heredoc bodies dropped, each line split at the
+    shell's separators, the prefixes above skipped on both sides of `bounded`."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    text = text.replace("\\" + NL, " ")
+    found: list[tuple[str, bool]] = []
+    in_heredoc = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if in_heredoc:
+            in_heredoc = line != "EOF"  # stay in the body until the terminator
+            continue
+        if "<<'EOF'" in line or "<<EOF" in line:
+            in_heredoc = True
+            line = line.split("<<", 1)[0]
+        if not line or line.startswith("#"):
+            continue
+        line = re.sub(r"\s#.*$", "", line)
+        for segment in _SEPARATORS.split(line):
+            segment = _PREFIX.sub("", segment.strip())
+            if not segment:
+                continue
+            bounded = _BOUND.match(segment) is not None
+            if bounded:
+                segment = _PREFIX.sub("", _BOUND.sub("", segment))
+            if not segment:
+                continue
+            first = segment.split(maxsplit=1)[0]
+            if first in BOUNDED_BINARIES or _TREE_BINARY.match(first):
+                found.append((first, bounded))
+    return found
+
+
+def test_every_external_binary_in_the_checks_is_bounded() -> None:
+    """TEXTUAL, and named as such -- the template's own rule ("a wiring guard in the tests is
+    what keeps 'every binary is bounded' true after the next edit"). Enumerates rather than
+    searches: every occurrence of every listed binary at a command position must be wrapped,
+    and every listed binary must occur at least once, so a rename cannot make the guard
+    vacuous. MUTATIONS (each reddens): drop `bounded "$BOUND_CMD"` from one runuser call; add
+    `if ! runuser ...; then` or `FOO=1 runuser ...` unbounded; pipe journalctl into head; call
+    "${T}/venv/bin/pip" unbounded. A binary hidden behind a variable is the documented limit."""
+    found = _command_positions()
+    unbounded = [name for name, bounded in found if not bounded]
+    assert not unbounded, f"unbounded at a command position: {unbounded}"
+    seen = {name for name, _ in found}
+    missing = [name for name in BOUNDED_BINARIES if name not in seen]
+    assert not missing, f"never found at a command position (renamed?): {missing}"
