@@ -704,4 +704,100 @@ new entry.
   and that a text syslog file may cut a very long `sent via` line where the
   journal keeps it whole.
 
+- `[internal]` **Linux stage: the installed script proven on a real host -- as a
+  service user, through a real logrotate, into the journal, against the lock and
+  the mode bits** (#14). `tools/linux_stage.sh`'s `run_native_checks()` replaces
+  the kit template's two example checks (`uname`, `systemd is PID 1`) with eight
+  that assert properties of logalert, keyed on a `mktemp -d` tree its trap
+  removes, nothing on the host outside it touched (pip's cache is pointed into
+  it), no user created, no unit installed, nothing mailed anywhere (the "MTA" is
+  `tests/fake_sendmail.py` under the venv's shebang); the residue is this run's
+  records in the host's logs (the journal, the syslog file rsyslog mirrors it
+  into, `runuser`'s session lines in `auth.log`). Every host binary that can
+  stall (`python3`, `cp` over the 9p mount, the venv and its pip, the installed
+  script, `runuser`, `logrotate`, `journalctl`) sits behind `bounded
+  "$BOUND_..."` with its exit code read first, 124 a skip; the stage's own
+  helpers (`body.py`, `offset.py`, `journal.py` under the temp venv's
+  interpreter) are bounded too, but a 124 there is a red naming the mail, the
+  state or the filter -- never a pass -- and a `systemctl is-active` that does
+  not answer is treated as journald absent (the `/var/log/syslog` check runs
+  instead); every skip names its cause and is red under
+  `LOGALERT_CHECK_MODE=required` (CI), tolerated in auto mode (the Windows gate,
+  which delegates into the sandbox). The checks: **preconditions** -- `python3`
+  names its minor and that `python3.X` must be on PATH (a VERSIONED interpreter,
+  `INSTALL.md`'s rule), `runuser`, `logrotate`, `gzip`, the service user
+  (`nobody`, `LOGALERT_STAGE_USER` to choose another); **install** -- the source
+  copied out of the checkout (read-only over 9p in the sandbox; pip builds
+  in-tree) and built into a wheel by the temp venv's own pip (an isolated build
+  that fetches `setuptools>=77` once, so the network is needed; its absence is
+  could-not-check, not a red naming the wheel), installed with `--no-deps`, the
+  console script symlinked into a bin directory the way `INSTALL.md` prescribes:
+  `logalert --version` through the symlink equals `version = "..."` in
+  `pyproject.toml`, and the script's shebang is the venv's interpreter;
+  **service user** -- as `nobody`, over a fixture log that holds a MATCHING line
+  before the first run: first sight exits 0 with 0 bytes on both streams and
+  mails nothing (a run from the beginning would mail that line), a new matching
+  line is one mail from `alerts@example.net` to `noc@example.net` carrying it,
+  exit 0 and quiet, the state's offset for the file equal to its size;
+  **rotation** -- a matching line, a REAL `logrotate -f` with `compress`, a
+  matching line in the fresh file: one mail, the report opening with the rotated
+  copy's `==> ... <==` header, the pre- and post-rotation lines once each and
+  the line mailed BEFORE the rotation never (mail bodies are read decoded -- a
+  temp path makes a summary line longer than 78 characters, and the body then
+  travels quoted-printable where `==>` is `=3D=3D>`); **lock** -- the holder's
+  fake sendmail sleeps 3 s, the second run is launched once the fake has
+  recorded the call and runs with `--log file:` under the fake's directory, and
+  the turn-away must be OBSERVED there (`this run exits quietly`, #12's line) --
+  ⭐ the review found the first version's assertions (one mail, two quiet exits)
+  satisfied by two runs that never overlapped, and the mutation it named
+  reddening only by timing; an unobserved overlap is could-not-check now;
+  **syslog** -- after `journalctl --sync`, the records naming the temp tree
+  carry `SYSLOG_IDENTIFIER=logalert` and the service user's `_UID`, and a run
+  with `--log stderr` leaves its records on stderr and none in the journal
+  (`/var/log/syslog` when journald is absent; a skip when both are); ⭐ every
+  `journalctl` is read through a file with its exit code first -- through a
+  pipe, a query that hung or refused printed `the journal holds 0 record(s)`,
+  byte for byte the red the `ident dropped` mutation prints, so a journal-side
+  fault would have sent the reader to `activity.py`; **permission** -- a `0600`
+  root-owned log beside a readable one in a section: exit 1, exactly one stderr
+  line naming it with `Permission denied`, the sibling's match mailed and its
+  state advanced (the EACCES case pytest cannot establish on Windows or in the
+  root sandbox); **modes** -- the state file `600`, the lock `644`, the
+  directory still `750`, all the service user's. ⭐ Also from the review: the
+  tree inherited the caller's umask, so `sudo` from a dev user with 027 or 077
+  turned every service-user check red with `Permission denied` lines blaming the
+  product (`umask 022` first); an unchecked `mktemp -d` under an unwritable
+  `TMPDIR` left the tree variable empty and laid `/logs`, `/fake`, `/conf2` and
+  the two helper scripts out at the filesystem root as root (measured on a copy
+  stopped before the install; the real script's next lines head for `/venv`,
+  `/bin/sendmail` and `/state`), which the trap correctly refused to remove
+  (checked; a skip); `cleanup()` killed the lock check's subshell and not the
+  run beneath it, which logged `state not saved` under the removed tree (it
+  signals the `timeout` child, which forwards down the chain); the interpreter
+  probe discarded `python3`'s stderr, reporting a loader failure as a PATH
+  problem. Every check that asserts logalert (seven of the eight; preconditions
+  asserts the host) reddens under a mutation of logalert of one line (two for
+  the cursors never saved), applied to the checkout and measured through the
+  stage in the sandbox (the wheel is built from the checkout) -- `__version__`
+  hardcoded; the summary printed on exit 0; the cursors never saved; a rotated
+  file read as a plain continue; the archive re-read from offset 0; every first
+  sight from the beginning; a fresh lock holder as a failed item; the syslog
+  ident dropped; an unreadable file ending its section; the state file `0644`;
+  the lock `0600` -- eleven, every one naming its check in the verdict line.
+  Re-measured after the fixes: green under `required` in 8 s, green under `umask
+  077`, an unreachable index a skip in auto mode, a refusing `journalctl` named,
+  a SIGTERM mid-check leaving no process, no tree and no record.
+  `tests/test_linux_stage.py` gains the wiring guard the template asked for and
+  the kit never wrote: every listed binary (`runuser`, `logrotate`,
+  `journalctl`, `systemctl`, `cp` -- the one copy reads the 9p mount --
+  `python3`, and any command under the temp tree or the versioned interpreter,
+  however quoted) at a command position must be wrapped, prefixes (`if`, `!`,
+  `then`, `while`, a bare `VAR=x`, `env`) stripped on both sides of the bound,
+  heredoc bodies and comments dropped, the whole file scanned, and every listed
+  name found at least once so a rename cannot make the guard vacuous; the
+  delegation tests are unchanged. CLAUDE.md's expected-skips paragraph is
+  unchanged (the stage's own skips are announced in its output, not pytest's).
+  The stage is what CI runs natively on the three legs under `required` from
+  this commit on; the journal side is the check #13 deferred here.
+
 [Unreleased]: https://github.com/IjonTichy1970/logalert/commits/main
