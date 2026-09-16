@@ -24,6 +24,12 @@ its notes.
   `starttls()` without the context passed the whole suite, and the stdlib's
   default there verifies nothing.
 
+- `[contract]` **The run lock is `0600`; a stale-lock line says when the
+  recorded holder is gone** (#27). `flock` needs no write access, so a lock any
+  local user could open read-only was a lock any local user could hold. A lock
+  left `0644` by 0.1.0 is tightened by the next run; the gone-holder line points
+  at `fuser` instead of a dead PID.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

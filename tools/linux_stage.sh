@@ -731,12 +731,12 @@ EOF
   dr="$(stat -c '%a %U' "$T/state" 2>/dev/null)"
   if [ "$st" != "600 $SVC" ]; then
     fail "the state file is '$st', not '600 $SVC'" "mode-state"
-  elif [ "$lk" != "644 $SVC" ]; then
-    fail "the lock is '$lk', not '644 $SVC'" "mode-lock"
+  elif [ "$lk" != "600 $SVC" ]; then
+    fail "the lock is '$lk', not '600 $SVC'" "mode-lock"
   elif [ "$dr" != "750 $SVC" ]; then
     fail "the state directory is '$dr' after the runs, not the '750 $SVC' it was created with" "mode-dir"
   else
-    ok "state file 600, lock 644, directory 750, all owned by $SVC"
+    ok "state file 600, lock 600, directory 750, all owned by $SVC"
   fi
 }
 

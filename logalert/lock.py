@@ -12,6 +12,14 @@ design is that a blocked run logs the holder's PID and age and exits 0 quietly -
 overlap is normal -- while a holder older than ``lock_stale`` seconds is a stuck run, which
 must not silence the watcher forever: one stderr line and exit 1.
 
+The lock file is ``0600`` (issue #27): ``flock`` needs no write access, so a lock any local
+user could open read-only was a lock any local user could hold, silently, for ``lock_stale``
+and then with a stale-lock line blaming the last real run's PID. A lock left at ``0644`` by
+an earlier version is tightened by the next holder that owns it. On POSIX a stale verdict
+also says when the recorded holder is no longer a process (``os.kill(pid, 0)``: ``ESRCH``),
+so the line points at ``fuser`` instead of a dead PID; Windows has no harmless probe
+(``os.kill(pid, 0)`` terminates there), so the line is unchanged.
+
 The descriptor is held until exit and is never inherited by children (``os.open`` descriptors
 are non-inheritable). ``flock`` locks travel with the open file description, so the lock
 outlives a fork of the holder; on Windows ``msvcrt.locking`` is per handle. The locked byte
@@ -50,11 +58,16 @@ class LockBusy(Exception):
         moment = time.time() if now is None else now
         self.age: float | None = None if started is None else max(0.0, moment - started)
         self.stale = self.age is not None and self.age > stale_after
+        # only a stale verdict is worth the probe: a fresh one is normal cron overlap
+        self.holder_gone: bool | None = holder_gone(pid) if self.stale else None
         super().__init__(self.describe())
 
     def describe(self) -> str:
         who = f"PID {self.pid}" if self.pid is not None else "an unknown process"
         age = f"{self.age:.0f}s" if self.age is not None else "an unknown time"
+        if self.holder_gone:
+            return (f"the recorded holder PID {self.pid} is gone; another process holds the "
+                    f"lock {self.path} (fuser {self.path} names it)")
         return f"another run ({who}) has held the lock {self.path} for {age}"
 
 
@@ -72,8 +85,9 @@ class RunLock:
         # otherwise be truncated and written through by a root run
         flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
                  | getattr(os, "O_NOFOLLOW", 0))
-        fd = os.open(self.path, flags, 0o644)
+        fd = os.open(self.path, flags, 0o600)
         try:
+            _tighten(fd)  # before the lock: a held legacy 0644 lock would otherwise stay so
             _lock(fd)
         except OSError as exc:
             if exc.errno not in _BUSY_ERRNOS:
@@ -115,6 +129,39 @@ class RunLock:
 
     def __exit__(self, *exc: object) -> None:
         self.release()
+
+
+def holder_gone(pid: int | None) -> bool | None:
+    """Whether the process the lock file names is gone: True for ``ESRCH``, and for ``EPERM``
+    too -- the lock is ``0600``, so a live process of another user with that PID cannot be
+    the holder; the PID was reused. False when it exists as ours. None when nothing can be
+    said: no PID, a number no kernel could have handed out (a hand-edited line), or Windows,
+    where ``os.kill(pid, 0)`` would terminate it."""
+    if sys.platform == "win32" or pid is None or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return True
+    except OverflowError:  # a PID that does not fit a C int
+        return None
+    return False
+
+
+def _tighten(fd: int) -> None:
+    """A lock we own that is readable by others (left by an earlier version) becomes
+    ``0600``; a failure here is not the lock's business."""
+    if sys.platform == "win32":
+        return
+    try:
+        st = os.fstat(fd)
+        if st.st_mode & 0o077 and st.st_uid == os.geteuid():
+            os.fchmod(fd, 0o600)
+            log.info("the lock was mode %04o; now 0600", st.st_mode & 0o777)
+    except OSError:
+        pass
 
 
 def _write_holder(fd: int, info: bytes) -> None:
