@@ -20,6 +20,10 @@ its notes.
   every host, and a test pins the floor, the classifiers, the CI matrix and
   the documents together.
 
+- `[internal]` **A test pins STARTTLS to a verifying SSL context** (#40).
+  `starttls()` without the context passed the whole suite, and the stdlib's
+  default there verifies nothing.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

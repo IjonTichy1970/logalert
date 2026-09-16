@@ -11,7 +11,9 @@ import json
 import logging
 import os
 import re
+import smtplib
 import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -340,6 +342,32 @@ def test_starttls_accepted_without_a_handshake_is_a_named_failure() -> None:
                      local_hostname="router1.example.net", timeout=5)
     assert str(exc.value).startswith(("SSLError: ", "ConnectionAbortedError: ", "SSLEOFError: "))
     assert "STARTTLS" in server.verbs()
+
+
+def test_starttls_hands_smtplib_a_verifying_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """USAGE.md promises the platform's default certificate verification and never a silent
+    downgrade (issue #40). A ``starttls()`` with no context passed the whole suite, and the
+    stdlib's own default there is ``_create_unverified_context`` -- verification gone while
+    mail keeps flowing. The spy ends the session with the exception ``via_smtp`` already
+    names, so no certificate and no TLS stub is needed."""
+    seen: list[object] = []
+
+    def spy(self: smtplib.SMTP, *, context: object = None) -> None:
+        seen.append(context)
+        raise smtplib.SMTPNotSupportedError("STARTTLS extension not supported by server.")
+
+    monkeypatch.setattr(smtplib.SMTP, "starttls", spy)
+    with run_stub(StubConfig(advertise_starttls=True)) as server:
+        with pytest.raises(DeliveryError, match="^SMTPNotSupportedError: "):
+            via_smtp(dotted_mail(), "127.0.0.1", server.port, starttls=True,
+                     local_hostname="router1.example.net", timeout=5)
+        server.wait_idle()
+    assert len(seen) == 1
+    context = seen[0]
+    assert isinstance(context, ssl.SSLContext), context
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    assert "MAIL" not in server.verbs()
 
 
 # -- the From -----------------------------------------------------------------------------------
