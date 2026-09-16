@@ -2,4 +2,9 @@ include README.md
 include INSTALL.md
 include CHANGELOG.md
 include LICENSE
-# Add "recursive-include docs *.md" once a docs/ directory exists (build warns if it is absent).
+recursive-include docs *.md
+# The sdist is a source snapshot of the package and its documents, not a test bed: setuptools
+# would otherwise pull tests/test_*.py in without the helpers, tools/ and the files they read
+# (CLAUDE.md, .github/), a suite that fails at import for whoever unpacks it. The wheel is the
+# product; the tests live in the repository.
+prune tests

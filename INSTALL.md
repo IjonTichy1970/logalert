@@ -99,7 +99,132 @@ ls /opt/logalert-venv                      # bin include lib [lib64] pyvenv.cfg 
 ```
 
 Run these once after install and again after any Python upgrade. The first line
-alone catches the alias problem before it bites.
+alone catches the alias problem before it bites. Once a configuration and a mail
+transport exist (steps 5 and 6), `logalert --check-config` and `logalert
+--test-mail SECTION` complete the check: the settings as logalert reads them,
+and one real message through the transport.
+
+### 5. Configuration and state
+
+logalert reads `/etc/logalert.conf` and keeps its state under
+`/var/lib/logalert` -- both **outside** the venv, which the upgrade and
+uninstall procedures below wipe whole. The state directory must be owned by the
+user the scheduled run executes as: the run writes the state file (`0600`) and
+the run lock there, and a run as root against another user's state directory is
+refused so that it cannot leave root-owned files the real user then cannot
+touch. A dedicated system user is the usual choice:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin logalert
+sudo install -d -o logalert -g logalert -m 750 /var/lib/logalert
+sudo sh -c 'logalert --example-config > /etc/logalert.conf'
+```
+
+Edit `/etc/logalert.conf`: at least one watch section with `subject`, `to`,
+`files` and a pattern, and `from = ` in `[logalert]` unless the default (the
+running user at this host's name) travels on your mail system. The file must be
+readable by the service user and the watched logs must be too (the `adm` group
+reads the syslog files under `/var/log` on Debian and Ubuntu: `sudo usermod -aG
+adm logalert`). The check that reads the file back is at the end of step 6: it
+needs the mail transport to exist first.
+
+### 6. Mail
+
+The default transport hands each message to the local `/usr/sbin/sendmail`; a
+fresh server has none, and logalert refuses to start rather than run without
+one (`transport = auto but /usr/sbin/sendmail does not exist: install an MTA
+...`). Install one and point it at your mail server -- Postfix, `dma` or
+`msmtp-mta` on Debian and Ubuntu (`dma` is in FreeBSD's base) -- or set
+`transport = smtp` and `smtp_host` in `[logalert]` to hand messages to a relay
+directly. Then, as the service user:
+
+```bash
+sudo -u logalert logalert --check-config
+sudo -u logalert logalert --test-mail router-disk
+```
+
+The first prints the effective settings and every file each watch will read,
+exit 0 when the configuration is usable and 2 when it is not (before this step,
+on a host without an MTA, it is exit 2 with `transport = auto but
+/usr/sbin/sendmail does not exist ...`, and so is every run: nothing is read
+until the transport exists). It touches neither the state nor the log
+destination -- nor does it look for the state directory; the first run does. The
+second sends one real one-line message to that section's recipients and prints
+the transport's answer (exit 0 accepted, 1 not delivered, 2 configuration).
+"Accepted for queueing" means the MTA took it; `mailq` shows whether it left. A
+root `logalert -n` (dry run) is safe too: it reads, prints what it would send,
+and creates nothing. [docs/USAGE.md](docs/USAGE.md#mail) covers the transports,
+the From address and what an alert looks like.
+
+### 7. Schedule it
+
+logalert has no daemon mode: every run reads, mails, saves and exits. **cron**,
+in the service user's crontab (`sudo crontab -u logalert -e`):
+
+```
+MAILTO=noc@example.net
+*/5 * * * * /usr/local/bin/logalert
+```
+
+The absolute path is what carries the venv (cron's `PATH` is a short fixed one
+that need not include `/usr/local/bin`, and the symlink's shebang picks the
+venv's interpreter); `MAILTO` is where the one line of a failed run goes. A run
+that finds nothing prints nothing, so cron mails nothing.
+
+**systemd**, as a oneshot service and a timer -- an absolute `ExecStart`, the
+service user, no daemonising:
+
+```
+# /etc/systemd/system/logalert.service
+[Unit]
+Description=logalert run
+
+[Service]
+Type=oneshot
+User=logalert
+ExecStart=/usr/local/bin/logalert
+
+# /etc/systemd/system/logalert.timer
+[Unit]
+Description=Run logalert every five minutes
+
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemd-analyze verify /etc/systemd/system/logalert.service /etc/systemd/system/logalert.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now logalert.timer
+```
+
+`systemd-analyze verify` prints nothing when the units are sound. Under a timer
+nothing mails the one line of a failed run; it is in the journal (next section)
+at info, and `journalctl -p err -t logalert` finds each failed item's ERROR
+record, the same text. Keep the default `log = syslog`
+under a timer -- [docs/USAGE.md](docs/USAGE.md#running-it) explains why.
+
+### 8. Where the log is
+
+Every run records what it did -- the files read, the lines matched, each message
+sent with its recipients and `Message-ID`, every failure -- through syslog by
+default, tagged `logalert`. On a systemd host:
+
+```bash
+journalctl -t logalert
+journalctl -p warning -t logalert --since today
+```
+
+Without `journalctl`, the syslog daemon's file for `user`-facility messages
+holds the same lines: `/var/log/syslog` on Debian and Ubuntu (readable by root
+and the `adm` group), `/var/log/messages` on Red Hat. For a file of logalert's
+own, set `log = file:/var/log/logalert.log` in `[logalert]` -- a path the
+service user can write -- or `log = stderr` to see the records on the terminal.
+`--log DEST` picks any of these for one run.
 
 ## Keep the venv directory disposable
 
@@ -142,8 +267,8 @@ Two traps:
 
 ## Uninstall
 
-Stop any running logalert process (and disable its service unit, if you created
-one) first.
+Stop the schedule first: `sudo crontab -u logalert -r`, or `sudo systemctl
+disable --now logalert.timer` and remove the two unit files. Then:
 
 ```bash
 sudo rm /usr/local/bin/logalert
@@ -151,7 +276,8 @@ ls /opt/logalert-venv           # look inside first — anything of yours in her
 sudo rm -rf /opt/logalert-venv
 ```
 
-Configuration and state files are left for you to remove deliberately.
+`/etc/logalert.conf`, `/var/lib/logalert` (the state and the lock) and the
+`logalert` user are left for you to remove deliberately.
 
 ## Troubleshooting
 
@@ -164,6 +290,10 @@ Configuration and state files are left for you to remove deliberately.
 | `sudo: logalert: command not found` | No symlink in a `secure_path` directory | Create the `/usr/local/bin` symlink (step 3) or use the absolute venv path |
 | `pip install logalert` fails or installs the wrong thing | logalert is not published to PyPI | Install from the release wheel (step 2) |
 | A rebuild (`--clear`) or uninstall removed my config / launcher | They were stored inside the venv directory | Restore from backup; keep them outside ([Keep the venv directory disposable](#keep-the-venv-directory-disposable)) |
+| `state directory /var/lib/logalert does not exist -- create it, owned by the user logalert runs as` (exit 1) | Step 5 was skipped, or the run is under a different user's `state_file` | Create it, owned by the service user (step 5); a root run never creates it for you |
+| `state directory ... belongs to <user>; a run as root would leave the state and the lock root-owned ...` (exit 1) | `sudo logalert` against the service user's state | Run as that user: `sudo -u logalert logalert ...` |
+| `transport = auto but /usr/sbin/sendmail does not exist: install an MTA ...` (exit 2) | No mail transfer agent on the host | Install one, or `transport = smtp` with `smtp_host` (step 6) |
+| `[section] /var/log/x.log: Permission denied` (exit 1) | The service user cannot read that log | `sudo usermod -aG adm logalert` on Debian/Ubuntu, or a group/ACL of your own (step 5) |
 
 ## Platform notes
 

@@ -257,9 +257,11 @@ Constraints the watcher's design must satisfy to fit that pattern:
 - Claim in classifiers only what CI tests: `Operating System :: POSIX :: Linux`
   once the watcher lands; "BSD known to work but ungated" belongs in prose, not
   metadata.
-- Once the CLI exists, `INSTALL.md` still needs: the service unit (absolute
-  `ExecStart`, foreground flag), the config/state paths, and a non-`journalctl`
-  way to find logs.
+- `INSTALL.md` carries, after the venv steps: the config and state paths with
+  the service user, the mail transport, the schedule (the cron line and the
+  `Type=oneshot` unit + timer with an absolute `ExecStart` -- there is no daemon
+  mode, so no foreground flag), and a non-`journalctl` way to find the log.
+  `tests/test_install_doc.py` pins the unit and the cron line to `USAGE.md`'s.
 
 ## Public-repo hygiene
 
