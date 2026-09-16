@@ -29,7 +29,8 @@ jobs:
     strategy:
       matrix:
         # MUST mirror the "Programming Language :: Python :: 3.x" classifiers in pyproject.toml
-        python-version: ["3.12", "3.13", "3.14"]
+        # (tests/test_install_doc.py pins the two together with requires-python); 3.11 is the floor
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
         with:

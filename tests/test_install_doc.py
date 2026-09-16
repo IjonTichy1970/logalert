@@ -93,6 +93,37 @@ def test_the_classifiers_claim_linux_and_nothing_else() -> None:
     assert systems == ["Operating System :: POSIX :: Linux"]
 
 
+def test_the_python_floor_is_one_number_in_metadata_ci_and_the_documents() -> None:
+    """The classifier rule (#53): claim only what CI tests. `requires-python`'s floor, the
+    `3.x` classifiers and ci.yml's matrix are one set, and README.md, INSTALL.md and CLAUDE.md
+    name that floor -- a leg dropped from the matrix or a floor bumped alone reddens here."""
+    with open(REPO_ROOT / "pyproject.toml", "rb") as handle:
+        project = tomllib.load(handle)
+    floor = re.fullmatch(r">=3\.(\d+)", project["project"]["requires-python"])
+    assert floor is not None, project["project"]["requires-python"]
+    versions = sorted(int(c.rsplit(".", 1)[1]) for c in project["project"]["classifiers"]
+                      if re.fullmatch(r"Programming Language :: Python :: 3\.\d+", c))
+    assert versions and versions[0] == int(floor.group(1)), (versions, floor.group(0))
+    assert versions == list(range(versions[0], versions[-1] + 1)), versions  # no gap
+    matrix = re.search(r'python-version: \[([^\]]+)\]', _text(".github/workflows/ci.yml"))
+    assert matrix is not None, "the matrix line moved"
+    legs = sorted(int(v.strip().strip('"').split(".")[1]) for v in matrix.group(1).split(","))
+    assert legs == versions, (legs, versions)
+    said = f"3.{versions[0]} or newer"
+    for name in ("README.md", "INSTALL.md"):
+        text = _text(name)
+        assert said in text, f"{name} does not say {said!r}"
+        stale = re.search(r"3\.\d+ or newer", text.replace(said, ""))
+        assert stale is None, (name, stale and stale.group(0))
+        # a claim or an example command naming a version BELOW the floor is always stale
+        # (a bare `python3.7` in prose about an old distribution is not a claim and is left alone)
+        for token in re.finditer(r"(?:python3\.(\d+) -m venv|py -3\.(\d+) -m venv"
+                                 r"|3\.(\d+)-or-newer|[Ff]loor (?:is |\()3\.(\d+))", text):
+            minor = int(next(g for g in token.groups() if g))
+            assert minor >= versions[0], (name, token.group(0), f"floor is 3.{versions[0]}")
+    assert f"currently 3.{versions[0]}" in _text("CLAUDE.md"), "CLAUDE.md's Versioning bullet"
+
+
 def test_the_minimum_watch_install_names_loads(tmp_path: Path) -> None:
     """INSTALL.md's own statement of the smallest watch: a section built from exactly the
     keys that sentence names must load (the review found `subject` missing from it)."""

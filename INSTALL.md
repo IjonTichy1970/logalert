@@ -12,8 +12,8 @@ system Python, reproducible, and disposable: rebuilding it is remove + recreate
 
 ## Requirements
 
-- Python **3.12 or newer**, available as a **versioned** binary (`python3.12`,
-  `python3.13`, …). The venv must be created with that versioned name — step 1
+- Python **3.11 or newer**, available as a **versioned** binary (`python3.11`,
+  `python3.12`, …). The venv must be created with that versioned name — step 1
   explains why.
 - `pip` and the `venv` module. Debian/Ubuntu ship `venv` separately: `apt
   install python3.12-venv` (match your version).
@@ -32,9 +32,9 @@ Commands that touch `/opt` or `/usr/local` need root; they are shown with
 sudo python3.12 -m venv /opt/logalert-venv
 ```
 
-`python3.12` is an **example** — use whichever 3.12-or-newer version you have
-(`python3.13 -m venv …` on a 3.13 box). The rule is to name *a* version, never
-bare `python3`.
+`python3.12` is an **example** — use whichever 3.11-or-newer version you have
+(`python3.11 -m venv …` on Debian 12, `python3.13 -m venv …` on a 3.13 box).
+The rule is to name *a* version, never bare `python3`.
 
 Why: a venv is bound to the Python minor version that created it. Its packages
 live in `lib/python3.X/site-packages`, and its `bin/python` resolves (via

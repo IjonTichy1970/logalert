@@ -39,7 +39,7 @@ key, rotation, mail, logging, troubleshooting).
 
 - **Linux.** That is what CI tests and the release is gated on. FreeBSD follows
   the same steps and is expected to work, but nothing gates it yet.
-- **Python 3.12 or newer, as a versioned binary** (`python3.12`, `python3.13`,
+- **Python 3.11 or newer, as a versioned binary** (`python3.11`, `python3.12`,
   ...): the deployment venv must be created with the versioned name, for a
   reason [INSTALL.md](INSTALL.md) explains.
 - **A mail transfer agent** providing `/usr/sbin/sendmail` (Postfix, dma,
@@ -71,19 +71,24 @@ and a troubleshooting table.
 - [docs/USAGE.md](docs/USAGE.md) -- options, configuration reference, position
   tracking and rotation, running it, mail, logging, troubleshooting.
 - [INSTALL.md](INSTALL.md) -- installing, configuring, scheduling, upgrading.
-- [CHANGELOG.md](CHANGELOG.md) -- every change, with the decisions behind it;
-  rendered at <https://ijontichy1970.github.io/logalert/>.
+- [CHANGELOG.md](CHANGELOG.md) -- every change, each linked to the issue that
+  holds the decisions behind it; rendered at
+  <https://ijontichy1970.github.io/logalert/>.
 
 ## Development
 
 Developed on Windows, run on Linux. Create the venv with a **versioned**
-interpreter (the oldest supported version is the one to develop against), then
-install the package in editable mode with the dev and docs extras:
+interpreter, then install the package in editable mode with the dev and docs
+extras:
 
 ```bash
 python3.12 -m venv .venv            # Windows: py -3.12 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev,docs]"   # Windows: .venv/Scripts/python.exe
 ```
+
+The floor is 3.11, and CI's 3.11 leg is the authority for it: develop against
+3.11 where you have it; where you do not, a native run on 3.11 before the push
+predicts what that leg will say.
 
 The gate is one file, `tools/gate.sh`, and it is the only definition of green.
 Run it with the venv's interpreter first on PATH and read its exit code directly

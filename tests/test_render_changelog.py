@@ -194,6 +194,42 @@ def test_structural_defects_are_exit_1_naming_the_line(
         parse(mutant)
 
 
+def _entry_of(lines: int) -> str:
+    """A well-formed entry that occupies exactly ``lines`` lines in the file."""
+    first = "- `[internal]` **A short headline** (#9). One sentence."
+    return NL.join([first] + ["  and a continuation line of the body."] * (lines - 1)) + NL
+
+
+def test_an_entry_over_the_line_cap_is_a_defect_naming_the_line_and_the_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One bold sentence, then at most three short sentences (#60): the cap is the entry's
+    lines in the file, headline included. Exactly the cap parses; one more is exit 1. A
+    mutation that lifts ``MAX_ENTRY_LINES`` passes the long entry and reddens here."""
+    cap: int = tool.MAX_ENTRY_LINES
+    assert cap == 6  # the About section says six; the two are one rule
+    fits = FIXTURE.replace(RELEASED, RELEASED + _entry_of(cap) + NL)
+    assert fits != FIXTURE and len(parse(fits).versions[1].entries) == 2
+    over = FIXTURE.replace(RELEASED, RELEASED + _entry_of(cap + 1) + NL)
+    line = over.split(NL).index("- `[internal]` **A short headline** (#9). One sentence.") + 1
+    with pytest.raises(Defect) as exc:
+        parse(over)
+    assert str(exc.value).startswith(f"CHANGELOG.md:{line}: an entry of {cap + 1} lines: at most"
+                                     f" {cap} ")
+    assert "reflow the block first" in str(exc.value)
+    assert str(exc.value).endswith(repr(_entry_of(1).rstrip(NL)))  # quotes the FIRST line
+    assert main(["--check", "--changelog", str(write(tmp_path, over))]) == EXIT_DEFECT
+    assert f"an entry of {cap + 1} lines" in capsys.readouterr().out
+    # a whitespace-only line after the entry is a blank line, not a seventh entry line
+    # (review: two spaces alone passed the continuation test before the blank test)
+    spaced = FIXTURE.replace(RELEASED, RELEASED + _entry_of(cap) + "  " + NL + NL)
+    assert spaced != fits and len(parse(spaced).versions[1].entries) == 2
+    # the grammar is checked first: a long AND untagged entry is reported as untagged
+    untagged = over.replace("- `[internal]` **A short", "- **A short")
+    with pytest.raises(Defect, match=r"without a \[contract\] / \[internal\] tag"):
+        parse(untagged)
+
+
 def test_the_about_sections_policy_bullets_are_not_entries() -> None:
     """The About section's `- **`[contract]`** ...` lines describe the tags; they are not
     entries and not defects (a parser keyed on `- ` alone would refuse the real file), and a
@@ -221,6 +257,9 @@ def test_the_real_changelog_is_structurally_sound() -> None:
     assert changelog.versions[0].name == "Unreleased"
     assert "**Everything gets an entry.**" in changelog.about  # the doctrine lives there
     assert "**Everything gets an entry.**" not in changelog.header
+    # the About section states the cap in words; the tool enforces it (#60) -- one rule
+    words = {4: "four", 5: "five", 6: "six", 7: "seven", 8: "eight"}
+    assert f"An entry is at most {words[tool.MAX_ENTRY_LINES]} lines" in changelog.about
     assert all(entry.tag in ("contract", "internal")
                for version in changelog.versions for entry in version.entries)
     assert sum(len(v.entries) for v in changelog.versions) >= 15

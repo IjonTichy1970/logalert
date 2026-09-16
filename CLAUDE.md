@@ -93,8 +93,13 @@ sandbox). Never run two gates against the sandbox at once.
   `--version`), a `[project.scripts]` change (the new console script is
   otherwise missing from `.venv/Scripts/`), or a `dependencies` change.
 - `requires-python`, the `Programming Language :: Python :: 3.x` classifiers and
-  the CI matrix in `.github/workflows/ci.yml` stay in sync (currently 3.12 /
-  3.13 / 3.14).
+  the CI matrix in `.github/workflows/ci.yml` stay in sync (currently 3.11 /
+  3.12 / 3.13 / 3.14; `tests/test_install_doc.py` pins the three together and
+  the documents' "3.11 or newer" to them). The floor is 3.11 (#53): mypy
+  reads the 3.11 typeshed on every host (`python_version` in `pyproject.toml`
+  -- the 3.12 dev venv would otherwise pass a 3.12-only API), the sandbox's
+  `/srv/logalert-py311` venv runs the suite on it natively, and CI's 3.11 leg
+  is the authority. 3.10 is excluded outright (`datetime.UTC`).
 - MINOR when the operator-facing set gains a member or a member changes
   substantively; PATCH for corrections, tooling, docs, gate work. The
   `[contract]` tag does NOT drive a minor -- it is a release-notes signal.
@@ -205,7 +210,11 @@ ever will not serve.
   fails on the 9p mount -- copy to `/srv` first; files read over `/mnt` look
   `0777`, so copy into `mktemp -d` before asking about modes. Tests run natively
   there with `/srv/logalert-py312/bin/python -m pytest -q -p no:cacheprovider
-  --basetemp=/tmp/logalert-pytest tests` (the checkout is read-only there).
+  --basetemp=/tmp/logalert-pytest tests` (the checkout is read-only there);
+  `/srv/logalert-py311` is the same venv on the floor. Install the wheel built
+  from the tree into the venv first (`--no-index --find-links`): the tests
+  that spawn a second process (`lock_holder.py`, `-m logalert`, the console
+  script) import the INSTALLED package, not the tree.
 - Never run two gates against the sandbox at once. End the session with `wsl
   --terminate rlyeh-sandbox`; it is the polite exit, not a repair.
 - Subagents: give each its own uniquely named scratchpad subdirectory, hand it

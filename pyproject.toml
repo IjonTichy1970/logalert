@@ -7,7 +7,7 @@ name = "logalert"
 version = "0.1.0"
 description = "Generalized log file watcher."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"             # the measured floor (#53); 3.10 lacks datetime.UTC
 license = "MIT"                        # PEP 639 SPDX string; no License:: classifier (deprecated)
 license-files = ["LICENSE"]
 authors = [{ name = "IjonTichy1970" }]
@@ -16,7 +16,8 @@ classifiers = [
     "Environment :: Console",
     "Operating System :: POSIX :: Linux",       # what CI tests (the classifier rule in CLAUDE.md)
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",   # MUST mirror the CI matrix in .github/workflows/ci.yml
+    "Programming Language :: Python :: 3.11",   # MUST mirror the CI matrix in .github/workflows/ci.yml
+    "Programming Language :: Python :: 3.12",   # (tests/test_install_doc.py pins the three together)
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: System :: Logging",
@@ -50,7 +51,7 @@ include = ["logalert*"]
 "logalert.data" = ["*.example"]   # the shipped example config (`logalert --example-config`)
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py311"   # the floor: the UP rules must not propose 3.12-only rewrites
 line-length = 100
 # `.claude/` is agent tooling: it carries the rich (emoji) style and shell-shaped strings that a
 # style tool would mangle. It is gated by BEHAVIOUR instead -- each hook's test is its own gate
@@ -65,6 +66,10 @@ ignore = ["S603", "S607"]  # subprocess with a fixed argv and a resolved executa
 
 [tool.mypy]
 strict = true
+# The floor's typeshed on every host (#53): the dev venv is 3.12, and without this a 3.12-only
+# API (`typing.override`, `itertools.batched`) passed the host's mypy and failed CI's 3.11 leg.
+# The cost: a `sys.version_info >= (3, 12)` branch would go unchecked; none exists.
+python_version = "3.11"
 exclude = ['^\.claude/', '^\.venv/']
 
 [tool.pytest.ini_options]

@@ -631,7 +631,7 @@ def test_zst_archive_is_skipped_where_unsupported(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     if sys.version_info >= (3, 14):
-        pytest.skip("3.14 reads .zst; the unsupported branch is measured on 3.12/3.13")
+        pytest.skip("3.14 reads .zst; the unsupported branch is measured on 3.11-3.13")
     path = tmp_path / "router.log"
     saved = seen(path, OLD)
     append(path, SINCE)
