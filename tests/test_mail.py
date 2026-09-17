@@ -15,8 +15,9 @@ import pytest
 from logalert import __version__
 from logalert.__main__ import main
 from logalert.config import Config, Watch, load_config
-from logalert.cursor import Line
+from logalert.cursor import Line, LogFile
 from logalert.mail import (
+    REPORT_CAP,
     Mail,
     Transport,
     attachment_name,
@@ -386,6 +387,55 @@ def test_max_lines_shows_that_many_matches_with_their_context_then_the_trailer(
     mail = compose(watch, [report], sender=SENDER, settings=config.settings, now=NOW,
                    host="router1")
     assert mail.subject.endswith("-- 4 match(es)") and mail.matched == 4
+
+
+def test_the_report_is_bounded_in_bytes_and_the_trailer_names_the_cut(tmp_path: Path) -> None:
+    """Issue #25: 200 matching lines of 16 000 non-UTF-8 bytes at the defaults made a
+    12.4 MiB message, which a relay with Postfix's default limit refuses every run -- the
+    cursors never move and the section stops alerting. The report is cut at REPORT_CAP
+    bytes of text, measured in UTF-8 (a replacement character is one ``str`` character and
+    three bytes: a cap counted in characters passes 3x the wire), and the trailer says so."""
+    config = make_config(tmp_path, "patterns =\n    disk failure\n")
+    watch = config.watches[0]
+    log = tmp_path / "router.log"
+    log.write_bytes((b"disk failure " + bytes([0xFF]) * 16000 + b"\n") * 200)
+    with LogFile("router-disk", str(log), None, from_start=True) as source:
+        report = scan(FILE, source.lines(), watch, context=0, cap=watch.max_lines)
+    assert report.matched == 200
+    text = render([report], watch.max_lines)
+    assert len(text.encode("utf-8")) <= REPORT_CAP + 200  # the cap, then the trailer line
+    shown = text.count(": disk failure")
+    assert 0 < shown < 200
+    assert text.endswith(f"... and {200 - shown} more matching line(s); the report was cut at "
+                         "1 MiB" + NL)
+    mail = compose(watch, [report], sender=SENDER, settings=config.settings, now=NOW,
+                   host="router1")
+    # the encoder picks base64 (1.37x) when the body's first ten lines carry non-ASCII, as
+    # this one-file fixture's do, and quoted-printable otherwise -- up to 3.06x for a report
+    # of three-byte characters (review: a four-file section gets QP); the bound is the QP one
+    assert len(mail.flatten("sendmail")) < 3.3 * 1024 * 1024
+    assert mail.matched == 200 and mail.subject.endswith("-- 200 match(es)")
+    # the same fixture below the cap: no cut, the old trailer
+    log.write_bytes((b"disk failure " + bytes([0xFF]) * 16000 + b"\n") * 20)
+    with LogFile("router-disk", str(log), None, from_start=True) as source:
+        small = scan(FILE, source.lines(), watch, context=0, cap=5)
+    text = render([small], 5)
+    assert text.endswith("... and 15 more matching line(s)" + NL) and "cut at" not in text
+
+
+def test_the_byte_cap_inside_the_last_window_still_says_so(tmp_path: Path) -> None:
+    """Every match shown, the cap falling on a context line: no remainder to count, the
+    trailer still names the cut so the reader knows the window is short."""
+    config = make_config(tmp_path, "patterns =\n    MATCH\n")
+    watch = config.watches[0]
+    big = "x" * 16000
+    stream = [Line("MATCH one", False, 1, FILE)] + [
+        Line(big, False, n, FILE) for n in range(2, 80)]
+    report = scan(FILE, stream, watch, context=100, cap=watch.max_lines)
+    text = render([report], watch.max_lines)
+    assert text.startswith("==> /var/log/router.log <==" + NL + "1: MATCH one" + NL)
+    assert text.endswith("... the report was cut at 1 MiB" + NL)
+    assert len(text.encode("utf-8")) <= REPORT_CAP + 100
 
 
 def test_the_budget_stops_before_the_next_matchs_window_when_windows_touch(

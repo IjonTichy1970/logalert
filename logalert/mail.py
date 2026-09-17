@@ -26,7 +26,14 @@ the bytes over and ``logalert.__main__`` (issue #12) decides when. The rules (de
   * The report is ``grep -n -C``'s vocabulary, as measured for issue #9: a ``tail``-style
     header per physical file, ``N: text`` for a match, ``N- text`` for context, ``--`` for
     omitted lines. The fragments of a cut line are one report line. At most ``max_lines``
-    matching lines per email, each with its context, then ``... and N more matching line(s)``.
+    matching lines per email, each with its context, then ``... and N more matching line(s)``
+    -- and at most ``REPORT_CAP`` bytes of report text (issue #25): a relay refuses an
+    oversized message every run, the cursors never move and the section stops alerting.
+    1 MiB of text is 1.4 MB on the wire as base64 and up to 3.2 MB as quoted-printable
+    (``set_content`` decides from the body's first ten lines: a section of four or more
+    files, or a report opening in ASCII, gets QP, which triples a three-byte character) --
+    under Postfix's 10 MB default either way. The trailer says when the cap cut the report
+    (``; the report was cut at 1 MiB``).
   * Sanitised before composition: a lone surrogate becomes ``?`` (``set_content`` raises on
     one), CR is removed (a bare CR is a line break to the encoder), every other C0 control
     except TAB, DEL and the C1 range (a raw CSI is live on a terminal that honours C1)
@@ -90,6 +97,7 @@ _UNSAFE_IN_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 _NAME_CAP = 40  # of the section's characters: the name must fit one Content-Disposition line
 #                 (measured: at 48 the stdlib folds it into RFC 2231 continuations)
 _INDENT = 12  # the summary's label column: "Message-ID: " is the widest label
+REPORT_CAP = 1024 * 1024  # bytes of report text per message (issue #25); see render()
 
 
 def clean_text(text: str) -> str:
@@ -293,6 +301,8 @@ def render(reports: Sequence[FileReport], max_lines: int) -> str:
     shown = 0
     total = sum(report.matched for report in reports)
     done = False
+    size = 0  # UTF-8 bytes of the report so far, newlines included
+    capped = False
     for report in reports:
         if done:
             break
@@ -310,26 +320,38 @@ def render(reports: Sequence[FileReport], max_lines: int) -> str:
                 if trailing is not None or shown >= max_lines:
                     done = True
                     break
-                shown += 1
-                if shown >= max_lines:
-                    trailing = report.context
             elif trailing is not None:
                 if trailing == 0 or line.path != path:
                     done = True  # the window is spent, or closed with the file
                     break
-                trailing -= 1
+            marker = ":" if line.kind == "match" else "-"
+            block: list[str] = []
             if line.path != path:
                 if out:
-                    out.append("")
-                out.append(f"==> {clean_text(line.path)} <==")  # the header is the discontinuity
-                path = line.path
+                    block.append("")
+                block.append(f"==> {clean_text(line.path)} <==")  # the discontinuity
             elif gap:
-                out.append("--")
+                block.append("--")
+            block.append(f"{line.number}{marker} {line.text}{' [cut]' if line.cut else ''}")
+            size += sum(len(part.encode("utf-8")) + 1 for part in block)
+            if size > REPORT_CAP:
+                done = capped = True  # the byte cap: this line and everything after it wait
+                break
+            if line.kind == "match":
+                shown += 1
+                if shown >= max_lines:
+                    trailing = report.context
+            elif trailing is not None:
+                trailing -= 1
+            if line.path != path:
+                path = line.path
             gap = False
-            marker = ":" if line.kind == "match" else "-"
-            out.append(f"{line.number}{marker} {line.text}{' [cut]' if line.cut else ''}")
+            out.extend(block)
         if trailing is not None:
             done = True  # the budget is spent; the next file's lines belong to unseen matches
+    mib = f"the report was cut at {REPORT_CAP // (1024 * 1024)} MiB"
     if total > shown:
-        out.append(f"... and {total - shown} more matching line(s)")
+        out.append(f"... and {total - shown} more matching line(s){'; ' + mib if capped else ''}")
+    elif capped:  # every match shown, the cap fell inside the last window
+        out.append(f"... {mib}")
     return NL.join(out) + NL if out else ""

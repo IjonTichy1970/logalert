@@ -46,6 +46,13 @@ its notes.
   the open blocked `open(2)` for good, with the lock held; a non-blocking open
   and `fstat` on what was opened close that window.
 
+- `[contract]` **A report is cut at 1 MiB of text, and the trailer says so**
+  (#25). A message a relay refused for its size was rebuilt from the same
+  position and refused every run, and the section stopped alerting; 1 MiB is
+  1.4 MB on the wire as base64, up to 3.2 MB as quoted-printable, under a
+  default limit either way. `docs/USAGE.md` names the escapes from a message
+  refused for any other reason every run.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

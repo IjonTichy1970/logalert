@@ -167,7 +167,7 @@ The file's rules:
 | `priority` | off | `high`, `medium` or `low`. The priority system is OFF unless a section sets this or a pattern carries a tag; when on, the mail carries `X-Logalert-Priority` plus the conventional `X-Priority` (`1`/`3`/`5`) and `Importance` (`high`/`normal`/`low`), the highest across the mail's matches. A pattern can carry its own tag: `[high] Requesting reboot` (lowercase, one space); any other bracketed prefix is part of the literal. |
 | `report` | `inline` | `inline` puts the report in the body; `attachment` attaches it as `<section>-<YYYYmmddTHHMM>.txt`, the section name reduced to ASCII letters, digits, `.`, `_` and `-` and cut to 40 characters (see [Mail](#mail)). The body opens with a summary either way. `--attach` forces the attachment for one run. |
 | `context` | the command line's `-c` | Lines of context before and after each match, like `grep -C`. Context never crosses from one file into another. |
-| `max_lines` | `200` | At most this many MATCHING lines per email, each with its context, then one trailer `... and N more matching line(s)` with the exact remainder. |
+| `max_lines` | `200` | At most this many MATCHING lines per email, each with its context, then one trailer `... and N more matching line(s)` with the exact remainder. The report is also cut at 1 MiB of text, whatever `max_lines` says (`; the report was cut at 1 MiB` in the trailer): 1.4 MB on the wire as base64, up to 3.2 MB as quoted-printable, under a relay's default size limit either way. |
 | `start` | `end` | Where the first run of a file begins: `end` (no flood of old news) or `beginning`. |
 | `archive_dir` | the log's own directory | Where rotated copies live when they are not beside the log: logrotate's `olddir`, newsyslog's `-a`. |
 | `include_archives` | `no` | Whether a glob reads rotated copies as files of their own ([Globs](#globs)). `yes` is for directories where the dated names ARE the live files (Apache's `rotatelogs`), never for a rotating log. |
@@ -579,7 +579,13 @@ reported (`refused: <recipient> -- <reply>`) with the others delivered, exit 1
 refused recipient is not re-sent those lines (the others must not get them
 twice); every recipient refused, a rejected message, a dropped connection or no
 reply within `mail_timeout` is a failed delivery, and the section's position is
-kept so the next run re-sends it.
+kept so the next run re-sends it. A message refused for the same reason every
+run -- a relay's size limit below the 1 MiB report cap, a content filter -- is
+rebuilt from the same position and refused again: exit 1 every run, and
+everything written after the block waits behind it. The escapes: lower
+`max_lines` for one run (the message shrinks, is accepted, and the position
+moves past the whole block), an `exclude_regex` for the offending shape, or
+`--reset-state <file>`, which forgets what is pending.
 
 **`--test-mail SECTION`** sends one real one-line message to that section's
 recipients and prints what happened:
@@ -693,6 +699,7 @@ configured destination still gets INFO and above.
 | --- | --- | --- |
 | Nothing arrives, cron is quiet | The first run of a file starts at its end, so lines already there are never mailed; or the message is queued in the MTA | Append a matching line and wait for the next run, or run `logalert -n` and see what it would send; `mailq` for a queued message; `journalctl -t logalert` for what each run did |
 | `transport = auto but /usr/sbin/sendmail does not exist: ...` (exit 2) | No MTA on the host | Install one (`postfix`, `dma`, `msmtp-mta`; `dma` is in FreeBSD's base) or set `transport = smtp` and `smtp_host` |
+| The same `sendmail exit N` / `552` refusal in cron's mail every run, and nothing new from that section | The relay refuses the message for what it is (its size below the 1 MiB report cap, a content filter), and the run re-sends the same message each time -- everything behind it waits | Lower `max_lines` for one run so the block is accepted and the position moves past it; an `exclude_regex` for the shape; or `--reset-state <file>` (what is pending is forgotten). The MTA's log names the reason |
 | `... failed: [router-disk] sendmail exit 75 (EX_TEMPFAIL): ...; see the log` in cron's mail (exit 1), or `logalert: not delivered via sendmail (...): sendmail exit 75 (EX_TEMPFAIL): ...` from `--test-mail` | The MTA could not accept the message (its queue, its configuration) | The MTA's log; the run kept the section's position, so the next run re-sends (a `--test-mail` failure keeps nothing: there is no position) |
 | The same lines arrive twice | A delivery whose state could not be saved afterwards (`state not saved` in the log) -- the mail went out, then the next run re-sent it | Make the state directory writable by the running user (`state directory ... is not writable`); the run refuses to send when it cannot save, once it knows |
 | `[section] /var/log/x.log: Permission denied` (exit 1) | The running user cannot read that file; the other files of the section were processed | Grant read access (a group, ACLs) or run as a user that has it |
