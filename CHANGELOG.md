@@ -82,6 +82,12 @@ its notes.
   the read, and the context window before the saved position is kept from the
   confirming seek. Measured: 2.9 passes over the archive down to 1.
 
+- `[contract]` **A rotation that lands during the catch-up stops the run at the
+  copy it moved, and the next run carries on from the last copy read** (#32).
+  The old answer skipped the moved copy and went on to the live file, and its
+  lines were never mailed. A copy renamed or gone between the directory listing
+  and its open makes the plan list the directory again, once.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

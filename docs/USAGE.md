@@ -404,6 +404,23 @@ however many rotations happened in between. It recognises, beside the log or in
 Symbolic links are never candidates. A `.gz` still being written yields what it
 has, with a warning, and the run continues.
 
+**A rotation during the run.** When a rename rotation (logrotate's default;
+not `copytruncate`) lands while the copies are being read, a copy the run was
+about to open is no longer the file it planned to read (renamed on, compressed
+away, removed). The run stops there and says so:
+
+```
+[router-disk] /var/log/router.log: router.log.1 was renamed or removed under us (a rotation during the run); stopping here, the next run resumes after router.log.2 (the names are from before the rotation)
+```
+
+Its position stays at the end of the last copy it read, and the next run carries
+on from there under the new names, so nothing is mailed twice or lost --
+provided that copy is still there at the next run: keep one rotation more than
+the interval between runs needs. A rotation landing between the directory
+listing and the copies' opens makes the run list the directory again, once; a
+second rotation inside one run reaches the warning below, whose first cause is
+then `a second rotation during this run (a copy was renamed twice)`.
+
 **The "no rotated copy" warning.** When no copy holds the saved position the log
 says so:
 
@@ -419,7 +436,9 @@ and xz), `the archive aged out` (rotation ran more times than there are archives
 kept: raise `rotate`, or run logalert more often than the rotation), and, only
 when the file had no complete first line at the last run, `the file had no
 complete first line at the last run` (nothing to match a copy by but its inode,
-which compression replaces). A file replaced by one that is not a continuation
+which compression replaces). After a rotation during the run (above) the first
+cause named is `a second rotation during this run (a copy was renamed twice)`.
+A file replaced by one that is not a continuation
 of it -- a different first line, or a new inode with no archive behind it --
 says the same thing. The run does not fail on it; the live file is read from the
 beginning, so anything in it is mailed once.
