@@ -34,6 +34,18 @@ its notes.
   link never worked as a redirect: the first save replaced the link itself with
   a regular file, silently, and the root-refusal rule judged the link's target.
 
+- `[contract]` **A listed symbolic link is followed only when its owner is
+  root, the running user or the file's owner** (#26). In a directory another
+  user owns, what a listed name resolves to is that user's choice; a link they
+  plant towards a file that is not theirs is now a failed item, not a mail.
+  Root's `/var/log/foo -> /data/foo` and an application's own `current ->
+  today.log` keep working.
+
+- `[internal]` **Logs, archives and the `file:` log are opened by descriptor,
+  never by name after a check** (#29). A FIFO swapped in between the check and
+  the open blocked `open(2)` for good, with the lock held; a non-blocking open
+  and `fstat` on what was opened close that window.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

@@ -724,6 +724,60 @@ EOF
     fi
   fi
 
+  echo "-- listed links: one planted by the directory's owner is refused, root's own is followed"
+  # Issue #26, as ROOT (the run with more privilege than the directory's owner): a link the
+  # service user plants in its own directory towards a root-only file is a failed item and
+  # its content never mailed; a link root made to root's file is read as any listed file.
+  install -d -m 755 -o "$SVC" "$T/planted"
+  printf 'disk failure SECRET-TOKEN\n' > "$T/secret.log"
+  chmod 600 "$T/secret.log"
+  bounded "$BOUND_CMD" runuser -u "$SVC" -- ln -s "$T/secret.log" "$T/planted/app.log"
+  install -d -m 755 "$T/own"
+  printf 'boot\n' > "$T/own/today.log"
+  chmod 644 "$T/own/today.log"
+  ln -s "$T/own/today.log" "$T/own/current"
+  install -d -m 750 "$T/rootstate"
+  cat > "$T/link.conf" <<EOF
+[logalert]
+sendmail_path = $T/bin/sendmail
+state_file = $T/rootstate/state.json
+from = alerts@example.net
+[planted]
+subject = Planted link
+to = noc@example.net
+files = $T/planted/app.log
+patterns =
+    disk failure
+[own]
+subject = Root's own link
+to = noc@example.net
+files = $T/own/current
+patterns =
+    disk failure
+EOF
+  chmod 644 "$T/link.conf"
+  bounded "$BOUND_CMD" env LOGALERT_FAKE_DIR="$T/fake" "$T/bin/logalert" -f "$T/link.conf" > "$T/l1.out" 2> "$T/l1.err"; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    skip "the first root run over the links did not finish within ${BOUND_CMD}s"; return
+  fi
+  echo "disk failure via the link" >> "$T/own/today.log"
+  before="$(fake_calls)"
+  bounded "$BOUND_CMD" env LOGALERT_FAKE_DIR="$T/fake" "$T/bin/logalert" -f "$T/link.conf" > "$T/l2.out" 2> "$T/l2.err"; rc=$?
+  lines="$(wc -l < "$T/l2.err")"
+  if [ "$rc" -eq 124 ]; then
+    skip "the root run over the links did not finish within ${BOUND_CMD}s"; return
+  elif [ "$rc" -ne 1 ]; then
+    fail "a root run over a planted link exited $rc, not 1: $(first_err l2)" "links-exit"
+  elif [ "$lines" -ne 1 ] || [ -s "$T/l2.out" ] || ! grep -q "app.log: is a symbolic link owned by $SVC to a file owned by root; not followed" "$T/l2.err"; then
+    fail "expected exactly one stderr line refusing the planted link: got $lines line(s): $(head -2 "$T/l2.err" | tr '\n' '|')" "links-line"
+  elif [ "$(( $(fake_calls) - before ))" -ne 1 ] || ! last_body || ! grep -q 'disk failure via the link' "$T/body.txt" || grep -q 'SECRET-TOKEN' "$T/body.txt"; then
+    fail "expected one mail carrying the line behind root's link and never the secret ($(( $(fake_calls) - before )) mail(s))" "links-mail"
+  elif grep -rq 'SECRET-TOKEN' "$T/fake" 2>/dev/null; then
+    fail "the planted link's target reached a mail" "links-secret"
+  else
+    ok "the planted link is a failed item (exit 1, one line, nothing of it mailed); root's own link is read and mailed"
+  fi
+
   echo "-- modes: the state file and the lock the service user left behind"
   local st lk dr
   st="$(stat -c '%a %U' "$T/state/state.json" 2>/dev/null)"

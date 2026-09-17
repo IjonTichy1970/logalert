@@ -505,6 +505,40 @@ def test_the_log_never_lands_in_the_state_file_through_the_command_line(
     assert not elsewhere.exists()
 
 
+def test_a_fifo_swapped_in_after_the_lstat_cannot_block_the_open(
+        site: Site, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #29: the lstat judged the name; the open came after, and a FIFO with no reader
+    put there in between blocked open(2) for good, before the lock. With O_NONBLOCK the
+    open is ENXIO at once. The lstat is made to lie (as the swap does), and an alarm turns
+    a regression into a failure rather than a hang."""
+    if sys.platform == "win32":
+        pytest.skip("no FIFOs on Windows; runs in the sandbox and on CI")
+    else:
+        import signal
+
+        fifo = site.root / "swapped"
+        os.mkfifo(fifo)
+        regular = os.lstat(__file__)
+        real_lstat = os.lstat
+        monkeypatch.setattr(os, "lstat", lambda p, *a, **k: regular if str(p) == str(fifo)
+                            else real_lstat(p, *a, **k))
+
+        def expired(signum: int, frame: object) -> None:
+            raise AssertionError("the open of the FIFO blocked: O_NONBLOCK is gone")
+
+        previous = signal.signal(signal.SIGALRM, expired)
+        signal.alarm(10)
+        try:
+            assert site.run("--log", f"file:{fifo.as_posix()}") == 0
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        lines = capsys.readouterr().err.splitlines()
+        assert lines[0] == (f"logalert: warning: cannot open the activity log {fifo.as_posix()} "
+                            f"(not a regular file); logging to stderr")
+        assert lines[-1] == "logalert: end: exit 0"
+
+
 def test_a_fifo_as_the_log_destination_is_refused_not_opened(
         site: Site, capsys: pytest.CaptureFixture[str]) -> None:
     if sys.platform == "win32":

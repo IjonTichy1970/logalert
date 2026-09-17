@@ -182,10 +182,10 @@ def test_an_unreadable_file_is_named_the_rest_is_processed_its_cursor_untouched(
     site.append(sibling, "DENY 192.0.2.10")
     real_open = logalert.cursor.open_log
 
-    def refuse(path: str) -> Any:
+    def refuse(path: str, **kwargs: Any) -> Any:
         if Path(path) == site.firewall:
             raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
-        return real_open(path)
+        return real_open(path, **kwargs)
 
     monkeypatch.setattr(logalert.cursor, "open_log", refuse)
     assert site.run() == 1
@@ -1039,10 +1039,10 @@ def test_dry_run_with_an_unreadable_file_is_exit_1_with_the_line(
     site.append(site.firewall, "DENY 192.0.2.9")
     real_open = logalert.cursor.open_log
 
-    def refuse(path: str) -> Any:
+    def refuse(path: str, **kwargs: Any) -> Any:
         if Path(path) == site.firewall:
             raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
-        return real_open(path)
+        return real_open(path, **kwargs)
 
     monkeypatch.setattr(logalert.cursor, "open_log", refuse)
     assert site.run("-n") == 1

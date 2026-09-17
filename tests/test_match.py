@@ -320,7 +320,7 @@ def test_context_before_tolerates_a_vanished_or_replaced_file(
     real_open = open_log
     calls = 0
 
-    def gone(target: str) -> object:
+    def gone(target: str, **kwargs: object) -> object:
         nonlocal calls
         calls += 1
         raise FileNotFoundError(2, "No such file", target)  # gone between open and hook
@@ -701,7 +701,7 @@ def test_segment_context_before_tolerates_a_vanished_or_renamed_archive(
         assert again.context_before(2) == []
         monkeypatch.setattr("logalert.rotation.os.fstat", real_fstat)
 
-        def gone(target: str) -> object:
+        def gone(target: str, **kwargs: object) -> object:
             raise FileNotFoundError(2, "No such file", target)
 
         monkeypatch.setattr("logalert.rotation.open_log", gone)

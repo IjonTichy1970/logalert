@@ -12,6 +12,7 @@ import logging
 import lzma
 import os
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -444,6 +445,138 @@ def test_a_fifo_is_refused_instead_of_blocking_open(tmp_path: Path) -> None:
             os.close(reader)
 
 
+# -- issue #29: the kind is judged on the descriptor, never on the name ------------------------
+
+
+@pytest.mark.parametrize("name", ["router.log", "router.log.gz"])
+def test_a_fifo_swapped_in_after_the_stat_cannot_block_the_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """The window the audit measured: a name checked and then opened. With no writer at
+    all, a blocking open(2) never returns; the descriptor-based open returns at once and
+    fstat names the FIFO. The stat is made to lie so the pre-open check, if one came back,
+    could not save the test -- the swap is the point."""
+    if sys.platform == "win32":
+        pytest.skip("no FIFOs on Windows; runs in the sandbox and on CI")
+    else:
+        import signal
+
+        fifo = tmp_path / name
+        os.mkfifo(fifo)
+        regular = os.stat(__file__)
+        monkeypatch.setattr(os, "stat", lambda *a, **k: regular)
+        monkeypatch.setattr(os, "lstat", lambda *a, **k: regular)
+
+        def expired(signum: int, frame: object) -> None:
+            raise AssertionError("the open of the FIFO blocked: O_NONBLOCK is gone")
+
+        previous = signal.signal(signal.SIGALRM, expired)
+        signal.alarm(10)  # a blocked open never comes back at all: the alarm is the verdict
+        started = time.monotonic()
+        try:
+            with pytest.raises(OSError, match=r"not a regular file \(a FIFO\)"):
+                open_log(str(fifo))
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        assert time.monotonic() - started < 5
+
+
+@pytest.mark.parametrize(
+    "suffix, pack",
+    [("", lambda raw: raw), (".gz", gzip.compress), (".bz2", bz2.compress),
+     (".xz", lzma.compress)],
+)
+def test_closing_the_handle_closes_the_descriptor(
+    tmp_path: Path, suffix: str, pack: Callable[[bytes], bytes]
+) -> None:
+    """The decompressors are built over the checked descriptor's file object and none of
+    them closes a file object it was given (measured); the handle logalert hands out does."""
+    path = tmp_path / f"router.log{suffix}"
+    path.write_bytes(pack(b"first\nsecond\n"))
+    handle = open_log(str(path))
+    fd = handle.fileno()
+    assert handle.read1(5) == b"first" and handle.seekable()
+    handle.close()
+    assert handle.closed
+    with pytest.raises(OSError):
+        os.fstat(fd)  # EBADF: the descriptor went with the handle
+
+
+# -- issue #26: a listed symbolic link is followed under the owner rule, an archive never --
+
+
+def test_an_archive_that_is_a_symbolic_link_is_refused(tmp_path: Path) -> None:
+    if sys.platform == "win32":
+        pytest.skip("symbolic links need a privilege on Windows; runs in the sandbox and on CI")
+    real = tmp_path / "router.log.1"
+    real.write_bytes(b"a\n")
+    link = tmp_path / "router.log.2"
+    link.symlink_to(real)
+    with pytest.raises(OSError, match="is a symbolic link; an archive is never followed"):
+        open_log(str(link))
+    with open_log(str(link), follow_links=True) as handle:  # a listed path, our own link
+        assert handle.read1(1) == b"a"
+
+
+def test_a_listed_link_of_our_own_is_followed_and_realpath_is_the_target(
+        tmp_path: Path) -> None:
+    if sys.platform == "win32":
+        pytest.skip("symbolic links need a privilege on Windows; runs in the sandbox and on CI")
+    real = tmp_path / "today.log"
+    real.write_bytes(b"first\nsecond\n")
+    link = tmp_path / "current"
+    link.symlink_to("today.log")  # relative: resolved against the link's directory
+    log, lines = scan(link, None, from_start=True)
+    assert texts(lines) == ["first", "second"]
+    assert log.cursor().realpath == os.path.realpath(real)
+    hop = tmp_path / "hop"
+    hop.symlink_to(link)  # a link to a link: refused, never resolved through
+    with pytest.raises(OSError, match="points at another symbolic link"):
+        open_log(str(hop), follow_links=True)
+
+
+def test_a_planted_link_is_refused_and_an_applications_own_link_is_followed(
+        tmp_path: Path) -> None:
+    """The owner rule (issue #26): a link owned by the log directory's owner towards a file
+    that is not theirs is refused (the planted case); a link they own to a file they own is
+    followed -- the case where this rule and the issue's stricter shape (a) disagree, so it
+    is pinned. Needs root to plant another user's link: the sandbox runs it as root and the
+    Linux stage carries the same scenario on CI."""
+    if sys.platform == "win32":
+        pytest.skip("symbolic links need a privilege on Windows; runs in the sandbox and on CI")
+    elif os.geteuid() != 0:
+        pytest.skip("needs root to plant another user's link; the root sandbox and the Linux "
+                    "stage run it")
+    else:
+        import pwd
+
+        other = pwd.getpwnam("nobody").pw_uid
+        secret = tmp_path / "secret.log"
+        secret.write_bytes(b"disk failure SECRET\n")
+        secret.chmod(0o600)
+        theirs = tmp_path / "theirs"
+        theirs.mkdir()
+        os.chown(theirs, other, other)
+        planted = theirs / "app.log"
+        planted.symlink_to(secret)
+        os.lchown(planted, other, other)
+        with pytest.raises(OSError) as exc:
+            open_log(str(planted), follow_links=True)
+        assert str(exc.value) == (f"{planted}: is a symbolic link owned by nobody to a file "
+                                  f"owned by root; not followed (a listed link is followed "
+                                  f"when its owner is root, the running user or the file's "
+                                  f"owner)")
+        own = theirs / "today.log"
+        own.write_bytes(b"first\n")
+        os.chown(own, other, other)
+        current = theirs / "current"
+        current.symlink_to(own)
+        os.lchown(current, other, other)
+        with open_log(str(current), follow_links=True) as handle:  # their link, their file
+            assert handle.read1(5) == b"first"
+
+
 def test_fingerprint_skips_a_copytruncate_hole(tmp_path: Path) -> None:
     path = tmp_path / "a.log"
     path.write_bytes(NUL * 100 + b"first line\nsecond\n")
@@ -661,8 +794,8 @@ def test_handle_is_closed_when_identification_fails(
     handles: list[Any] = []
     real_open = open_log
 
-    def spy(target: str) -> Any:
-        handles.append(real_open(target))
+    def spy(target: str, **kwargs: Any) -> Any:
+        handles.append(real_open(target, **kwargs))
         return handles[-1]
 
     def boom(handle: Any) -> str:

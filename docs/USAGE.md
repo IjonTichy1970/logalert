@@ -158,7 +158,7 @@ The file's rules:
 | --- | --- | --- |
 | `subject` | required | The Subject of the alert, verbatim (plus the suffix above). |
 | `to` | required | The recipients, one per line or comma-separated. |
-| `files` | required | The log files to read, absolute, one per line; an entry with `*`, `?` or `[` is a glob, expanded at every run ([Globs](#globs)). Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly. A file the list names more than once, or a glob matches after it was named, is read once. |
+| `files` | required | The log files to read, absolute, one per line; an entry with `*`, `?` or `[` is a glob, expanded at every run ([Globs](#globs)). Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly. A file the list names more than once, or a glob matches after it was named, is read once. A listed symbolic link is followed only when its owner is root, the running user or the file's owner ([Globs](#globs)). |
 | `patterns` | | Literal text, matched case-SENSITIVELY against the whole line. A line matches when any pattern of any of the four shapes is found in it. |
 | `ipatterns` | | Literal text, case-insensitive. |
 | `regex` | | Python regular expressions (`re.search`), case-sensitive. |
@@ -436,10 +436,18 @@ glob matches regular files only, and never through a symbolic link: a link it
 matches, and a link where a wildcard directory component would descend, is
 passed over (a link is a name you never wrote, and a run with more privilege
 than whoever planted it would otherwise mail a file outside the directory);
-list a link by name, which is your own choice. A directory, FIFO or device the
-glob names is passed over too (`/var/log/*` names directories nobody wants
-read), where a listed entry naming one is an error; hard links to one file are
-read once, under the first name in sort order. The matches are read in name
+list a link by name, which is your own choice -- but what a listed name
+resolves to at each run is the choice of whoever owns its directory, so a
+listed link is followed only when its owner is root, the user logalert runs
+as, or the owner of the file it points to (root's `/var/log/foo -> /data/foo`
+and an application's own `current -> today.log` work; a link another user
+planted towards a file that is not theirs is a failed item, `is a symbolic
+link owned by <user> to a file owned by <other>; not followed`). A link to
+another link is refused (`points at another symbolic link`); name the file. A
+directory, FIFO or device the glob names is passed over too (`/var/log/*`
+names directories nobody wants read), where a listed entry naming one is an
+error; hard links to one file are read once, under the first name in sort
+order. The matches are read in name
 order, so a daily directory reads in date order, and each match is one file
 with its own position in the state, spelled as `--check-config` lists it --
 that spelling is what `--reset-state` takes (given the glob itself,
@@ -698,4 +706,5 @@ configured destination still gets INFO and above.
 | `no rotated copy holds the saved position ...` in the log after every rotation | The archives are elsewhere, or fewer are kept than rotations happen between runs | Set `archive_dir`, or run logalert more often than the rotation |
 | `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config (or as `--check-config` lists a glob's match), or the file was never seen; given the glob itself it says `is a glob` | Use the exact path; `--reset-state` with no path forgets everything |
 | A glob mails nothing, or a file it should read is missing from `--check-config` | The glob matches nothing where it looks (`matches nothing`), or the file is left out as a rotated copy (`left out:` -- a name ending in `.N` or a date such as `app.2024`, a `.bak` or `.gz` twin), or it is not a regular file or is a symbolic link (`passed over:`) | `logalert --check-config` names every match and everything left out; list a wanted file by name, or set `include_archives = yes` for a directory of dated live files |
+| `[section] /var/log/app/current: is a symbolic link owned by app to a file owned by root; not followed (...)` (exit 1) | A listed path is a link whose owner is neither root, nor the running user, nor the owner of the file it points to -- in a directory another user owns, what the name resolves to is that user's choice | List the file itself, or make the link root's (`chown -h root <link>`); a link another user planted is the reason the rule exists |
 | `[section] /var/log/hosts/*/messages: cannot list /var/log/hosts (Permission denied)` (exit 1) | The running user cannot list a directory the glob needs to look into; the files of the section that were reachable were processed | Grant read and search permission on the directory, or run as a user that has it |

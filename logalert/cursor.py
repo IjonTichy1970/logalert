@@ -25,6 +25,21 @@ Compressed files (``.gz``, ``.bz2``, ``.xz``; ``.zst`` where the stdlib has
 stream; ``seek`` past its end is silent, so ``tell`` after the seek is what detects a shorter
 stream.
 
+Files are opened by DESCRIPTOR (issues #29 and #26): ``os.open`` with ``O_NONBLOCK`` and
+``O_NOFOLLOW``, ``fstat`` on what was opened, and only a regular file is read -- the kind is
+judged on the descriptor, never on the name and then opened, so a FIFO swapped in between
+cannot block ``open(2)`` (measured: the non-blocking open of a FIFO with no writer returns
+at once). The decompressors are built over that file object. A symbolic link at a LISTED
+path (``follow_links=True``; an archive found by the catch-up is never followed) is
+followed under one rule: its owner is root, the running user, or the owner of the file it
+points to -- so root's ``/var/log/foo -> /data/foo`` and an application's own ``current ->
+today.log`` work, and a link the owner of a log directory plants towards a file that is
+not theirs is a failed item, not a mail. The link is judged through an ``O_PATH``
+descriptor and its target read through the same descriptor (``readlink("", dir_fd=...)``),
+so a link swapped between the check and the follow is the link that was checked (measured);
+a target that is itself a link is refused. Windows has none of these flags: there a link
+opens as before.
+
 Lines are read in binary and decoded as UTF-8 with replacement. The cursor advances only to
 the end of the last COMPLETE line: an unterminated tail is re-read next run. A line longer
 than ``LINE_CAP`` bytes is cut there and the cut is reported; the cap is a hard boundary, so
@@ -34,6 +49,7 @@ it is a whole line or the start of one.
 """
 
 import bz2
+import errno
 import gzip
 import hashlib
 import importlib
@@ -43,6 +59,7 @@ import lzma
 import os
 import re
 import stat
+import sys
 import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -50,6 +67,10 @@ from datetime import datetime
 from typing import Literal
 
 from logalert.state import Cursor, timestamp
+
+if sys.platform != "win32":
+    import fcntl
+    import pwd
 
 log = logging.getLogger("logalert.cursor")
 
@@ -97,31 +118,137 @@ def compressed_suffix(path: str) -> str | None:
     return None
 
 
-def open_log(path: str) -> BinaryStream:
+_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+               | getattr(os, "O_BINARY", 0))
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_LINK_RULE = ("a listed link is followed when its owner is root, the running user or the "
+              "file's owner")
+
+
+def open_log(path: str, *, follow_links: bool = False) -> BinaryStream:
     """Open for binary reading, through the decompressor the suffix names.
 
-    Only a regular file: a FIFO with no writer would block ``open(2)`` for good, and a
-    device or socket has no byte offsets to remember. ``FileNotFoundError`` propagates.
+    Only a regular file, judged on the descriptor (see the module docstring): a FIFO with
+    no writer would block ``open(2)`` for good, and a device or socket has no byte offsets
+    to remember. A symbolic link is refused unless ``follow_links`` (a listed path) and the
+    link passes the owner rule. ``FileNotFoundError`` propagates.
     """
-    kind = special_kind(os.stat(path).st_mode)
-    if kind is not None:
-        raise OSError(f"{path}: not a regular file (a {kind})")
+    if sys.platform == "win32":
+        # no O_NONBLOCK and nothing that blocks an open: the kind is judged by name, where
+        # os.open of a directory is EACCES rather than a descriptor to fstat
+        kind = special_kind(os.stat(path).st_mode)
+        if kind is not None:
+            raise OSError(f"{path}: not a regular file (a {kind})")
+    try:
+        fd = os.open(path, _OPEN_FLAGS | _NOFOLLOW)
+    except OSError as exc:
+        if exc.errno != errno.ELOOP or not _NOFOLLOW:
+            raise
+        if not follow_links:
+            raise OSError(f"{path}: is a symbolic link; an archive is never followed") from None
+        fd = _open_through_link(path)
+    try:
+        kind = special_kind(os.fstat(fd).st_mode)
+        if kind is not None:
+            raise OSError(f"{path}: not a regular file (a {kind})")
+        _blocking(fd)
+        raw = open(fd, "rb")  # inside the guard: a failure here would leak the descriptor
+    except BaseException:
+        os.close(fd)
+        raise
+    return _wrap(path, raw)
+
+
+def _open_through_link(path: str) -> int:
+    """A descriptor on the file a listed link points to, when the link passes the owner
+    rule; the link itself is judged through an ``O_PATH`` descriptor so the content read is
+    that link's (a swap between the check and the follow cannot substitute another). Where
+    ``O_PATH`` is absent (a BSD) the link is read by name: the same rule, a microsecond
+    window between the judgement and the follow."""
+    if sys.platform == "win32":  # never reached: no O_NOFOLLOW, so no ELOOP; mypy's branch
+        raise OSError(errno.ELOOP, "a symbolic link", path)
+    else:
+        o_path = getattr(os, "O_PATH", None)
+        if o_path is not None:
+            link_fd = os.open(path, o_path | _NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+            try:
+                link = os.fstat(link_fd)
+                target = os.readlink("", dir_fd=link_fd)
+            finally:
+                os.close(link_fd)
+        else:
+            link = os.lstat(path)
+            target = os.readlink(path)
+        if not os.path.isabs(target):
+            target = os.path.join(os.path.dirname(path), target)
+        try:
+            fd = os.open(target, _OPEN_FLAGS | _NOFOLLOW)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                # the target's spelling is the link planter's text: not quoted in a message
+                raise OSError(f"{path}: points at another symbolic link; name the file "
+                              f"itself") from None
+            raise
+        try:
+            st = os.fstat(fd)
+            if link.st_uid not in (0, os.geteuid()) and link.st_uid != st.st_uid:
+                raise OSError(f"{path}: is a symbolic link owned by {_user(link.st_uid)} to "
+                              f"a file owned by {_user(st.st_uid)}; not followed "
+                              f"({_LINK_RULE})")
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+
+def _user(uid: int) -> str:
+    if sys.platform == "win32":
+        return f"#{uid}"
+    else:  # mypy narrows the platform per branch, not past an early return
+        try:
+            return pwd.getpwuid(uid).pw_name
+        except KeyError:
+            return f"#{uid}"
+
+
+def _blocking(fd: int) -> None:
+    """``O_NONBLOCK`` served the open; the reads are ordinary."""
+    if sys.platform != "win32":
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+
+
+def _wrap(path: str, raw: io.BufferedReader) -> BinaryStream:
+    """The decompressor the suffix names, over the checked file object, its ``close`` closing
+    both (measured: none of the stdlib decompressors closes a file object it was given)."""
     suffix = compressed_suffix(path)
+    stream: BinaryStream
     if suffix == ".gz":
-        return gzip.open(path, "rb")
-    if suffix == ".bz2":
-        return bz2.open(path, "rb")
-    if suffix == ".xz":
-        return lzma.open(path, "rb")
-    if suffix == ".zst":
+        stream = gzip.GzipFile(fileobj=raw, mode="rb")
+    elif suffix == ".bz2":
+        stream = bz2.BZ2File(raw, "rb")
+    elif suffix == ".xz":
+        stream = lzma.LZMAFile(raw, "rb")
+    elif suffix == ".zst":
         try:
             zstd = importlib.import_module("compression.zstd")  # 3.14+
         except ImportError:
+            raw.close()
             raise OSError(f"{path}: reading .zst needs Python 3.14+ built with zstd support "
                           f"(compression.zstd)") from None
-        handle: BinaryStream = zstd.open(path, "rb")
-        return handle
-    return open(path, "rb")
+        stream = zstd.open(raw, "rb")
+    else:
+        return raw
+    inner_close = stream.close
+
+    def close() -> None:
+        try:
+            inner_close()
+        finally:
+            raw.close()
+
+    setattr(stream, "close", close)  # noqa: B010  # an instance attribute shadows the method
+    return stream
 
 
 def special_kind(mode: int) -> str | None:
@@ -307,7 +434,7 @@ class LogFile:
         self.section = section
         self.path = path
         self.saved = saved
-        self.handle = open_log(path)
+        self.handle = open_log(path, follow_links=True)  # a listed path; see open_log
         try:
             st = os.fstat(self.handle.fileno())
             self.ino, self.dev = st.st_ino, st.st_dev
@@ -369,7 +496,7 @@ class LogFile:
         if n <= 0 or self.start == 0:
             return []
         try:
-            with open_log(self.path) as handle:
+            with open_log(self.path, follow_links=True) as handle:
                 st = os.fstat(handle.fileno())
                 if (st.st_ino, st.st_dev) != (self.ino, self.dev):
                     return []  # rotated under us since the open: not this file's lines
