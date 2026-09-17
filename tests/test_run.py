@@ -1052,3 +1052,45 @@ def test_dry_run_with_an_unreadable_file_is_exit_1_with_the_line(
         f"logalert: 1 of 1 section would be sent; failed: [firewall] "
         f"{site.firewall.as_posix()}: Permission denied; see the log")
     assert site.calls() == []
+
+
+# -- issue #28: a file's scan is bounded by scan_timeout ----------------------------------------
+
+
+def test_a_regex_that_hangs_is_a_failed_item_within_scan_timeout_and_the_cursor_stays(
+        site: Site, capsys: pytest.CaptureFixture[str]) -> None:
+    """The measured hang: ^(\\w+\\s?)+failed$ over a line of plain words takes hours from
+    thirty characters on; with scan_timeout = 1 the file is a failed item naming the line
+    and the pattern, the sibling section runs, the cursor stays (the operator's escapes are
+    the documented three), the timer is disarmed afterwards. POSIX only: SIGALRM."""
+    if sys.platform == "win32":
+        pytest.skip("no interval timer on Windows: scan_timeout is reported, not enforced; "
+                    "runs in the sandbox and on CI")
+    else:
+        import signal
+        import time
+
+        bs = chr(92)
+        site.write_config(settings="scan_timeout = 1\n",
+                          router=f"regex = ^({bs}w+{bs}s?)+failed$\n")
+        site.prime()
+        before = site.offset("router-disk", site.router)
+        site.append(site.router, " ".join(["word"] * 40) + " ok")
+        site.append(site.firewall, "DENY 192.0.2.9")
+        started = time.monotonic()
+        assert site.run() == 1
+        elapsed = time.monotonic() - started
+        assert elapsed < 20, elapsed  # the bound fired; the regex alone runs for hours
+        err = capsys.readouterr().err
+        assert err == (f"logalert: 1 of 1 section sent; failed: [router-disk] "
+                       f"{site.router.as_posix()}: scanning exceeded scan_timeout (1 s) at "
+                       f"line 3 while trying regex '^({bs}{bs}w+{bs}{bs}s?)+failed$'; see the "
+                       f"log" + NL)  # the pattern's repr: each backslash doubled
+        assert site.offset("router-disk", site.router) == before  # re-read next run
+        assert len(site.calls()) == 1  # the firewall section's mail went out
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)  # disarmed
+        assert signal.getsignal(signal.SIGALRM) in (signal.SIG_DFL, signal.SIG_IGN, None)
+        # with the bound off the same run would hang: not run. 0 is accepted by the loader and
+        # scan_bound is a no-op for it -- pinned on the context manager directly
+        with logalert.run.scan_bound(0):
+            assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)

@@ -149,6 +149,7 @@ The file's rules:
 | `smtp_starttls` | `no` | Ask for STARTTLS with the platform's default certificate verification; a relay that cannot is a delivery failure, never a silent downgrade. |
 | `mail_timeout` | `60` | Seconds to wait for the mail system. For sendmail the whole child; for SMTP each socket operation (a slow relay can hold a run for a few multiples of it and still succeed). At most 3600. |
 | `lock_stale` | `3600` | A run that finds another run holding the lock exits 0 quietly -- cron overlap is normal -- unless the holder is older than this many seconds, which is exit 1: `stale lock: another run (PID N) has held the lock <path> for Ns`. |
+| `scan_timeout` | `300` | Seconds one file's scan may take before it is given up as a failed item naming the line and the pattern being tried (`scanning exceeded scan_timeout (300 s) at line N while trying regex '...'`); its position stays, the section's other files are processed. `0` turns the bound off. A scan that is legitimately long -- a first read of a multi-GB file on a slow machine -- needs a higher value, or `0` for that run; the message names the key. Enforced on Linux and the BSDs (an interval timer); on Windows `--check-config` says `not enforced on this platform`. |
 | `state_ttl` | `30` | Days after which the saved position of a file that has not been seen is forgotten (logged as `forgotten`). A file that is back after that is a first sight again. |
 | `subject_suffix` | `yes` | Append ` -- N match(es)` to every Subject, a literal a mail filter can key on. `no` for the bare subject. |
 
@@ -161,7 +162,7 @@ The file's rules:
 | `files` | required | The log files to read, absolute, one per line; an entry with `*`, `?` or `[` is a glob, expanded at every run ([Globs](#globs)). Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly. A file the list names more than once, or a glob matches after it was named, is read once. A listed symbolic link is followed only when its owner is root, the running user or the file's owner ([Globs](#globs)). |
 | `patterns` | | Literal text, matched case-SENSITIVELY against the whole line. A line matches when any pattern of any of the four shapes is found in it. |
 | `ipatterns` | | Literal text, case-insensitive. |
-| `regex` | | Python regular expressions (`re.search`), case-sensitive. |
+| `regex` | | Python regular expressions (`re.search`), case-sensitive. `re` has no backtracking limit: a nested or ambiguous quantifier (`(x+)+`, `(x*)*`, `(\w+\s?)+`) can run for hours on one long line of ordinary words, holding the lock -- `--check-config` warns about that shape, and `scan_timeout` bounds the damage. An anchor or a delimiter class (`[^ ]+`) usually stops it. |
 | `iregex` | | Regular expressions, case-insensitive. |
 | `exclude`, `iexclude`, `exclude_regex`, `iexclude_regex` | | Noise: a line that matched a pattern but also matches one of these is dropped, and the count of dropped lines is in the mail's summary. The same four shapes. |
 | `priority` | off | `high`, `medium` or `low`. The priority system is OFF unless a section sets this or a pattern carries a tag; when on, the mail carries `X-Logalert-Priority` plus the conventional `X-Priority` (`1`/`3`/`5`) and `Importance` (`high`/`normal`/`low`), the highest across the mail's matches. A pattern can carry its own tag: `[high] Requesting reboot` (lowercase, one space); any other bracketed prefix is part of the literal. |
@@ -235,6 +236,12 @@ This is `logalert --example-config`, verbatim (a test keeps the two identical):
 # A run that finds another run still holding the lock exits quietly -- unless
 # that run is older than this many seconds, which is reported as a problem.
 #lock_stale = 3600
+
+# Seconds a single file's scan may take before the run gives it up as a failed
+# item naming the line and the pattern (a regex with a nested quantifier can
+# run for hours on one long line, holding the lock). 0 turns the bound off.
+# Enforced on Linux and the BSDs; on Windows it is reported and not enforced.
+#scan_timeout = 300
 
 # Days after which the position of a file that has not been seen is forgotten.
 #state_ttl = 30
@@ -709,6 +716,7 @@ configured destination still gets INFO and above.
 | `warning: no usable syslog socket (...); logging to stderr` in cron's mail every run | No syslog daemon, or the socket is somewhere else | Start rsyslog / journald, or set `log = file:/var/log/logalert.log` |
 | `warning: From address '...' has no domain part; set from = in [logalert]` | The default From is `<user>@<short hostname>` | Set `from = logalert@example.net` |
 | `'...' is not a bare local@domain address` (exit 2; as `[logalert] from:`, `[<section>] to:` or `--from:`) | A display name, angle brackets or spaces in an address; a leading `-` is refused separately as `'...' starts with '-'` | Bare addresses only |
+| `scanning exceeded scan_timeout (300 s) at line N while trying regex '...'` (exit 1), or `stale lock` every run with PID N alive at 100 % CPU | A regex with a nested quantifier on a long line (`(x+)+`, `(\w+\s?)+`): `re` backtracks without bound; on Windows nothing bounds it | Simplify the regex (an anchor, a delimiter class instead of `\w+\s?`); the file is re-read next run, so `--reset-state <file>` skips the line if the log must keep it; `--check-config` names the shape |
 | A pattern starting with `#` or `;` never matches | The parser drops such a continuation line as a comment | A regex with the escape: `\#`, `\;` |
 | `no rotated copy holds the saved position ...` in the log after every rotation | The archives are elsewhere, or fewer are kept than rotations happen between runs | Set `archive_dir`, or run logalert more often than the rotation |
 | `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config (or as `--check-config` lists a glob's match), or the file was never seen; given the glob itself it says `is a glob` | Use the exact path; `--reset-state` with no path forgets everything |

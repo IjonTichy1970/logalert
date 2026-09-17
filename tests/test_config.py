@@ -640,3 +640,51 @@ def test_module_run_check_config(tmp_path: Path) -> None:
 ])
 def test_is_address_is_the_loaders_rule(value: str, ok: bool) -> None:
     assert is_address(value) is ok
+
+
+# -- issue #28: scan_timeout and the nested-quantifier warning ------------------------------
+
+
+def test_scan_timeout_is_a_non_negative_integer_with_zero_off(tmp_path: Path) -> None:
+    settings = load_config(write(tmp_path, watch(tmp_path))).settings
+    assert settings.scan_timeout == 300
+    settings = load_config(write(tmp_path, "[logalert]\nscan_timeout = 0\n"
+                                 + watch(tmp_path))).settings
+    assert settings.scan_timeout == 0
+    assert "scan_timeout: must be >= 0" in error(
+        tmp_path, "[logalert]\nscan_timeout = -1\n" + watch(tmp_path))
+    assert "scan_timeout: expected an integer" in error(
+        tmp_path, "[logalert]\nscan_timeout = soon\n" + watch(tmp_path))
+    assert "scan_timeout" in GLOBAL_KEYS and "scan_timeout" in example_config()
+
+
+def test_a_nested_quantifier_is_a_check_config_warning_never_a_refusal(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """(x+)+ and its kin backtrack without bound on a long line of ordinary words (measured:
+    hours, holding the lock). The loader warns; --check-config prints it; the run does not,
+    and the pattern is accepted -- the shapes that hang are not enumerable."""
+    bs = chr(92)  # a backslash, from the code point: the regex escapes are test data
+    good = write(tmp_path, watch(tmp_path, "regex = ^(a+)$\n    ^[a-z]+ failed$\n"
+                                           f"    ({bs}d{{2}})+x\n    (a{bs}?)+\n    (a{bs}+)+\n"))
+    assert load_config(good).warnings == ()  # a fixed count and escaped literals: benign
+    ranged = write(tmp_path, watch(tmp_path, f"regex = ({bs}d{{2,}})+x\n    (x{{1,3}}?)+y\n"))
+    assert len(load_config(ranged).warnings) == 2  # a range before the ) is the hazard
+    hot = write(tmp_path, usable(tmp_path, watch(
+        tmp_path, f"regex = ^({bs}w+{bs}s?)+failed$\nexclude_regex = (x*)*y\n")))
+    config = load_config(hot)
+    assert config.warnings == (
+        f"[router-disk] regex: '^({bs}{bs}w+{bs}{bs}s?)+failed$': a quantified group ending "
+        "in a quantifier can backtrack without bound on a long line; simplify it (see "
+        "USAGE.md)",
+        "[router-disk] exclude_regex: '(x*)*y': a quantified group ending in a quantifier "
+        "can backtrack without bound on a long line; simplify it (see USAGE.md)",
+    )
+    assert main(["--check-config", "-f", hot]) == 0
+    out = capsys.readouterr().out
+    assert "warning: [router-disk] regex: " in out and "backtrack without bound" in out
+    assert "scan_timeout: 300s" in out
+    if sys.platform == "win32":
+        assert "scan_timeout: 300s (not enforced on this platform)" in out
+    off = write(tmp_path, usable(tmp_path, "scan_timeout = 0\n" + watch(tmp_path)))
+    assert main(["--check-config", "-f", off]) == 0
+    assert "scan_timeout: off;" in capsys.readouterr().out

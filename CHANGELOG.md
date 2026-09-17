@@ -53,6 +53,13 @@ its notes.
   default limit either way. `docs/USAGE.md` names the escapes from a message
   refused for any other reason every run.
 
+- `[contract]` **`scan_timeout` bounds one file's scan (300 s; `0` is off), and
+  `--check-config` warns about a regex with a nested quantifier** (#28). Such a
+  regex runs for hours on one long line of ordinary words, holding the lock;
+  past the bound the file is a failed item naming the line and the pattern,
+  its position kept. Enforced on POSIX; Windows reports the key and cannot
+  enforce it.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

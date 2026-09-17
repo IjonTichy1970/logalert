@@ -109,14 +109,32 @@ def pattern_matches(pattern: Pattern, text: str) -> bool:
 
 def matching(text: str, patterns: Iterable[Pattern]) -> list[Pattern]:
     """Every pattern that matches, in config order."""
-    return [p for p in patterns if pattern_matches(p, text)]
+    return [p for p in patterns if _try(p, text)]
 
 
 def is_excluded(text: str, excludes: Iterable[Pattern]) -> bool:
-    return any(pattern_matches(p, text) for p in excludes)
+    return any(_try(p, text) for p in excludes)
+
+
+def _try(pattern: Pattern, text: str) -> bool:
+    progress.pattern = pattern  # named by the scan bound if this is the one that hangs
+    return pattern_matches(pattern, text)
 
 
 GAP = Entry("gap", 0, "", False)
+
+
+class Progress:
+    """Where the scan is: the file, the physical line and the pattern being tried, kept
+    current so a scan bound (the run's ``scan_timeout``, issue #28) can name them from a
+    signal handler. One record, updated in place: the scan runs in one thread."""
+
+    file: str = ""
+    line: int = 0
+    pattern: Pattern | None = None
+
+
+progress = Progress()
 
 Before = Callable[[int], list[Line]]
 
@@ -181,6 +199,7 @@ def scan(file: str, lines: Iterable[Line], watch: Watch, *, context: int,
             if first_path is None:
                 first_path = current_path
         report.lines += 1
+        progress.file, progress.line, progress.pattern = group[0].path, group[0].number, None
         text = "".join(fragment.text for fragment in group)  # the whole line, for anchors
         found = matching(text, watch.patterns)
         if found and is_excluded(text, watch.excludes):

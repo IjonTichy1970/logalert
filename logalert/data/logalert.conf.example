@@ -52,6 +52,12 @@
 # that run is older than this many seconds, which is reported as a problem.
 #lock_stale = 3600
 
+# Seconds a single file's scan may take before the run gives it up as a failed
+# item naming the line and the pattern (a regex with a nested quantifier can
+# run for hours on one long line, holding the lock). 0 turns the bound off.
+# Enforced on Linux and the BSDs; on Windows it is reported and not enforced.
+#scan_timeout = 300
+
 # Days after which the position of a file that has not been seen is forgotten.
 #state_ttl = 30
 
