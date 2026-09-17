@@ -16,6 +16,7 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +120,11 @@ LIVE = b"live 1\n"  # written to the new live file after the rotation
         ("router.log.bak", "other", (), ".bak", False),
         ("router.log.GZ", "other", (), "", True),  # compressed in place, no rotation suffix
         ("router.log-old.zst", "other", (), "-old", True),
+        # logrotate's extension directive (issue #51): the suffix before the log's own
+        ("router.1.log", "numeric", (-1,), ".1", False),
+        ("router.1.log.gz", "numeric", (-1,), ".1", True),
+        ("router-20260914.log.gz", "dated", (2026, 9, 14, 0, 0, 0, 0), "-20260914", True),
+        ("router.2026-09-14.log", "dated", (2026, 9, 14, 0, 0, 0, 0), ".2026-09-14", False),
     ],
 )
 def test_classify_recognises_the_styles(
@@ -132,6 +138,16 @@ def test_classify_rejects_other_logs_and_the_file_itself() -> None:
     assert classify("router.log2", "router.log") is None  # another log
     assert classify("router.logs.1", "router.log") is None
     assert classify("firewall.log.1", "router.log") is None
+    assert classify("router1.log", "router.log") is None  # the extension form needs . or -
+    assert classify("routers.1.log", "router.log") is None
+    assert classify("router.1.txt", "router.log") is None  # not the log's own extension
+    assert classify("messages.1", "messages") == ("numeric", (-1,), ".1", False)  # no ext
+    assert classify("worker.2.log", "worker.log") == ("numeric", (-2,), ".2", False)
+    # a sibling log, never a copy in the extension form (review: app-error.log was chained
+    # whole behind a hand-moved app-old.log)
+    assert classify("router-disk.log", "router.log") is None
+    assert classify("app-error.log", "app.log") is None
+    assert classify("app.log-old", "app.log") == ("other", (), "-old", False)  # classic
 
 
 def archive(name: str, mtime: float = 0.0, **over: object) -> Archive:
@@ -1657,3 +1673,169 @@ def test_an_entry_whose_kind_needs_an_lstat_the_directory_refuses_counts_as_deni
     assert everything == [] and archives == []
     assert problems == [(f"cannot examine 2 of the 2 entries of {old} while looking for rotated "
                          f"copies (Permission denied); is the directory searchable?", 13)]
+
+
+# -- logrotate's extension directive (issue #51) ------------------------------------------------
+
+
+def test_the_extension_form_is_read_after_a_rotation(tmp_path: Path) -> None:
+    """The layout logrotate 3.21 makes under `compress` + `extension .log` (measured); the
+    classic-form code lost `since 1` here."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    rotate(path, tmp_path / "router.1.log.gz", compress=True)
+    path.write_bytes(LIVE)
+    source, lines, cursor = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "content"
+    assert lines == ["since 1", "since 2", "live 1"]
+    _, again, _ = run(path, cursor)
+    assert again == []
+
+
+def test_the_chain_keeps_to_the_matched_copys_naming_form(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """worker.log rotated twice the classic way (.2 the holder, .1 = middle) beside a live
+    per-worker log worker.1.log, whose numeric key (-1) is "newer" than the holder's: without
+    the form rule it would join the chain and be mailed whole."""
+    path = tmp_path / "worker.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    rotate(path, tmp_path / "worker.log.2")
+    (tmp_path / "worker.log.1").write_bytes(b"middle 1" + NLB)
+    path.write_bytes(LIVE)
+    (tmp_path / "worker.1.log").write_bytes(b"another worker" + NLB)
+    caplog.set_level(logging.INFO, logger="logalert.rotation")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource)
+    assert [Path(a.path).name for a in source.plan.chain] == ["worker.log.1"]
+    assert lines == ["since 1", "since 2", "middle 1", "live 1"]
+    assert any("1 rotated copy named in the other form (worker.1.log) left out" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_a_numbered_live_sibling_is_not_the_holder_by_name_alone(tmp_path: Path) -> None:
+    """The content stage still decides: worker.1.log with its own first line does not fit."""
+    path = tmp_path / "worker.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    (tmp_path / "worker.1.log").write_bytes(b"another worker" + NLB * 4)
+    path.unlink()
+    path.write_bytes(LIVE)  # rotate 0: the holder is gone
+    source, lines, _ = run(path, saved)
+    assert lines == ["live 1"]
+
+
+def test_epoch_keys_are_computed_without_fromtimestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 32-bit time_t raises OverflowError from datetime.fromtimestamp at 2**31 (CPython's
+    _PyTime_ObjectToTime_t); the arithmetic path gives the same key on every host."""
+
+    class Refusing(datetime):
+        @classmethod
+        def fromtimestamp(cls, *args: object, **kwargs: object) -> "Refusing":
+            raise OverflowError("timestamp out of range for platform time_t")
+
+        @classmethod
+        def utcfromtimestamp(cls, *args: object, **kwargs: object) -> "Refusing":
+            raise OverflowError("timestamp out of range for platform time_t")
+
+    monkeypatch.setattr(rotation, "datetime", Refusing)
+    assert rotation._epoch_key(2**31) == (2038, 1, 19, 3, 14, 8, 2**31)
+    assert rotation._epoch_key(9999999999) == (2286, 11, 20, 17, 46, 39, 9999999999)
+    assert rotation._epoch_key(1789440820) == (2026, 9, 15, 2, 53, 40, 1789440820)
+    assert classify("router.log-1789440820", "router.log") == (
+        "dated", (2026, 9, 15, 2, 53, 40, 1789440820), "-1789440820", False)
+
+
+def test_a_sibling_log_is_never_chained_behind_a_hand_moved_copy(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Review of #51: with the extension form allowed an other style, app-error.log was a
+    copy of app.log and the chain behind a hand-moved app-old.log (an other-style match
+    OF THIS LOG, which admits other-style members) mailed the sibling whole."""
+    path = tmp_path / "app.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    rotate(path, tmp_path / "app-old.log")
+    (tmp_path / "app-error.log").write_bytes(b"error 1" + NLB + b"error 2" + NLB)
+    path.write_bytes(LIVE)
+    caplog.set_level(logging.INFO, logger="logalert.rotation")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource)
+    assert source.plan.match is not None and source.plan.chain == []
+    assert Path(source.plan.match.path).name == "app-old.log"
+    assert lines == ["since 1", "since 2", "live 1"]
+    assert not any("app-error.log" in r.getMessage() for r in caplog.records)
+
+
+def test_an_extension_form_chain_is_read_in_order(tmp_path: Path) -> None:
+    """Two rotations under extension + delaycompress: the holder router.2.log.gz, the
+    member router.1.log, then the live file -- the form rule keeps them together."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.2.log.gz", compress=True)
+    (tmp_path / "router.1.log").write_bytes(b"middle 1" + NLB)
+    path.write_bytes(LIVE)
+    source, lines, cursor = run(path, saved)
+    assert isinstance(source, CatchUpSource)
+    assert [Path(a.path).name for a in source.plan.chain] == ["router.1.log"]
+    assert lines == ["since 1", "middle 1", "live 1"]
+    _, again, _ = run(path, cursor)
+    assert again == []
+
+
+def test_an_unnamed_match_keeps_its_classic_chain(tmp_path: Path) -> None:
+    """The ext_form of a file the scan cannot name is the classic form (the guard on
+    ``found``): a holder found by inode under a hand-made name still chains router.log.1."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    rotate(path, tmp_path / "keep-this-one.txt")
+    older = time.time() - 10  # the holder is older by mtime, whatever the clock tick
+    os.utime(tmp_path / "keep-this-one.txt", (older, older))
+    (tmp_path / "router.log.1").write_bytes(b"middle 1" + NLB)
+    path.write_bytes(LIVE)
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "inode"
+    assert [Path(a.path).name for a in source.plan.chain] == ["router.log.1"]
+    assert lines == ["since 1", "since 2", "middle 1", "live 1"]
+
+
+def test_a_classic_plain_orphan_is_not_the_twin_of_the_extension_form_copy(
+        tmp_path: Path) -> None:
+    """Review of #51, reproduced with real logrotate: a switch from classic delaycompress
+    to extension + compress leaves router.log.1 behind for good, and the twin collapse --
+    keyed on the suffix alone -- kept that plain orphan and dropped router.1.log.gz, the
+    copy holding the saved position, at every rotation after the switch."""
+    path = tmp_path / "router.log"
+    (tmp_path / "router.log.1").write_bytes(b"an orphan of the old form" + NLB)
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    rotate(path, tmp_path / "router.1.log.gz", compress=True)
+    path.write_bytes(LIVE)
+    _, archives, _ = scan_directories([str(tmp_path)], "router.log")
+    assert sorted(Path(a.path).name for a in archives) == ["router.1.log.gz", "router.log.1"]
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "content"
+    assert lines == ["since 1", "since 2", "live 1"]
+
+
+def test_the_saved_identity_wins_a_key_tie_against_a_sibling_with_the_same_first_line(
+        tmp_path: Path) -> None:
+    """Review of #51, reproduced on NTFS (which lists worker.1.log before worker.log.1): the
+    two tie on the numeric key, and a live sibling that shares the banner first line and is
+    long enough fitted by content when the listing put it first -- the holder's lines lost.
+    The saved identity breaks the tie."""
+    path = tmp_path / "worker.log"
+    banner = b"# worker log v1" + NLB
+    saved = seen(path, banner + b"old 1" + NLB)
+    append(path, SINCE)
+    rotate(path, tmp_path / "worker.log.1")  # the holder keeps its inode
+    (tmp_path / "worker.1.log").write_bytes(banner + b"w1 line 2" + NLB + b"w1 line 3" + NLB
+                                            + b"w1 line 4" + NLB)
+    path.write_bytes(LIVE)
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource)
+    assert source.plan.match is not None
+    assert Path(source.plan.match.path).name == "worker.log.1"
+    assert lines == ["since 1", "since 2", "live 1"]

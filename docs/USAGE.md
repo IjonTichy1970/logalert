@@ -410,7 +410,15 @@ however many rotations happened in between. It recognises, beside the log or in
   archive is skipped with a warning and its lines are lost -- keep logrotate on
   gzip there);
 - anything else sharing the log's name as a stem, ordered by modification time,
-  with a log line saying the order was a guess.
+  with a log line saying the order was a guess;
+- the numeric and dated ones in logrotate's `extension` form as well, the
+  suffix before the log's own extension: `router.1.log.gz`,
+  `router-20260916.log.gz`. The chain after a rotation keeps to one of the two
+  forms (the one the matched copy has); a copy named in the other is left
+  out, with a log line -- so a numbered live sibling such as `worker.1.log`
+  beside `worker.log` is never chained as a copy (whether it holds the saved
+  position is the content check's decision, as for any candidate: a sibling
+  that shares the log's first line can be mistaken for the copy).
 
 Symbolic links are never candidates. A `.gz` still being written yields what it
 has, with a warning, and the run continues.
@@ -513,7 +521,12 @@ when what precedes it does not end in a digit (`router.log.1`,
 compression extension); and a bare compression extension (`messages.gz`, a
 hand-made `gzip` of a live log). A fourth is judged against the other matches
 in the same directory: a numeric or dated rotation of another matched name
-whose base ends in a digit (`router1.2` beside `router1`). Nothing else is:
+whose base ends in a digit (`router1.2` beside `router1`), or in logrotate's
+`extension` form (`router.1.log` and `router-20260916.log.gz` beside
+`router.log` -- so a `rotatelogs`-style `access-20260916.log` is left out only
+when `access.log` is matched beside it, and `worker.2.log` alone is a file of
+its own; a numbered or dated live sibling in that form beside its base is
+left out, so list it by name). Nothing else is:
 `fw-dmz` beside `fw`, `router1.example.net` beside `router1`, `syslog.log`
 beside `syslog` are hosts and logs of their own. Otherwise `/var/log/router*`
 would read `router.log.1.gz` as a file of its own and mail every alert twice

@@ -21,6 +21,13 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
         (``.YYYY-MM-DD``, ``.YYYY-MM-DD_HH-MM-SS``), newsyslog ``-t`` (``.YYYYMMDDTHHMMSS``),
         and the hand-rolled ``.YYYYMMDD`` and ``.<epoch>`` -- the stamp orders them;
       - anything else sharing the stem -- mtime orders them, and the log says so.
+    Each of those in logrotate's ``extension`` form too (issue #51), the suffix BEFORE the
+    log's own extension: ``router.1.log.gz``, ``router-20260916.log.gz`` for ``router.log``
+    (measured with logrotate 3.21; the classic form lost the interval's lines under it, and
+    a glob read the renamed copy as a file of its own) -- the numeric and dated styles
+    only, which is all the directive produces: an ``other`` style in that form would make
+    ``app-error.log`` a copy of ``app.log`` and chain it, whole, behind a hand-moved
+    ``app-old.log`` (review, reproduced).
     When ``<x>`` and ``<x>.<ext>`` both exist in one directory (compression in progress) the
     uncompressed one is kept. Compression ALWAYS creates a new inode (measured), so an inode
     alone never finds a compressed copy.
@@ -43,7 +50,14 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     full, then the live file from 0. "Newer" is by the style key when every file involved shares
     a style and by mtime otherwise (announced). A file of unrecognised style joins the chain only
     when the match itself is an unrecognised archive OF THIS LOG: a ``router.log.bak`` with a
-    fresh mtime must not be mailed as log lines.
+    fresh mtime must not be mailed as log lines. And the chain keeps to the match's naming
+    form, classic or ``extension`` (issue #51): a rotating tool uses one, and a numbered live
+    sibling -- ``worker.1.log`` beside ``worker.log`` rotated to ``worker.log.N``, or a
+    ``rotatelogs`` daily file beside a ``dateext`` log -- would otherwise be mailed whole as
+    a newer copy. Copies in the other form are left out with an INFO line. An unnamed
+    match (found by inode under a hand-made name) counts as the classic form: admitting
+    both behind it would re-open the sibling case, and a tool that rotates a hand-moved
+    file into the extension form is the rarer loss (review).
   * An archive that fails part-way through (a ``.gz`` still being written, a bogus file with an
     archive's name) yields what it had, a WARNING, and the chain continues. Nothing matching is
     one WARNING naming the file, the saved identity, the directories searched and the likely
@@ -84,7 +98,7 @@ import re
 import stat
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from logalert.cursor import (
@@ -143,17 +157,31 @@ class Archive:
     dev: int
     size: int
     mtime: float
+    ext_form: bool = False  # named in logrotate's extension form (issue #51); the chain
+    #                         keeps to the match's form
 
 
 def classify(name: str, base: str) -> tuple[Style, tuple[int, ...], str, bool] | None:
-    """The rotation style of ``name`` as an archive of ``base``, or None when it is not one."""
-    if not name.startswith(base) or name == base:
+    """The rotation style of ``name`` as an archive of ``base``, or None when it is not one:
+    ``<base><suffix>[.<compression>]``, or logrotate's ``extension`` form
+    ``<stem><suffix><ext>[.<compression>]`` where ``base`` is ``<stem><ext>`` (issue #51).
+    ``rest`` is judged the same way in both, but the extension form is never ``other``:
+    a sibling log shares the stem and the extension by nature."""
+    if name == base:
         return None
-    rest = name[len(base):]
-    compressed = False
-    ext = _EXT.search(rest)
+    plain, compressed = name, False
+    ext = _EXT.search(name)
     if ext is not None:
-        rest, compressed = rest[:ext.start()], True
+        plain, compressed = name[:ext.start()], True
+    extension_form = not plain.startswith(base)
+    if not extension_form:
+        rest = plain[len(base):]
+    else:
+        stem, own = os.path.splitext(base)
+        if not (own and len(plain) > len(base) and plain.startswith(stem)
+                and plain.endswith(own)):
+            return None
+        rest = plain[len(stem):-len(own)]
     if rest and rest[0] not in ".-":
         return None  # router.log2 is another log, not a copy of router.log
     numeric = _NUMERIC.match(rest)
@@ -174,6 +202,8 @@ def classify(name: str, base: str) -> tuple[Style, tuple[int, ...], str, bool] |
     epoch = _EPOCH.match(rest)
     if epoch is not None:
         return "dated", _epoch_key(int(epoch.group(1))), rest, compressed
+    if extension_form:
+        return None  # app-error.log is a sibling of app.log, not a copy (review)
     return "other", (), rest, compressed
 
 
@@ -218,8 +248,14 @@ def _plausible_date(fields: list[int]) -> bool:
     return year >= 1970
 
 
+_EPOCH_ZERO = datetime(1970, 1, 1, tzinfo=UTC)
+
+
 def _epoch_key(epoch: int) -> DatedKey:
-    moment = datetime.fromtimestamp(epoch, UTC)
+    # arithmetic, never fromtimestamp: on a 32-bit time_t that raises OverflowError from
+    # 2**31 on, a traceback on every run for one oddly named file (issue #51); POSIX time
+    # has no leap seconds, so the two agree everywhere else
+    moment = _EPOCH_ZERO + timedelta(seconds=epoch)
     return (moment.year, moment.month, moment.day, moment.hour, moment.minute, moment.second,
             epoch)
 
@@ -231,12 +267,17 @@ def newer(a: Archive, b: Archive) -> bool:
     return a.mtime > b.mtime
 
 
-def _oldest_first(archives: list[Archive]) -> list[Archive]:
+def _oldest_first(archives: list[Archive],
+                  prefer: tuple[int, int] | None = None) -> list[Archive]:
     """Oldest first: by the style key when every archive shares a recognised style, else by
-    mtime for the whole list -- a comparison across styles is not transitive."""
+    mtime for the whole list -- a comparison across styles is not transitive. On a key
+    tie the archive with the identity ``prefer`` (the saved one) comes first: a numbered
+    live sibling in the extension form (``worker.1.log``) ties with ``worker.log.1`` and
+    with a shared first line was taken as the match on a filesystem that lists it first
+    (issue #51, review); a secondary key only, so ext4's inode reuse gains nothing."""
     styles = {a.style for a in archives}
     if len(styles) == 1 and "other" not in styles:
-        return sorted(archives, key=lambda a: a.key)
+        return sorted(archives, key=lambda a: (a.key, (a.ino, a.dev) != prefer))
     return sorted(archives, key=lambda a: a.mtime)
 
 
@@ -300,7 +341,7 @@ def scan_directories(directories: list[str], base: str
             archive = Archive(
                 path=entry.path, of_log=found is not None, style=style, key=key, suffix=suffix,
                 compressed=compressed, ino=st.st_ino, dev=st.st_dev, size=st.st_size,
-                mtime=st.st_mtime,
+                mtime=st.st_mtime, ext_form=found is not None and not entry.name.startswith(base),
             )
             identity = (st.st_ino, st.st_dev)
             if identity not in by_identity or _rank(archive) > _rank(by_identity[identity]):
@@ -310,10 +351,12 @@ def scan_directories(directories: list[str], base: str
                              f"while looking for rotated copies ({reason}); is the directory "
                              f"searchable?", code))
     everything = list(by_identity.values())
-    twins: dict[tuple[str, str], list[Archive]] = {}
+    twins: dict[tuple[str, str, bool], list[Archive]] = {}
     for archive in everything:
-        if archive.of_log:
-            twins.setdefault((os.path.dirname(archive.path), archive.suffix), []).append(archive)
+        if archive.of_log:  # the form too (issue #51, review): a classic plain orphan left
+            # by a switch of the directive is not the twin of the extension-form .gz
+            twins.setdefault((os.path.dirname(archive.path), archive.suffix, archive.ext_form),
+                             []).append(archive)
     archives: list[Archive] = []
     for pair in twins.values():
         plain = [a for a in pair if not a.compressed]
@@ -533,7 +576,8 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
     def stages() -> None:
         """The three stages over the last listing; sets ``plan.match``."""
         since = parse_timestamp(saved.last_seen).timestamp() - _SLACK
-        recent = _oldest_first([a for a in archives if a.mtime >= since])
+        recent = _oldest_first([a for a in archives if a.mtime >= since],
+                               prefer=(saved.ino, saved.dev))
         older = list(reversed(_oldest_first([a for a in archives if a.mtime < since])))
         if saved.fingerprint is not None:
             plan.match = next((a for a in recent if fits(a, by_content=True)), None)
@@ -575,6 +619,14 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
                  if a.path != match.path and (a.path, a.ino, a.dev) not in unreadable
                  and newer(a, match)
                  and (a.style != "other" or (match.style == "other" and match.of_log))]
+        other_form = [a for a in later if a.ext_form != match.ext_form]  # issue #51
+        if other_form:
+            log.info("[%s] %s: %d rotated %s named in the other form (%s) left out of the "
+                     "chain: it keeps to the naming form of the copy it matched%s", section,
+                     path, len(other_form), "copy" if len(other_form) == 1 else "copies",
+                     ", ".join(os.path.basename(a.path) for a in other_form[:5]),
+                     "" if match.of_log else " (the classic form, for a copy with no name)")
+            later = [a for a in later if a.ext_form == match.ext_form]
         plan.chain = _oldest_first(later)
         styles = {a.style for a in [match, *plan.chain]}
         if plan.chain and (len(styles) > 1 or "other" in styles):

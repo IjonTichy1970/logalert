@@ -36,7 +36,11 @@ measured in the sandbox and on Windows):
     file is absent after a ``nocreate`` rotation or a hand-made ``gzip``) and by KIN (a name
     ``rotation.classify`` calls a numeric or dated copy of ANOTHER file matched in the same
     directory, which catches the bases the shape rule declines: ``router1.2`` beside
-    ``router1``). Otherwise ``/var/log/router*`` would read ``router.log.1.gz`` as a file of
+    ``router1`` -- and, with the name's own extension put back on the base, logrotate's
+    ``extension`` form, ``router.1.log`` and ``router-20260916.log.gz`` beside ``router.log``,
+    issue #51; a ``rotatelogs`` daily ``access-20260916.log`` is therefore left out only when
+    ``access.log`` is matched beside it, and ``worker.2.log`` alone stays a file of its
+    own). Otherwise ``/var/log/router*`` would read ``router.log.1.gz`` as a file of
     its own and mail every alert twice after each rotation, and a hand-made copy with a fresh
     mtime would be mailed whole under the run's new-file rule. The ``other`` style is NOT
     kin: ``fw-dmz`` beside ``fw`` and ``router1.example.net`` beside ``router1`` are hosts,
@@ -185,12 +189,28 @@ def _without_archives(files: list[str]) -> tuple[list[str], list[str]]:
     for path in files:
         directory, name = os.path.dirname(path), os.path.basename(path)
         if archive_suffix(name) is not None or any(
-                name[:index] in names[directory] and _rotation_of(name, name[:index])
-                for index in range(1, len(name)) if name[index] in ".-"):
+                base in names[directory] and _rotation_of(name, base)
+                for base in _kin_bases(name)):
             archives.append(path)
         else:
             kept.append(path)
     return kept, archives
+
+
+def _kin_bases(name: str) -> list[str]:
+    """The names ``name`` could be a rotation of: the text before each ``.`` or ``-``
+    (``router1`` for ``router1.2``) and, for logrotate's ``extension`` form (issue #51), that
+    text with the name's own extension put back (``router.log`` for ``router.1.log``). A
+    compressed name never reaches the kin rule: the bare compression extension is a
+    shape ``archive_suffix`` catches first."""
+    own = os.path.splitext(name)[1]
+    bases: list[str] = []
+    for index in range(1, len(name)):
+        if name[index] in ".-":
+            bases.append(name[:index])
+            if own and index < len(name) - len(own):
+                bases.append(name[:index] + own)
+    return list(dict.fromkeys(bases))  # a prefix can coincide with an earlier one plus own
 
 
 def _rotation_of(name: str, base: str) -> bool:

@@ -222,3 +222,72 @@ def test_a_glob_over_the_rotating_log_keeps_matching_the_live_file_only(tmp_path
     # (the live file's own stamp is not compared: the kernel's coarse clock can give the
     # renamed copy and the created live file the same mtime -- measured in review)
     assert [Path(p).stat().st_mtime_ns for p in copies.files[1:]] == stamps[::-1]
+
+
+# -- the extension directive (issue #51) --------------------------------------------------------
+
+
+def test_extension_with_compress(tmp_path: Path) -> None:
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    logrotate(tmp_path, path, "    create\n    compress\n    extension .log\n")
+    assert (tmp_path / "router.1.log.gz").exists()
+    append(path, LIVE)
+    source, lines, cursor = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "content"
+    assert lines == ["since 1", "since 2", "live 1"]
+    _, again, _ = run(path, cursor)
+    assert again == []
+
+
+def test_extension_with_dateext_and_compress(tmp_path: Path) -> None:
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    logrotate(tmp_path, path, "    create\n    compress\n    dateext\n    extension .log\n")
+    names = [p.name for p in tmp_path.glob("router-*.log.gz")]
+    assert len(names) == 1 and names[0][7:15].isdigit()
+    append(path, LIVE)
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "content"
+    assert lines == ["since 1", "since 2", "live 1"]
+
+
+def test_extension_without_compression_under_a_glob(tmp_path: Path) -> None:
+    """The renamed copy router.1.log was a file of its own to the glob (read from 0 under
+    the new-file rule) AND found by the catch-up by inode: the interval twice, the whole
+    copy once."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    logrotate(tmp_path, path, "    create\n    extension .log\n")
+    assert (tmp_path / "router.1.log").exists()
+    append(path, LIVE)
+    found = expand(str(tmp_path / "router*"))
+    assert found.files == (str(path),)
+    assert [Path(a).name for a in found.archives] == ["router.1.log"]
+    _, lines, cursor = run(path, saved)
+    assert lines == ["since 1", "since 2", "live 1"]
+    _, again, _ = run(path, cursor)
+    assert again == []
+
+
+def test_extension_with_delaycompress_two_rounds(tmp_path: Path) -> None:
+    """The extension-form chain against the real tool: the holder compressed, the member
+    plain, then the live file."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    for round_number in (1, 2):
+        append(path, f"round {round_number}\n".encode("ascii"))
+        logrotate(tmp_path, path,
+                  "    create\n    compress\n    delaycompress\n    extension .log\n")
+    assert sorted(p.name for p in tmp_path.glob("router.*.log*")) == ["router.1.log",
+                                                                       "router.2.log.gz"]
+    append(path, LIVE)
+    source, lines, cursor = run(path, saved)
+    assert isinstance(source, CatchUpSource)
+    assert [Path(a.path).name for a in source.plan.chain] == ["router.1.log"]
+    assert lines == ["round 1", "round 2", "live 1"]
+    _, again, _ = run(path, cursor)
+    assert again == []

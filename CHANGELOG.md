@@ -148,6 +148,13 @@ its notes.
   line named four causes the run had just ruled out. The exit code stays 0,
   #8's rule; a failed item instead is the owner's call, on the issue.
 
+- `[contract]` **logrotate's `extension` form is a rotated copy:
+  `router.1.log.gz` is read after a rotation and left out of a glob beside
+  `router.log`** (#51). The interval's lines were lost under it and the plain
+  copy was mailed whole. The chain keeps to the matched copy's naming form, so
+  a numbered live sibling is never chained as a copy; the epoch suffix no
+  longer goes through `fromtimestamp`, which overflows on a 32-bit `time_t`.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty
