@@ -107,6 +107,35 @@ def test_a_PRESENT_entry_passes(tmp_path: Path) -> None:
     assert result.returncode == EXIT_OK, result.stderr
 
 
+def test_a_prefix_match_in_a_cited_number_does_not_satisfy_a_smaller_ref(
+    tmp_path: Path,
+) -> None:
+    """#47. `(#10)` in the changelog must NOT satisfy a commit referencing `(#1)`.
+
+    A bare `f"#{n}" not in text` substring check accepted `#1` because `"#1"` is a prefix of
+    `"#10"`, manufacturing a silent false negative.
+
+    MUTATION: revert to `f"#{n}" not in text`; this reddens (exits EXIT_OK instead of EXIT_MISSING).
+    """
+    root = _repo(
+        tmp_path / "r",
+        "# Changelog\n\n- `[internal]` **Issue ten** (#10).\n",
+        ["Fix issue one (#1)"],
+    )
+    result = _run(root)
+    assert result.returncode == EXIT_MISSING
+    assert "#1" in result.stderr
+
+    # Positive control: citing #1 satisfies #1
+    root_ok = _repo(
+        tmp_path / "r_ok",
+        "# Changelog\n\n- `[internal]` **Issue one** (#1).\n- `[internal]` **Issue ten** (#10).\n",
+        ["Fix issue one (#1)"],
+    )
+    result_ok = _run(root_ok)
+    assert result_ok.returncode == EXIT_OK, result_ok.stderr
+
+
 def test_a_MERGE_commit_ref_is_not_treated_as_an_issue(tmp_path: Path) -> None:
     r"""THE test. `Merge pull request #176 from ...` is a PR number, not an issue.
 
