@@ -101,6 +101,12 @@ its notes.
   and a UTF-8 BOM defeated `^` -- all silently. A troubleshooting row names
   the three shapes.
 
+- `[contract]` **The service user's files are documented: the `file:` log is
+  pre-created (`install -o logalert -m 640 /dev/null`), the venv is made under
+  `umask 022` on a hardened host, and the state directory is owned by the
+  user, not merely writable** (#37). Three troubleshooting rows quote the
+  messages and give the remedies, including a root-owned lock.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

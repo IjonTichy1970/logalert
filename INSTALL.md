@@ -50,6 +50,25 @@ If your system ships only an unversioned `python3` with no versioned binary
 beside it, `python3` is the only option — then plan to rebuild the venv after
 every Python upgrade ([Upgrading Python](#upgrading-python)).
 
+On a host whose default umask is `027` or `077` (`UMASK` in `/etc/login.defs`,
+a hardening baseline), run every command that writes into the venv -- this
+one, step 2's `pip install`, and every upgrade -- under `umask 022`:
+
+```bash
+sudo sh -c 'umask 022; python3.12 -m venv /opt/logalert-venv'
+```
+
+`pam_umask` applies that default to every `sudo` session whatever your own
+shell's umask is (Debian and Ubuntu; measured on Ubuntu 24.04: a `077` shell
+gets `0027` under `UMASK 027`, and a `077` shell gets `0022` under `UMASK
+022`). A venv made `750` is one the service user cannot enter, and a package
+pip installed `750`/`640` into a readable venv is one it cannot import: step
+4's checks pass in a root shell (a non-root administrator sees an empty
+`readlink` and `Permission denied` on the rest), and the first command run as
+the service user fails. The service-user check at the end of step 5 catches
+both; `sudo chmod -R o+rX /opt/logalert-venv` repairs a venv already made that
+way -- until the next `pip install` made under that umask.
+
 ### 2. Download the wheel and install it
 
 From the [Releases](https://github.com/IjonTichy1970/logalert/releases) page, or
@@ -65,6 +84,13 @@ Then:
 
 ```bash
 sudo /opt/logalert-venv/bin/pip install ./logalert-X.Y.Z-py3-none-any.whl
+```
+
+On the hardened host of step 1, pip creates the package's files under the
+umask it runs with, so this too goes under `umask 022`:
+
+```bash
+sudo sh -c 'umask 022; /opt/logalert-venv/bin/pip install ./logalert-X.Y.Z-py3-none-any.whl'
 ```
 
 The `py3-none-any` wheel is pure Python — one file covers every supported Python
@@ -108,17 +134,26 @@ and one real message through the transport.
 
 logalert reads `/etc/logalert.conf` and keeps its state under
 `/var/lib/logalert` -- both **outside** the venv, which the upgrade and
-uninstall procedures below wipe whole. The state directory must be owned by the
-user the scheduled run executes as: the run writes the state file (`0600`) and
-the run lock there, and a run as root against another user's state directory is
-refused so that it cannot leave root-owned files the real user then cannot
-touch. A dedicated system user is the usual choice:
+uninstall procedures below wipe whole. The state directory must be **owned** by
+the user the scheduled run executes as -- owned, not merely writable: the run
+writes the state file (`0600`) and the run lock there, and a run as root against
+another user's state directory is refused so that it cannot leave root-owned
+files the real user then cannot touch. That refusal keys on the directory's
+owner; a `root:logalert 2770` directory lets a root run through, and the
+root-owned lock it leaves stops every later run of the service user
+([Troubleshooting](#troubleshooting)). A dedicated system user is the usual
+choice:
 
 ```bash
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin logalert
 sudo install -d -o logalert -g logalert -m 750 /var/lib/logalert
 sudo sh -c 'logalert --example-config > /etc/logalert.conf'
+sudo -u logalert /opt/logalert-venv/bin/logalert --version   # the venv is readable and executable by the service user
 ```
+
+The last line is the service-user check step 4 could not make before the user
+existed: `Permission denied` or `No module named 'logalert.__main__'` there is
+the umask trap of steps 1 and 2.
 
 Edit `/etc/logalert.conf`: at least one watch section with `subject`, `to`,
 `files` and a pattern, and `from = ` in `[logalert]` unless the default (the
@@ -229,9 +264,34 @@ journalctl -p warning -t logalert --since today
 Without `journalctl`, the syslog daemon's file for `user`-facility messages
 holds the same lines: `/var/log/syslog` on Debian and Ubuntu (readable by root
 and the `adm` group), `/var/log/messages` on Red Hat. For a file of logalert's
-own, set `log = file:/var/log/logalert.log` in `[logalert]` -- a path the
-service user can write -- or `log = stderr` to see the records on the terminal.
-`--log DEST` picks any of these for one run.
+own, set `log = file:/var/log/logalert.log` in `[logalert]` and pre-create the
+file owned by the service user -- `/var/log` is root's, so the user cannot
+create it there (every run would then say `cannot open the activity log ...;
+logging to stderr` and mail its records to cron), and a root run that is
+refused still creates the file root-owned first; a pre-created file is
+appended to by both without changing owner:
+
+```bash
+sudo install -o logalert -g logalert -m 640 /dev/null /var/log/logalert.log
+```
+
+Give it a logrotate stanza of its own, since nothing else rotates it:
+
+```
+# /etc/logrotate.d/logalert
+/var/log/logalert.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 640 logalert logalert
+}
+```
+
+Or `log = stderr` to see the records on the terminal. `--log DEST` picks any of
+these for one run.
 
 ## Keep the venv directory disposable
 
@@ -247,6 +307,10 @@ restart any running logalert process.
 ```bash
 sudo /opt/logalert-venv/bin/pip install --upgrade ./logalert-X.Y.Z-py3-none-any.whl
 ```
+
+On a host with a hardened default umask, under `umask 022` as in steps 1 and 2
+(`sudo sh -c 'umask 022; ...'`), or the upgraded package is one the service
+user cannot read.
 
 ## Upgrading Python
 
@@ -290,7 +354,7 @@ sudo rm -rf /opt/logalert-venv
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ModuleNotFoundError: No module named 'logalert'` from `/usr/local/bin/logalert` or the venv | The venv's interpreter was upgraded out from under it. Confirm: `readlink /opt/logalert-venv/bin/python` prints the unversioned `python3`, and `/opt/logalert-venv/bin/python --version` reports a minor whose `python3.X/` directory under `/opt/logalert-venv/lib` is missing — or exists but holds only pip, meaning someone already ran `venv --upgrade`. `grep ^command /opt/logalert-venv/pyvenv.cfg` shows the last `venv` command that touched the directory: `python3 -m venv` is the alias trap, `--upgrade` the wrong repair. Same fix either way. (A traceback naming `/usr/local/bin/logalert` is still a venv problem — the symlink only resolves into it.) | Rebuild the venv against the new interpreter ([Upgrading Python](#upgrading-python)). Not `venv --upgrade`. |
+| `ModuleNotFoundError: No module named 'logalert'` from `/usr/local/bin/logalert` or the venv (as every user, root included; `No module named 'logalert.__main__'` as the service user alone, with root's `--version` fine, is the umask row below instead) | The venv's interpreter was upgraded out from under it. Confirm: `readlink /opt/logalert-venv/bin/python` prints the unversioned `python3`, and `/opt/logalert-venv/bin/python --version` reports a minor whose `python3.X/` directory under `/opt/logalert-venv/lib` is missing — or exists but holds only pip, meaning someone already ran `venv --upgrade`. `grep ^command /opt/logalert-venv/pyvenv.cfg` shows the last `venv` command that touched the directory: `python3 -m venv` is the alias trap, `--upgrade` the wrong repair. Same fix either way. (A traceback naming `/usr/local/bin/logalert` is still a venv problem — the symlink only resolves into it.) | Rebuild the venv against the new interpreter ([Upgrading Python](#upgrading-python)). Not `venv --upgrade`. |
 | `cannot execute: required file not found` (bash 5.2+), `bad interpreter: No such file or directory` (older bash), or `sudo` / a service manager reporting `No such file or directory` for `/usr/local/bin/logalert` although the file exists — typically right after a **distribution release upgrade** | The venv's `bin/python3.X` symlink dangles — the old Python was **removed**, not just re-pointed. A release upgrade (Debian 12 → 13, Ubuntu LTS → LTS) drops the previous minor's packages as obsolete, so `/usr/bin/python3.X` is gone. The versioned-interpreter rule cannot prevent this; it only prevents the *silent* alias case above. Confirm: `readlink /opt/logalert-venv/bin/python3.X` names a path that no longer exists. | Rebuild against the new interpreter ([Upgrading Python](#upgrading-python)) and reinstall the same wheel — it is pure Python, so no new download is needed unless you no longer have it. Plan this step into every release upgrade. |
 | `python3.12: command not found` | That versioned binary is not installed, or the example does not match your version | Use the version you have (`ls /usr/bin/python3.* /usr/local/bin/python3.*`); on a minimal box, bare `python3` plus rebuild-on-upgrade |
 | `ensurepip is not available` (Debian/Ubuntu) | The `venv` module ships separately | `apt install python3.12-venv` (match your version) |
@@ -302,6 +366,9 @@ sudo rm -rf /opt/logalert-venv
 | `transport = auto but /usr/sbin/sendmail does not exist: install an MTA ...` (exit 2) | No mail transfer agent on the host | Install one, or `transport = smtp` with `smtp_host` (step 6) |
 | `not delivered via smtp (...): SMTPSenderRefused: 530 ...` from `--test-mail`, or the same `530` as `failed: [section] ...` in cron's mail every run (exit 1) | The relay wants a login (`Authentication required`); `transport = smtp` cannot log in | Reach it through an MTA that can, as the sendmail transport (`transport = auto`): Postfix or Exim in their smarthost configuration, `msmtp-mta` (`auth on`) or `dma` (step 6) |
 | `[section] /var/log/x.log: Permission denied` (exit 1) | The service user cannot read that log | `sudo usermod -aG adm logalert` on Debian/Ubuntu, or a group/ACL of your own (step 5) |
+| `sudo: unable to execute ...: Permission denied` at step 5 or 6, `/bin/sh: 1: /usr/local/bin/logalert: Permission denied` in cron's mail, or `status=203/EXEC` for the unit -- while the same commands work as root; or, with the venv itself readable, `ModuleNotFoundError: No module named 'logalert.__main__'` as the service user | The venv, or the package inside it, was made under a hardened default umask (`UMASK 027` or `077` in `/etc/login.defs`, applied to every `sudo` session by `pam_umask`): directories `750` or `700` the service user cannot enter, or files it cannot read | `sudo chmod -R o+rX /opt/logalert-venv` -- again after every `pip install` made under that umask -- or make the venv and its installs under `umask 022` (steps 1 and 2) |
+| `warning: cannot open the activity log /var/log/logalert.log (Permission denied); logging to stderr` in cron's mail every run -- every record of a quiet run, four or five lines | `log = file:` names a file the service user cannot create (`/var/log` is root's), or a root run created it root-owned | Pre-create it owned by the service user (step 8); an existing one: `sudo chown logalert:logalert /var/log/logalert.log` |
+| `state directory: Permission denied (/var/lib/logalert/lock) -- the lock file must belong to the user logalert runs as` (exit 1), `cannot take the run lock ... (Permission denied)` from `--reset-state`, or `state file ...: cannot read (Permission denied) -- is it owned by another user?` | A root run happened before the service user's first one, in a state directory root OWNS (`root:logalert 2770`): the lock and the state are root-owned `0600`. The refusal of root runs keys on the owner (of the state file once it exists, of the directory before), so a directory that is merely writable by the service user does not protect it | `sudo chown logalert:logalert /var/lib/logalert /var/lib/logalert/lock /var/lib/logalert/state.json` -- every position kept, and root's runs refused from then on. With no run alive the `lock` file may be removed instead, and a root-owned state replaced by `--reset-state` with no path (the lock it then takes is the user's), at the cost of every position |
 
 ## Platform notes
 

@@ -417,9 +417,10 @@ run_native_checks() {
     T=""
     skip "mktemp -d failed (TMPDIR=${TMPDIR:-unset}) -- no private tree to work in"; return
   fi
-  # The caller's umask is not ours: sudo carries a hardened 027 or 077 into the re-exec, and
-  # everything below must be readable (the venv, the confs, the fixture) and the console
-  # script executable by $SVC. mktemp gives 0700 whatever the umask.
+  # The caller's umask is not ours: pam_umask sets login.defs' UMASK (027 or 077 on a
+  # hardened host) in every sudo session whatever the caller's shell had, and everything
+  # below must be readable (the venv, the confs, the fixture) and the console script
+  # executable by $SVC. mktemp gives 0700 whatever the umask.
   umask 022
   chmod 755 "$T"
   mkdir -p "$T/bin" "$T/logs" "$T/fake" "$T/conf2"

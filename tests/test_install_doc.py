@@ -102,6 +102,52 @@ def test_the_mta_lists_name_exim_and_the_login_limit() -> None:
     assert "SMTP AUTH is not supported" in example_config()  # the shipped comment, too
 
 
+def test_the_service_users_files_are_documented_with_the_programs_own_words() -> None:
+    """Issue #37: the file: log the service user cannot create, the login.defs umask trap
+    and the root-owned lock were measured and undocumented. The pre-create line, the umask
+    form and the service-user check are in the steps; the rows quote the messages the
+    code emits, and 'owned by' is the word for the state directory in both documents."""
+    install = _text("INSTALL.md")
+    usage = _text("docs/USAGE.md")
+    line = "install -o logalert -g logalert -m 640 /dev/null /var/log/logalert.log"
+    step8 = install[install.index("### 8. Where the log is"):install.index("## Keep the venv")]
+    assert "sudo " + line in step8 and "create 640 logalert logalert" in step8
+    logging = usage[usage.index("## Logging"):usage.index("## Troubleshooting")]
+    assert line in logging.replace(NL, " ")  # the destination paragraph, wrapped
+    syslog_row = next(r for r in usage.splitlines()
+                      if r.startswith("| `warning: no usable syslog socket"))
+    assert line in syslog_row
+    step1 = install[install.index("### 1. Create the venv"):install.index("### 2. Download")]
+    assert "sudo sh -c 'umask 022; python3.12 -m venv /opt/logalert-venv'" in step1
+    step5 = install[install.index("### 5. Configuration and state"):install.index("### 6. Mail")]
+    assert "sudo -u logalert /opt/logalert-venv/bin/logalert --version" in step5
+    assert "**owned** by" in step5
+    usage_row = next(r for r in usage.splitlines() if r.startswith("| `state_file` |"))
+    assert "owned by the user" in usage_row and "writable by the user" not in usage_row
+    assert "must exist and be OWNED by the user" in example_config()
+    messages = {"cannot open the activity log ": "activity.py",
+                "logging to stderr": "activity.py",
+                "state directory: Permission denied (": "INSTALL.md",
+                "the lock file must belong to the user logalert runs as": "run.py",
+                "cannot take the run lock ": "__main__.py",
+                "cannot read (": "state.py", "is it owned ": "state.py",
+                "by another user?": "state.py",
+                "No module named 'logalert.__main__'": "INSTALL.md"}
+    for message, module in messages.items():
+        if module.endswith(".py"):  # the rows quote the program (a measured shape otherwise)
+            source = (REPO_ROOT / "logalert" / module).read_text(encoding="utf-8")
+            assert message in source, (message, module)
+        for name, text in (("INSTALL.md", install), ("docs/USAGE.md", usage)):
+            table = text[text.index("## Troubleshooting"):]
+            assert message.strip() in table, (name, message)
+    for name, text in (("INSTALL.md", install), ("docs/USAGE.md", usage)):
+        table = text[text.index("## Troubleshooting"):]
+        umask = next(r for r in table.splitlines() if "status=203/EXEC" in r)
+        assert "chmod -R o+rX /opt/logalert-venv" in umask and "login.defs" in umask, name
+        lock = next(r for r in table.splitlines() if "cannot take the run lock" in r)
+        assert "chown logalert:logalert" in lock and "every position kept" in lock, name
+
+
 def test_the_classifiers_claim_linux_and_nothing_else() -> None:
     with open(REPO_ROOT / "pyproject.toml", "rb") as handle:
         classifiers = tomllib.load(handle)["project"]["classifiers"]

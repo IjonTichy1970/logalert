@@ -22,7 +22,7 @@
 #from = logalert@example.net
 
 # Where logalert remembers its position in each file between runs. The
-# directory must exist and be writable by the user cron runs logalert as; the
+# directory must exist and be OWNED by the user cron runs logalert as; the
 # file is written 0600 and the run lock (`lock`) sits next to it. To forget a
 # position: `logalert --reset-state /path/to/file` (every file: no path).
 #state_file = /var/lib/logalert/state.json
