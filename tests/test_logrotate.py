@@ -291,3 +291,25 @@ def test_extension_with_delaycompress_two_rounds(tmp_path: Path) -> None:
     assert lines == ["round 1", "round 2", "live 1"]
     _, again, _ = run(path, cursor)
     assert again == []
+
+
+def test_a_gap_deeper_than_rotate_keeps_reads_the_surviving_copies(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """rotate 1 with two rotations between runs (issue #64): the holder is gone, the copy
+    rotated meanwhile is read before the live file, and only the holder's tail is lost."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    logrotate(tmp_path, path, "    create\n    rotate 1\n")
+    append(path, b"middle 1\n")
+    logrotate(tmp_path, path, "    create\n    rotate 1\n")  # the holder is dropped
+    assert sorted(p.name for p in tmp_path.glob("router.log*")) == ["router.log", "router.log.1"]
+    append(path, LIVE)
+    caplog.set_level("WARNING", logger="logalert")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is None
+    assert lines == ["middle 1", "live 1"]
+    warned = [r.getMessage() for r in caplog.records if "no rotated copy" in r.getMessage()]
+    assert len(warned) == 1 and "the archive aged out" in warned[0]
+    assert "reading the 1 rotated copy written since the last run" in warned[0]

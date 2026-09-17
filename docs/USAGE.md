@@ -385,7 +385,9 @@ entries, so the
 section whose mail failed keeps its place while the other advances. The state is
 saved after each section, atomically; a section whose delivery failed keeps the
 positions of the files that contributed to the message (the next run re-sends
-them) and marks them seen, so a file whose mail keeps failing never expires. A
+them) and their sighting -- the moment a position was taken bounds what a
+rotation gap reads back -- marking them seen once they are halfway to expiry,
+so a file whose mail keeps failing never expires. A
 file read for the first time that run is kept too, at the position where that
 read began: the beginning under `--from-start`, `start = beginning` or the
 new-file rule, otherwise the end it started at. A file of that section that
@@ -439,8 +441,10 @@ away, removed). The run stops there and says so:
 
 Its position stays at the end of the last copy it read, and the next run carries
 on from there under the new names, so nothing is mailed twice or lost --
-provided that copy is still there at the next run: keep one rotation more than
-the interval between runs needs. A rotation landing between the directory
+provided that copy is still there at the next run; when it is not (its number
+plus the rotations since exceeds `rotate`), the copies newer than it are still
+read (the warning below), and only what that copy held after the position is
+lost. A rotation landing between the directory
 listing and the copies' opens makes the run list the directory again, once; a
 second rotation inside one run reaches the warning below, whose first cause is
 then `a second rotation during this run (a copy was renamed twice)`.
@@ -449,8 +453,21 @@ then `a second rotation during this run (a copy was renamed twice)`.
 says so:
 
 ```
-[router-disk] /var/log/router.log: no rotated copy holds the saved position (...) in /var/log -- likely causes: ...; reading the live file from the beginning, and lines written between the last run and the last rotation are lost
+[router-disk] /var/log/router.log: no rotated copy holds the saved position (...) in /var/log -- likely causes: ...; reading the 2 rotated copies written since the last run from the beginning (router.log.2, then router.log.1), then the live file; what was written between the last run and the oldest of them is lost
 ```
+
+The copies written after the last run are read in full, oldest first, before
+the live file: they hold lines never mailed, whichever copy held the saved
+position (rotation ran more times than `rotate` keeps copies, say). What is
+lost is what that copy held after the position. The set keeps to the
+recognised styles and to one naming form: the classic one when any classic
+copy is among them, else the extension form's compressed copies and a plain
+one newer than all of them (`delaycompress` leaves the newest plain) -- any
+other plain file in that form is what a numbered live sibling such as
+`router.1.log` looks like, and is left out with a log line -- and leaves out
+a copy the user cannot read. With no such copy the line ends `reading the
+live file from the beginning, and lines written between the last run and the
+last rotation are lost`.
 
 The `likely causes` the line names, in the log's own words: `rotate 0` (the
 rotating tool keeps no copies), `an olddir or -a elsewhere (set archive_dir)`
@@ -474,8 +491,9 @@ less readable than its log takes a hand `chmod`, a foreign tool or an `olddir`
 the running user cannot enter: logrotate's `compress` keeps the log's mode and
 group. A file replaced by one that is not a continuation of it -- a different
 first line, or a new inode with no archive behind it -- says the same thing. The
-run does not fail on it -- the live file is read from the beginning, so anything
-in it is mailed once -- except when a permission was the cause: then the run is
+run does not fail on it -- the copies written since and the live file are read
+from the beginning, so anything in them is mailed once -- except when a
+permission was the cause: then the run is
 exit 1 with the item `a permission kept the rotated copies out of reach
 (router.log.1); the lines before the rotation are lost`, the position moving
 on all the same, so cron carries the line once per rotation until the mode is
@@ -820,7 +838,7 @@ configured destination still gets INFO and above.
 | `scanning exceeded scan_timeout (300 s) at line N while trying regex '...'` (exit 1), or `stale lock` every run with PID N alive at 100 % CPU | A regex with a nested quantifier on a long line (`(x+)+`, `(\w+\s?)+`): `re` backtracks without bound; on Windows nothing bounds it | Simplify the regex (an anchor, a delimiter class instead of `\w+\s?`); the file is re-read next run, so `--reset-state <file>` skips the line if the log must keep it; `--check-config` names the shape |
 | A pattern or exclude with an umlaut (any non-ASCII text) never matches, or a `^` regex misses the first line, or a file is `N line(s) read, 0 matched` under an ASCII pattern, with `skipped M NUL bytes` in the log once it has more than one line | Lines are decoded as UTF-8 and nothing else: a latin-1 log, a UTF-8 BOM before line 1 (U+FEFF, which stands between `^` and the text), a UTF-16 export (every other byte is a NUL). Nothing warns at run time; a missed exclude lets the line through with U+FFFD where the byte was | Write the log as UTF-8 (`iconv -f latin1 -t utf-8`, or the exporter's encoding setting); an unanchored literal for a file with a BOM; `--check-config` names a non-ASCII pattern or exclude |
 | A pattern starting with `#` or `;` never matches | The parser drops such a continuation line as a comment | A regex with the escape: `\#`, `\;` |
-| `no rotated copy holds the saved position ...` in the log after every rotation (exit 1 with `a permission kept the rotated copies out of reach (...)` when that is the cause) | The archives are elsewhere, or fewer are kept than rotations happen between runs -- or the running user cannot read the copy or search its directory, and the causes say so | Set `archive_dir`, or run logalert more often than the rotation; grant read on the copies (a group; `olddir`'s mode) |
+| `no rotated copy holds the saved position ...` in the log after every rotation (exit 1 with `a permission kept the rotated copies out of reach (...)` when that is the cause) | The archives are elsewhere, or fewer are kept than rotations happen between runs (the copies rotated since the last run are read; what the missing one held after the position is lost) -- or the running user cannot read the copy or search its directory, and the causes say so | Set `archive_dir`, or run logalert more often than the rotation; grant read on the copies (a group; `olddir`'s mode) |
 | `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config (or as `--check-config` lists a glob's match), or the file was never seen; given the glob itself it says `is a glob` | Use the exact path; `--reset-state` with no path forgets everything |
 | A glob mails nothing, or a file it should read is missing from `--check-config` | The glob matches nothing where it looks (`matches nothing`), or the file is left out as a rotated copy (`left out:` -- a name ending in `.N` or a date such as `app.2024`, a `.bak` or `.gz` twin), or it is not a regular file or is a symbolic link (`passed over:`) | `logalert --check-config` names every match and everything left out; list a wanted file by name, or set `include_archives = yes` for a directory of dated live files |
 | `[section] /var/log/app/current: is a symbolic link owned by app to a file owned by root; not followed (...)` (exit 1) | A listed path is a link whose owner is neither root, nor the running user, nor the owner of the file it points to -- in a directory another user owns, what the name resolves to is that user's choice | List the file itself, or make the link root's (`chown -h root <link>`); a link another user planted is the reason the rule exists |

@@ -71,7 +71,17 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
   * An archive that fails part-way through (a ``.gz`` still being written, a bogus file with an
     archive's name) yields what it had, a WARNING, and the chain continues. Nothing matching is
     one WARNING naming the file, the saved identity, the directories searched and the likely
-    causes; the live file is then read from 0 and the exit code is untouched. A copy the
+    causes; the copies of this log written AFTER the last run are then read in full,
+    oldest first (issue #64: they are ours or newer by the rule above, and skipping them
+    lost every line of an interval that rotated deeper than ``rotate`` keeps -- measured,
+    routine after a stop under a tight ``rotate``), the live file after them from 0, and
+    the exit code is untouched; what the holder held after the position is what is lost.
+    That set keeps to the recognised styles (a ``router.log.bak`` with a fresh mtime is
+    not log lines) and to ONE naming form -- the classic one when any classic copy is
+    recent, else the extension form's compressed copies: a numbered live sibling
+    (``worker.1.log``, issue #51) is a plain file in that form with a fresh mtime, and
+    nothing confirms the form without a match -- and leaves out a copy a permission
+    refused. A copy the
     running user cannot read, a directory it cannot list, and a directory it can list but
     not search (``0644``: the entries cannot be examined) are each ONE warning, in the
     errno's words (issue #38: the read failure was warned about twice, once per search
@@ -655,9 +665,11 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
         if plan.match is None:
             for leftover in kept.values():
                 leftover.close()
+            plan.chain = _written_since(section, path, archives, unreadable, saved)  # #64
             _nothing_matched(section, path, saved, verdict, directories, renamed=bool(renamed),
-                             unreadable=denied, unsearchable=unsearchable)
-            if refused:  # the live file is read from 0 (an absent one never surfaces the plan)
+                             unreadable=denied, unsearchable=unsearchable,
+                             chain=plan.chain)
+            if refused:  # the readable copies and the live file are read; the item stands
                 plan.denied = (f"a permission kept the rotated copies out of reach "
                                f"({', '.join(refused)}); the lines before the rotation are lost")
             return plan
@@ -695,6 +707,51 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
         for leftover in kept.values():
             leftover.close()
         raise
+
+
+def _written_since(section: str, path: str, archives: list[Archive],
+                   unreadable: set[tuple[str, int, int]], saved: Cursor) -> list[Archive]:
+    """The chain when nothing matched (issue #64): the archives of this log written after
+    the last run -- ours or newer, every one -- that are readable and of a recognised
+    style, in one naming form, oldest first: the classic one when any classic copy is
+    among them, else the extension form's compressed copies and a plain one newer than
+    every compressed copy (``delaycompress`` leaves exactly the newest plain) -- any other
+    plain file in that form is what a numbered live sibling (``worker.1.log``, issue
+    #51) looks like, and a compressed file is never a live log. For a cursor PARKED on a
+    copy the set is the copies newer than
+    that copy: what the stopped run had still to read was written before it ran, so
+    ``last_seen`` bounds nothing there (review: the S4 layout lost both copies)."""
+    if saved.mtime is not None:  # parked (issue #65): not older than the parked copy
+        # not older, rather than newer: a coarse clock stamps two writes alike (a 15 ms
+        # tick on Windows, a jiffy on ext4), and the parked copy itself is gone or
+        # unreadable here, or the mtime stage would have taken it
+        recent = [a for a in archives if a.mtime >= saved.mtime]
+    else:
+        since = parse_timestamp(saved.last_seen).timestamp() - _SLACK
+        recent = [a for a in archives if a.mtime >= since]
+    recent = [a for a in recent if a.style != "other"
+              and (a.path, a.ino, a.dev) not in unreadable]
+    classic = [a for a in recent if not a.ext_form]
+    if classic:
+        chain, left_out = classic, [a for a in recent if a.ext_form]
+        why = "the copies read keep to one naming form"
+    else:
+        # a compressed copy is never a live log, and delaycompress leaves exactly the
+        # newest copy plain: a plain copy newer than every compressed one is the tool's;
+        # any other plain file in that form is what a numbered live sibling looks like
+        packed = [a for a in recent if a.compressed]
+        chain = packed + [a for a in recent if not a.compressed and packed
+                          and all(newer(a, p) for p in packed)]
+        left_out = [a for a in recent if a not in chain]
+        why = ("a plain file in that form is what a numbered live sibling looks like; "
+               "without a match only a compressed copy, or a plain one newer than every "
+               "compressed copy, is read")
+    if left_out:
+        log.info("[%s] %s: %d rotated %s named in the extension form (%s) left out of the "
+                 "copies read: %s", section, path, len(left_out),
+                 "copy" if len(left_out) == 1 else "copies",
+                 ", ".join(os.path.basename(a.path) for a in left_out[:5]), why)
+    return _oldest_first(chain)
 
 
 def _named(target: str, real: str) -> str:
@@ -738,11 +795,16 @@ CAUSE_SECOND_ROTATION = "a second rotation during this run (a copy was renamed t
 CAUSE_UNREADABLE = "a rotated copy this user cannot read (named above)"
 CAUSE_UNSEARCHABLE = "a directory this user cannot list or search (named above)"
 CAUSE_NO_FIRST_LINE = "the file had no complete first line at the last run"
+# the warning's two tails (issue #64), in the words docs/USAGE.md quotes
+TAIL_LIVE_ONLY = ("reading the live file from the beginning, and lines written between "
+                  "the last run and the last rotation are lost")
+TAIL_COPIES = "what was written between the last run and the oldest of them is lost"
 
 
 def _nothing_matched(section: str, path: str, saved: Cursor, verdict: Verdict | None,
                      directories: list[str], *, renamed: bool = False,
-                     unreadable: bool = False, unsearchable: bool = False) -> None:
+                     unreadable: bool = False, unsearchable: bool = False,
+                     chain: list[Archive] | None = None) -> None:
     identity = (f"inode {saved.ino}, offset {saved.offset}, first-line hash "
                 f"{(saved.fingerprint or 'none')[:12]}")
     causes = list(CAUSES)
@@ -756,14 +818,23 @@ def _nothing_matched(section: str, path: str, saved: Cursor, verdict: Verdict | 
     if saved.fingerprint is None:
         causes.append(CAUSE_NO_FIRST_LINE)
     where = ", ".join(directories)
+    if chain:  # the copies written since the last run are read (issue #64)
+        names = ", then ".join(os.path.basename(a.path) for a in chain[:5])
+        read = (f"reading the {len(chain)} rotated {'copy' if len(chain) == 1 else 'copies'} "
+                f"written since the last run from the beginning ({names}"
+                f"{', ...' if len(chain) > 5 else ''})")
     if verdict is None:
         log.info("[%s] %s: absent this run, and no rotated copy holds the saved position (%s) "
-                 "in %s", section, path, identity, where)
+                 "in %s%s", section, path, identity, where, f"; {read}" if chain else "")
+        return
+    if chain:
+        log.warning("[%s] %s: no rotated copy holds the saved position (%s) in %s -- likely "
+                    "causes: %s; %s, then the live file; %s",
+                    section, path, identity, where, ", ".join(causes), read, TAIL_COPIES)
         return
     log.warning("[%s] %s: no rotated copy holds the saved position (%s) in %s -- likely "
-                "causes: %s; reading the live file from the beginning, and lines written "
-                "between the last run and the last rotation are lost",
-                section, path, identity, where, ", ".join(causes))
+                "causes: %s; %s", section, path, identity, where, ", ".join(causes),
+                TAIL_LIVE_ONLY)
 
 
 class Segment:
@@ -911,7 +982,8 @@ class CatchUpSource:
             self.segments.append(Segment(section, plan.match.path, saved.offset,
                                          (plan.match.ino, plan.match.dev), saved.line,
                                          verified=plan.verified))
-            self.segments += [Segment(section, a.path, 0, (a.ino, a.dev)) for a in plan.chain]
+        # with no match: the copies written since the last run, in full (issue #64)
+        self.segments += [Segment(section, a.path, 0, (a.ino, a.dev)) for a in plan.chain]
 
     def context_before(self, n: int) -> list[Line]:
         """The lines before the stream's first line: those before the saved offset in the
@@ -1001,7 +1073,8 @@ def open_source(section: str, path: str, saved: Cursor | None, *,
                 archive_dir: str | None = None, from_start: bool = False) -> Source | None:
     """What the run loop reads for one (section, file): the live file, with its rotated copies
     first when the cursor says the file rotated or was truncated; None when there is nothing
-    to read this run (the file is absent and no copy holds the saved position). The run loop
+    to read this run (the file is absent, no copy holds the saved position and none was
+    written since the last run). The run loop
     calls this, never ``LogFile`` directly, so a rotation is never read from 0 alone."""
     try:
         live: LogFile | None = LogFile(section, path, saved, from_start=from_start)
@@ -1021,7 +1094,7 @@ def open_source(section: str, path: str, saved: Cursor | None, *,
         if live is not None:
             live.close()
         raise
-    if live is None and plan.match is None:
+    if live is None and plan.match is None and not plan.chain:
         return None
     try:
         return CatchUpSource(section, path, plan, live, saved)

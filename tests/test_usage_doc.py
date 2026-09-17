@@ -164,6 +164,8 @@ def test_the_causes_paragraph_quotes_every_cause_in_the_logs_own_words() -> None
         CAUSE_UNREADABLE,
         CAUSE_UNSEARCHABLE,
         CAUSES,
+        TAIL_COPIES,
+        TAIL_LIVE_ONLY,
     )
     text = _text()
     paragraph = text[text.index('**The "no rotated copy" warning.**'):
@@ -172,6 +174,8 @@ def test_the_causes_paragraph_quotes_every_cause_in_the_logs_own_words() -> None
                   CAUSE_NO_FIRST_LINE):
         assert "`" + cause + "`" in paragraph, cause
     assert "a permission kept the rotated copies out of reach" in paragraph  # the item
+    for tail in (TAIL_COPIES, TAIL_LIVE_ONLY):  # the two ways the line ends (issue #64)
+        assert tail in paragraph, tail
     for shape in ("could not be read (Permission denied); skipped",
                   "cannot list /var/log/old while looking for rotated copies (Permission denied)",
                   "entries of /var/log/old while looking for rotated copies (Permission denied); "

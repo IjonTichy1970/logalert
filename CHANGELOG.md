@@ -162,6 +162,13 @@ its notes.
   inode with the same first line was taken too. The state gains two optional
   fields on such an entry.
 
+- `[contract]` **When no rotated copy holds the saved position, the copies
+  written since are read before the live file instead of being skipped** (#64).
+  After a rotation gap deeper than `rotate` keeps -- routine after a stop under
+  a tight `rotate` -- every line of those copies was lost with the copies in
+  the directory. A refused delivery now keeps the entry's sighting too (touched
+  once halfway to `state_ttl`), so the gap's bound stays at the position.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

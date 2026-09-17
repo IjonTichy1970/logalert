@@ -33,7 +33,7 @@ from logalert.rotation import (
     plan_catch_up,
     scan_directories,
 )
-from logalert.state import Cursor, State, load_state, timestamp
+from logalert.state import Cursor, State, load_state, parse_timestamp, timestamp
 
 SECTION = "router-disk"
 NLB = chr(10).encode()  # a newline as bytes, for fixtures built in a comprehension
@@ -533,7 +533,10 @@ def test_archive_shorter_than_the_offset_is_not_ours(
     caplog.set_level(logging.WARNING, logger="logalert")
     source, lines, _ = run(path, replace(saved, ino=NOWHERE))
     assert isinstance(source, CatchUpSource) and source.plan.match is None
-    assert lines == ["live 1"]
+    # not the holder -- but written since the last run, so read whole (issue #64): new
+    # content where every file opens with the same line, a duplicate where it is a
+    # restored backup with a fresh mtime; never a loss
+    assert lines == ["old 1", "old 2", "live 1"]
     assert any("no rotated copy holds the saved position" in r.getMessage()
                for r in caplog.records)
 
@@ -1228,8 +1231,12 @@ def test_a_rotation_between_the_scan_and_the_content_stage_is_found_by_a_rescan(
 def test_a_second_rename_inside_one_plan_reaches_the_warning_with_its_cause(
         tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The rescan is once: renamed under again, the plan gives up as before, and the
-    warning's first cause says why (the old text named four causes, none of them this)."""
+    """The rescan is once: renamed under again, the plan gives up, and the warning's first
+    cause says why (the old text named four causes, none of them this). The copies the
+    stale listing names are then tried (issue #64) and the first is renamed under too:
+    the stop, nothing read, the saved position kept -- and the next run, under the
+    settled names, reads every line once (the old answer read the live handle from 0
+    and lost the archives for good)."""
     if sys.platform == "win32":
         pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
                     "the sandbox and on CI")
@@ -1246,13 +1253,18 @@ def test_a_second_rename_inside_one_plan_reaches_the_warning_with_its_cause(
 
     monkeypatch.setattr(rotation, "scan_directories", scan_then_rotate)
     caplog.set_level(logging.WARNING, logger="logalert.rotation")
-    _, lines, _ = run(path, saved)
+    source, lines, cursor = run(path, saved)
     assert calls["n"] == 2  # once more, never a third time
-    assert lines == ["live 1"]  # the live file the run opened, from 0; the archives are lost
+    assert isinstance(source, CatchUpSource) and source.stopped
+    assert lines == [] and cursor == saved  # nothing read: the names had moved on again
     warned = [r.getMessage() for r in caplog.records if "no rotated copy" in r.getMessage()]
     assert len(warned) == 1
     assert "likely causes: a second rotation during this run (a copy was renamed twice), " \
         "rotate 0, " in warned[0]  # first, before the four old causes
+    assert any("stopping here, the next run resumes after the saved position"
+               in r.getMessage() for r in caplog.records)
+    _, rest, _ = run(path, saved)  # the names settled: the holder is found, then the rest
+    assert rest == ["since 1", "middle 1", "live 1", "live 2", "live 3"]
 
 
 def test_the_holder_gone_at_the_content_stage_is_found_again_under_its_new_name(
@@ -1375,10 +1387,16 @@ def test_one_rename_then_the_copy_gone_names_no_second_rotation(
     caplog.set_level(logging.WARNING, logger="logalert.rotation")
     _, lines, _ = run(path, saved)
     assert calls["n"] == 2
-    assert lines == ["live 1"]  # the live file the run opened, from 0
+    # the copy rotated meanwhile (.2 = middle 1; the live handle's file is .1 by now and
+    # excluded), then the live file the run opened, from 0 (issue #64: "live 1" alone
+    # before, middle 1 lost)
+    assert lines == ["middle 1", "live 1"]
     warned = [r.getMessage() for r in caplog.records if "no rotated copy" in r.getMessage()]
     assert len(warned) == 1 and "the archive aged out" in warned[0]
     assert "a second rotation" not in warned[0]
+    assert warned[0].endswith("reading the 1 rotated copy written since the last run from "
+                              "the beginning (router.log.2), then the live file; what was "
+                              "written between the last run and the oldest of them is lost")
 
 
 def test_an_unreadable_chain_member_is_skipped_not_a_stop(
@@ -1488,9 +1506,12 @@ def test_an_unreadable_copy_is_warned_about_once_in_the_errnos_words_and_named_a
     monkeypatch.setattr("logalert.rotation.open_log", refuse)
     caplog.set_level(logging.WARNING, logger="logalert.rotation")
     _, lines, cursor = run(path, saved)
-    assert lines == ["live 1"]
+    assert lines == ["middle 1", "live 1"]  # the readable copy written since (#64)
     assert cursor is not None and cursor.ino == path.stat().st_ino
     warned = _warnings(caplog)
+    assert warned[-1].endswith("reading the 1 rotated copy written since the last run from "
+                               "the beginning (router.log.1), then the live file; what was "
+                               "written between the last run and the oldest of them is lost")
     assert warned == [
         f"[{SECTION}] {path}: rotated copy {holder} could not be read (Permission denied); "
         f"skipped",
@@ -1513,7 +1534,7 @@ def test_a_copy_the_mode_refuses_is_one_warning_and_the_cause(
         _, lines, _ = run(path, saved)
     finally:
         (tmp_path / "router.log.2").chmod(0o644)
-    assert lines == ["live 1"]
+    assert lines == ["middle 1", "live 1"]  # the readable copy written since (issue #64)
     warned = _warnings(caplog)
     assert len(warned) == 2 and warned[0].endswith("could not be read (Permission denied); skipped")
     assert "(named above), rotate 0" in warned[1]
@@ -1864,7 +1885,7 @@ def test_a_permission_names_the_failed_item_a_corrupt_copy_does_not(
 
     monkeypatch.setattr("logalert.rotation.open_log", refuse)
     source, lines, _ = run(path, saved)
-    assert isinstance(source, CatchUpSource) and lines == ["live 1"]
+    assert isinstance(source, CatchUpSource) and lines == ["middle 1", "live 1"]
     assert source.plan.denied == ("a permission kept the rotated copies out of reach "
                                   "(router.log.2); the lines before the rotation are lost")
     monkeypatch.setattr("logalert.rotation.open_log", real_open)
@@ -2231,3 +2252,230 @@ def test_the_parked_name_moved_inside_the_plan_makes_the_run_list_again(
     assert source.plan.stage == "mtime" and source.plan.match is not None
     assert source.plan.match.path.endswith("router.log.3.gz")
     assert rest[:4] == ["=== router boot log ===", "middle 1", "middle 2", "middle 3"]
+
+
+# -- nothing matched: the copies written since the last run are read (issue #64) ---------------
+
+
+def _aged_out(tmp_path: Path) -> tuple[Path, Cursor]:
+    """rotate 2 with three rotations between two runs: the holder is gone, .2 = 'middle 1'
+    and .1 = 'live 1' were both written after the last run, the live file holds 'live 2'."""
+    path, saved = _two_rotations(tmp_path)
+    _third_rotation(tmp_path)
+    (tmp_path / "router.log.3").unlink()
+    return path, saved
+
+
+def test_the_copies_written_since_the_last_run_are_read_when_nothing_matched(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Measured (the #32 review, S4): the run read the live file alone and 'middle 1' and
+    'live 1' were lost with their copies sitting in the directory."""
+    path, saved = _aged_out(tmp_path)
+    caplog.set_level(logging.WARNING, logger="logalert")
+    source, lines, cursor = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is None
+    assert source.plan.stage == "" and [os.path.basename(a.path) for a in source.plan.chain] == [
+        "router.log.2", "router.log.1"]
+    assert lines == ["middle 1", "live 1", "live 2"]
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warned) == 1 and "the archive aged out" in warned[0]
+    assert warned[0].endswith(
+        "reading the 2 rotated copies written since the last run from the beginning "
+        "(router.log.2, then router.log.1), then the live file; what was written between the "
+        "last run and the oldest of them is lost")
+
+
+def test_a_stop_then_a_shift_that_drops_the_holder_loses_only_the_holders_tail(
+        tmp_path: Path) -> None:
+    """S4 itself: the stop parks on the holder, one more shift under rotate 2 drops it, and
+    the copies rotated meanwhile are read -- every surviving line once across the two runs."""
+    path, saved = _two_rotations(tmp_path)
+    # real time: the copies were written well before the run that stops (a minute and
+    # more here; hours in real life), so the last-seen bound alone would leave them
+    # out (review, both platforms) -- a parked cursor reads what is not older than the
+    # parked copy
+    for name, back in (("router.log.2", 90), ("router.log.1", 60), ("router.log", 30)):
+        os.utime(tmp_path / name, (time.time() - back, time.time() - back))
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    kept = (tmp_path / "router.log.1").stat().st_mtime
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    os.utime(tmp_path / "router.log.1.gz", (kept, kept))  # as gzip keeps it
+    (tmp_path / "router.log.1").unlink()
+    with source:
+        first = texts(list(source.lines()))
+        parked = source.cursor()
+    assert first == ["since 1"]
+    _shift_after_the_stop(tmp_path, b"live 2")
+    (tmp_path / "router.log.3").unlink()  # rotate 2: the parked copy is dropped
+    again, rest, _ = run(path, parked)
+    assert isinstance(again, CatchUpSource) and again.plan.match is None
+    assert rest == ["middle 1", "live 1", "live 2"]
+    assert first + rest == ["since 1", "middle 1", "live 1", "live 2"]
+
+
+def test_a_copy_from_before_the_last_run_is_never_read_when_nothing_matched(
+        tmp_path: Path) -> None:
+    """The mutation: a chain built from `older` too would mail lines sent long ago."""
+    path, saved = _aged_out(tmp_path)
+    ancient = tmp_path / "router.log.4"
+    ancient.write_bytes(b"ancient 1" + NLB)
+    os.utime(ancient, (1_700_000_000, 1_700_000_000))
+    _, lines, _ = run(path, saved)
+    assert lines == ["middle 1", "live 1", "live 2"]
+
+
+def test_an_other_style_copy_with_a_fresh_mtime_is_not_read_when_nothing_matched(
+        tmp_path: Path) -> None:
+    path, saved = _aged_out(tmp_path)
+    (tmp_path / "router.log.bak").write_bytes(b"a hand-made copy" + NLB)
+    _, lines, _ = run(path, saved)
+    assert lines == ["middle 1", "live 1", "live 2"]
+
+
+def test_the_copies_read_without_a_match_keep_to_one_naming_form(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A numbered live sibling in the extension form (router.1.log, issue #51) has a fresh
+    mtime and is not a copy; with classic copies present it stays out, and says so."""
+    path, saved = _aged_out(tmp_path)
+    (tmp_path / "router.1.log").write_bytes(b"sibling 1" + NLB)
+    caplog.set_level(logging.INFO, logger="logalert.rotation")
+    _, lines, _ = run(path, saved)
+    assert lines == ["middle 1", "live 1", "live 2"]
+    assert any("1 rotated copy named in the extension form (router.1.log) left out of the "
+               "copies read: the copies read keep to one naming form" in r.getMessage()
+               for r in caplog.records)
+    # the extension form alone: its compressed copies are read, a plain file in that
+    # form is not -- a numbered live sibling is a plain file in that form
+    (tmp_path / "router.log.2").unlink()
+    (tmp_path / "router.log.1").unlink()
+    (tmp_path / "router.1.log").replace(tmp_path / "router.3.log")  # the sibling, renumbered:
+    #   beside router.1.log.gz the twin rule would keep the plain one as a compression
+    #   in progress
+    compress_to(tmp_path / "router.2.log.gz", b"ext 2" + NLB)
+    compress_to(tmp_path / "router.1.log.gz", b"ext 1" + NLB)
+    caplog.clear()
+    _, lines, _ = run(path, saved)
+    assert lines == ["ext 2", "ext 1", "live 2"]
+    assert any("(router.3.log) left out of the copies read: a plain file in that form is "
+               "what a numbered live sibling looks like" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_an_absent_live_file_with_copies_written_since_reads_them_and_parks(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """nocreate and a gap deeper than rotate keeps: the copies are read now, the cursor parks
+    on the last of them, and the writer's return is a plain rotation next run."""
+    path, saved = _aged_out(tmp_path)
+    path.unlink()
+    caplog.set_level(logging.INFO, logger="logalert")
+    source, lines, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.verdict == "absent"
+    assert lines == ["middle 1", "live 1"]
+    assert parked is not None and parked.ino == (tmp_path / "router.log.1").stat().st_ino
+    assert parked.mtime == (tmp_path / "router.log.1").stat().st_mtime
+    assert any(r.getMessage().endswith(
+        "; reading the 2 rotated copies written since the last run from the beginning "
+        "(router.log.2, then router.log.1)") for r in caplog.records
+        if "absent this run" in r.getMessage())
+    path.write_bytes(b"live 2" + NLB)
+    again, rest, _ = run(path, parked)
+    assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
+    assert rest == ["live 2"]
+
+
+def test_a_cursor_with_no_first_line_reads_the_copies_written_since(tmp_path: Path) -> None:
+    """The issue proposed keeping the live-only answer for a cursor with no hash; corrected:
+    such a cursor has read nothing (offset 0) -- or, past 2000 bytes of an unterminated
+    first line, a cut fragment of it, which is then mailed twice (review) -- so the
+    copies are read."""
+    path = tmp_path / "router.log"
+    saved = seen(path, b"")
+    assert saved.fingerprint is None and saved.offset == 0
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1.gz", compress=True)  # a new inode: no inode hit
+    path.write_bytes(b"live 1" + NLB)
+    # ext4 hands the freed inode number straight back (measured): the new live file
+    # would then read as a continuation of the empty one; the saved inode is fabricated
+    _, lines, _ = run(path, replace(saved, ino=NOWHERE))
+    assert lines == ["since 1", "live 1"]
+
+
+def test_an_unreadable_recent_copy_stays_out_of_the_no_match_chain(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A copy a permission refused is the #38 item, warned about once; the others are read."""
+    if sys.platform == "win32":
+        pytest.skip("mode bits are fabricated on Windows; runs in the sandbox and on CI")
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 0000 file; expected in the root sandbox; CI runs it")
+    path, saved = _aged_out(tmp_path)
+    (tmp_path / "router.log.2").chmod(0o000)
+    caplog.set_level(logging.WARNING, logger="logalert")
+    try:
+        source, lines, _ = run(path, saved)
+    finally:
+        (tmp_path / "router.log.2").chmod(0o644)
+    assert isinstance(source, CatchUpSource)
+    assert lines == ["live 1", "live 2"]
+    assert source.plan.denied.startswith("a permission kept the rotated copies out of reach "
+                                         "(router.log.2)")
+    assert sum("could not be read" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_a_compressed_copy_confirms_the_extension_form_for_its_delayed_plain_sibling(
+        tmp_path: Path) -> None:
+    """extension + delaycompress (review): the delayed plain router.1.log is newer than the
+    compressed router.2.log.gz, so it is read; alone, or older than a compressed copy, a
+    plain file in that form is not (it is what a numbered live sibling looks like)."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    path.unlink()
+    compress_to(tmp_path / "router.2.log.gz", b"ext 2" + NLB)
+    (tmp_path / "router.1.log").write_bytes(b"ext 1" + NLB)
+    path.write_bytes(b"live 1" + NLB)
+    _, lines, _ = run(path, saved)
+    assert lines == ["ext 2", "ext 1", "live 1"]
+    (tmp_path / "router.3.log").write_bytes(b"sibling 3" + NLB)  # older than .2.log.gz
+    _, lines, _ = run(path, saved)
+    assert lines == ["ext 2", "ext 1", "live 1"]
+    (tmp_path / "router.2.log.gz").unlink()
+    _, lines, _ = run(path, saved)
+    assert lines == ["live 1"]
+
+
+def test_the_last_seen_bound_keeps_its_slack(tmp_path: Path) -> None:
+    """A copy stamped one second before last_seen is read (last_seen is whole seconds and the
+    copy may be from the run itself); three seconds before, it is not."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    path.unlink()
+    path.write_bytes(b"live 1" + NLB)
+    last_seen = parse_timestamp(saved.last_seen).timestamp()
+    for name, back in (("router.log.2", 3), ("router.log.1", 1)):
+        (tmp_path / name).write_bytes(name.encode("ascii") + NLB)
+        os.utime(tmp_path / name, (last_seen - back, last_seen - back))
+    _, lines, _ = run(path, saved)
+    assert lines == ["router.log.1", "live 1"]
+
+
+def test_an_absent_live_file_with_a_refused_holder_and_a_readable_copy_is_the_item(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plan surfaces for an absent live file now (issue #64); a permission that kept the
+    holder out of reach is the #38 item there too, beside the copy that was read."""
+    path, saved = _aged_out(tmp_path)
+    (tmp_path / "router.log.3").write_bytes(OLD + b"since 1" + NLB)  # the holder is back
+    holder = str(tmp_path / "router.log.3")
+    real_open = open_log
+
+    def refuse(target: str, *, follow_links: bool = False) -> BinaryStream:
+        if target == holder:
+            raise PermissionError(13, "Permission denied", target)
+        return real_open(target, follow_links=follow_links)
+
+    monkeypatch.setattr("logalert.rotation.open_log", refuse)
+    path.unlink()
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and lines == ["middle 1", "live 1"]
+    assert source.failed_item() == ("a permission kept the rotated copies out of reach "
+                                    "(router.log.3); the lines before the rotation are lost")

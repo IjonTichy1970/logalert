@@ -56,8 +56,12 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     and matched nothing moves anyway (none of its lines is in the message -- the summary
     still names it -- and context never crosses files) -- a file at its first sight in that
     run would otherwise be first-sighted again next time and lose what was written in
-    between. Every file read is ``touch``ed so it never expires while its mail keeps
-    failing -- and a contributing file with NO entry yet (a first sight under
+    between. A contributing file keeps its SIGHTING as well as its place: ``last_seen``
+    is the moment its position was taken, and bounds what a rotation gap reads back
+    (issue #64: the copies newer than it), so it is ``touch``ed only once it is halfway
+    to expiry -- and never expires while its mail keeps failing (review of #64: a touch
+    on every refusal moved the bound past copies never delivered). A contributing
+    file with NO entry yet (a first sight under
     ``--from-start``, ``start = beginning`` or the new-file rule; a plain first sight a
     writer appended to between the end-seek and the read) gets one at the offset its read
     began (``start_cursor``, issue #31): ``touch`` is a no-op without an entry, and the
@@ -421,14 +425,25 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
                 # a first sight that contributed (issue #31): its entry is where the read
                 # began, so the next run re-sends exactly these lines
                 state.set(watch.name, path, starts[path])
-            else:
-                state.touch(watch.name, path)
+            elif _halfway_to_expiry(state.get(watch.name, path), config.settings.state_ttl_days):
+                state.touch(watch.name, path)  # its last_seen bounds a gap's read (#64)
         _save(state, watch.name, outcome, delivered=False)
         return
     outcome.sent += 1
     for recipient, answer in delivery.refused:
         outcome.fail(f"[{watch.name}] refused: {recipient} -- {answer}")
     _advance(watch, state, cursors, options, outcome, started, seen, delivered=True)
+
+
+def _halfway_to_expiry(cursor: Cursor | None, ttl_days: int) -> bool:
+    """Whether a refused delivery should still move the entry's sighting: only when it is
+    halfway to expiry, so it never expires while its mail keeps failing (issue #12) and
+    otherwise keeps the moment its position was taken (issue #64).
+    """
+    if cursor is None:
+        return False
+    age = datetime.now(UTC) - parse_timestamp(cursor.last_seen)
+    return age.total_seconds() > ttl_days * 86400 / 2
 
 
 def _pin_first_sight(watch: Watch, state: State, path: str, starts: dict[str, Cursor]) -> None:

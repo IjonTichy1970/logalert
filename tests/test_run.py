@@ -209,12 +209,14 @@ def test_an_unreadable_file_is_named_the_rest_is_processed_its_cursor_untouched(
 def test_a_failed_delivery_keeps_that_sections_place_and_a_rerun_resends_it_only(
         site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     site.prime()
-    # age the firewall entry so a touch is visible: same-second timestamps compare equal
+    # age the firewall entry past half of state_ttl (30 days), where a refused delivery
+    # still touches it (issue #64: a younger entry keeps the moment its position was
+    # taken, which bounds what a rotation gap reads back)
     state = load_state(str(site.state_file))
     aged = state.get("firewall", site.firewall.as_posix())
     assert aged is not None
     state.set("firewall", site.firewall.as_posix(),
-              replace(aged, last_seen=timestamp(datetime.now(UTC) - timedelta(days=2))))
+              replace(aged, last_seen=timestamp(datetime.now(UTC) - timedelta(days=16))))
     state.save()
     primed = site.state()["firewall"][site.firewall.as_posix()]
     site.append(site.router, "disk failure now")
@@ -1046,7 +1048,7 @@ def test_every_file_read_is_touched_when_the_delivery_fails(
     sibling.write_text("up" + NL, encoding="utf-8", newline=NL)
     site.write_config(firewall_files=site.firewall.as_posix() + NL + f"    {sibling.as_posix()}")
     site.prime()
-    first = age(site, "firewall", site.firewall, days=2)
+    first = age(site, "firewall", site.firewall, days=16)  # past half of state_ttl (#64)
     second = age(site, "firewall", sibling, days=2)
     site.append(site.firewall, "DENY 192.0.2.9")
     site.append(sibling, "quiet")  # read, nothing matched: still present
@@ -1689,3 +1691,18 @@ def test_a_permission_on_the_rotated_copy_is_a_failed_item_and_the_position_move
     assert "disk failure after" in body and "before the rotation" not in body
     assert site.offset("router-disk", site.router) == site.router.stat().st_size  # moved on
     assert site.run() == 0 and len(site.calls()) == 1  # the next run: nothing to say
+
+
+def test_a_refused_delivery_keeps_a_young_entrys_sighting(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review of #64: a touch on every refusal moved last_seen past copies the refused run had
+    read, and a later rotation gap left them out. An entry under half of state_ttl keeps
+    the moment its position was taken."""
+    site.prime()
+    primed = age(site, "firewall", site.firewall, days=2)
+    site.append(site.firewall, "DENY 192.0.2.9")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    assert site.run() == 1
+    capsys.readouterr()
+    after = site.state()["firewall"][site.firewall.as_posix()]
+    assert after["offset"] == primed["offset"] and after["last_seen"] == primed["last_seen"]
