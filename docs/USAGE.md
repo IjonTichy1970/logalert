@@ -77,7 +77,7 @@ example and exits before the run-only flags are examined.
 | Exit | Meaning | What is printed |
 | --- | --- | --- |
 | 0 | The run completed; every section that had something to send was sent. | Nothing, on either stream. A match is the normal outcome, not an event. |
-| 1 | Something needs attention: a file that could not be read, a delivery that failed, a recipient the server refused, a state file that could not be saved, a stale lock, a corrupt state file. | Exactly one line on stderr naming every failed item, and the detail in the activity log. |
+| 1 | Something needs attention: a file that could not be read, a delivery that failed, a recipient the server refused, a state file that could not be saved, a stale lock, a corrupt state file, a rotated copy a permission kept out of reach. | Exactly one line on stderr naming every failed item, and the detail in the activity log. |
 | 2 | A usage or configuration error; nothing ran. | argparse's own message, or `logalert: <what is wrong>`. |
 | 130 | Interrupted (Ctrl-C). The lock is released, a sendmail child is killed with its process group, no temp file is left. | `logalert: interrupted`. |
 | 143 | Terminated (SIGTERM: `kill`, a `timeout` wrapper's expiry -- `timeout` itself then reports 124 unless given `--preserve-status` -- or systemd's `TimeoutStartSec=`). The same cleanup as 130; a message the sendmail child had read entirely may still be queued. | `logalert: terminated`. |
@@ -469,8 +469,14 @@ less readable than its log takes a hand `chmod`, a foreign tool or an `olddir`
 the running user cannot enter: logrotate's `compress` keeps the log's mode and
 group. A file replaced by one that is not a continuation of it -- a different
 first line, or a new inode with no archive behind it -- says the same thing. The
-run does not fail on it; the live file is read from the beginning, so anything
-in it is mailed once.
+run does not fail on it -- the live file is read from the beginning, so anything
+in it is mailed once -- except when a permission was the cause: then the run is
+exit 1 with the item `a permission kept the rotated copies out of reach
+(router.log.1); the lines before the rotation are lost`, the position moving
+on all the same, so cron carries the line once per rotation until the mode is
+fixed; a copy the chain could not read for a permission is the item `a
+permission kept a rotated copy out of reach (router.log.1); its lines are
+lost`.
 
 **Forgetting a position.** `logalert --reset-state /var/log/router.log` forgets
 every section's position in that file; `logalert --reset-state` forgets them
@@ -809,7 +815,7 @@ configured destination still gets INFO and above.
 | `scanning exceeded scan_timeout (300 s) at line N while trying regex '...'` (exit 1), or `stale lock` every run with PID N alive at 100 % CPU | A regex with a nested quantifier on a long line (`(x+)+`, `(\w+\s?)+`): `re` backtracks without bound; on Windows nothing bounds it | Simplify the regex (an anchor, a delimiter class instead of `\w+\s?`); the file is re-read next run, so `--reset-state <file>` skips the line if the log must keep it; `--check-config` names the shape |
 | A pattern or exclude with an umlaut (any non-ASCII text) never matches, or a `^` regex misses the first line, or a file is `N line(s) read, 0 matched` under an ASCII pattern, with `skipped M NUL bytes` in the log once it has more than one line | Lines are decoded as UTF-8 and nothing else: a latin-1 log, a UTF-8 BOM before line 1 (U+FEFF, which stands between `^` and the text), a UTF-16 export (every other byte is a NUL). Nothing warns at run time; a missed exclude lets the line through with U+FFFD where the byte was | Write the log as UTF-8 (`iconv -f latin1 -t utf-8`, or the exporter's encoding setting); an unanchored literal for a file with a BOM; `--check-config` names a non-ASCII pattern or exclude |
 | A pattern starting with `#` or `;` never matches | The parser drops such a continuation line as a comment | A regex with the escape: `\#`, `\;` |
-| `no rotated copy holds the saved position ...` in the log after every rotation | The archives are elsewhere, or fewer are kept than rotations happen between runs -- or the running user cannot read the copy or search its directory, and the causes say so | Set `archive_dir`, or run logalert more often than the rotation; grant read on the copies (a group; `olddir`'s mode) |
+| `no rotated copy holds the saved position ...` in the log after every rotation (exit 1 with `a permission kept the rotated copies out of reach (...)` when that is the cause) | The archives are elsewhere, or fewer are kept than rotations happen between runs -- or the running user cannot read the copy or search its directory, and the causes say so | Set `archive_dir`, or run logalert more often than the rotation; grant read on the copies (a group; `olddir`'s mode) |
 | `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config (or as `--check-config` lists a glob's match), or the file was never seen; given the glob itself it says `is a glob` | Use the exact path; `--reset-state` with no path forgets everything |
 | A glob mails nothing, or a file it should read is missing from `--check-config` | The glob matches nothing where it looks (`matches nothing`), or the file is left out as a rotated copy (`left out:` -- a name ending in `.N` or a date such as `app.2024`, a `.bak` or `.gz` twin), or it is not a regular file or is a symbolic link (`passed over:`) | `logalert --check-config` names every match and everything left out; list a wanted file by name, or set `include_archives = yes` for a directory of dated live files |
 | `[section] /var/log/app/current: is a symbolic link owned by app to a file owned by root; not followed (...)` (exit 1) | A listed path is a link whose owner is neither root, nor the running user, nor the owner of the file it points to -- in a directory another user owns, what the name resolves to is that user's choice | List the file itself, or make the link root's (`chown -h root <link>`); a link another user planted is the reason the rule exists |

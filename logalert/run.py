@@ -28,8 +28,10 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     that cannot be read is a failed item and its cursor stays where it was, the section
     continues; a file absent this run is nothing to do (its cursor and its ``last_seen``
     stay, so it expires in time); a source is scanned with the section's context (or
-    ``-c``) and its ``max_lines`` cap, its cursor taken after the read. A first sight starts
-    at the end of the file unless ``--from-start`` or ``start = beginning`` -- or, for a
+    ``-c``) and its ``max_lines`` cap, its cursor taken after the read; a rotation catch-up a
+    permission refused (issue #38) is a failed item too, with the cursor moving on. A first
+    sight starts at the end of the file unless ``--from-start`` or ``start = beginning`` --
+    or, for a
     path a glob matched, the NEW-FILE RULE (issue #18): some glob that matched it has a
     recorded moment (the start of the last saved run that listed its directories without
     error) and the file's mtime is not older than it -- a new daily file is all new
@@ -113,7 +115,7 @@ from logalert.globs import expand, is_glob
 from logalert.lock import LockBusy, RunLock
 from logalert.mail import Mail, clean_header, compose
 from logalert.match import FileReport, progress, scan
-from logalert.rotation import open_source
+from logalert.rotation import CatchUpSource, open_source
 from logalert.state import (
     Cursor,
     State,
@@ -368,6 +370,10 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
                 # outside the bound (review): an alarm handled on the way out of it must
                 # not leave a cursor here for _advance to save past lines never mailed
                 cursors[path] = source.cursor()
+            if isinstance(source, CatchUpSource) and source.failed_item():
+                # a permission kept a copy out of reach, the holder or a chain member
+                # (issue #38): a failed item, the position moving on all the same
+                outcome.fail(f"[{watch.name}] {path}: {source.failed_item()}")
         except OSError as exc:  # an archive vanishing mid-read, a corrupt stream
             outcome.fail(f"[{watch.name}] {path}: {_reason(exc, path)}")
             _pin_first_sight(watch, state, path, starts)

@@ -1659,3 +1659,33 @@ def test_a_quiet_first_sight_read_from_the_start_moves_on_in_a_failed_section(
     assert site.run("--from-start") == 1
     assert site.offset("firewall", quiet) == quiet.stat().st_size  # read from 0, moved on
     assert site.offset("firewall", site.firewall) == 0  # contributed: where its read began
+
+
+def test_a_permission_on_the_rotated_copy_is_a_failed_item_and_the_position_moves_on(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The owner's call on #38 (option C): exit 1 naming what the permission kept out of
+    reach, so cron carries the line once per rotation, while the cursor moves on to the
+    live file -- a kept cursor would leave the section stuck behind a permanent mode."""
+    site.prime()
+    site.append(site.router, "disk failure before the rotation")
+    copy = site.root / "router.log.1"
+    site.router.replace(copy)  # a rename rotation; the copy holds the position
+    site.router.write_text("disk failure after" + NL, encoding="utf-8", newline=NL)
+    real_open = logalert.cursor.open_log  # the name rotation looks up
+
+    def refuse(target: str, *, follow_links: bool = False) -> Any:
+        if os.path.normcase(target) == os.path.normcase(str(copy)):
+            raise PermissionError(13, "Permission denied", target)
+        return real_open(target, follow_links=follow_links)
+
+    monkeypatch.setattr("logalert.rotation.open_log", refuse)
+    assert site.run() == 1
+    err = capsys.readouterr().err
+    assert err == (f"logalert: 1 of 1 section sent; failed: [router-disk] "
+                   f"{site.router.as_posix()}: a permission kept the rotated copies out of reach "
+                   f"(router.log.1); the lines before the rotation are lost; see the log" + NL)
+    (_, stdin), = site.calls()
+    body = body_of(stdin)
+    assert "disk failure after" in body and "before the rotation" not in body
+    assert site.offset("router-disk", site.router) == site.router.stat().st_size  # moved on
+    assert site.run() == 0 and len(site.calls()) == 1  # the next run: nothing to say

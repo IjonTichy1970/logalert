@@ -640,7 +640,7 @@ def test_scan_ignores_directories_devices_and_unreadable_dirs(
     assert [os.path.basename(a.path) for a in everything] == ["router.log.2"]
     assert [a.suffix for a in archives] == [".2"]
     assert len(problems) == 1 and problems[0][0].startswith("cannot list ")  # logged by the plan
-    assert problems[0][1] == errno.ENOENT  # the cause names a permission only
+    assert problems[0][1:] == (errno.ENOENT, str(tmp_path / "nope"))  # a permission only
     assert not caplog.records  # once, by the caller (issue #38), not here
 
 
@@ -1631,8 +1631,11 @@ def test_a_listing_a_permission_refuses_is_one_warning_and_the_cause_on_every_pl
 
     monkeypatch.setattr(os, "scandir", refuse)
     caplog.set_level(logging.WARNING, logger="logalert.rotation")
-    _, lines, _ = run(path, saved, archive_dir=old)
+    source, lines, _ = run(path, saved, archive_dir=old)
     assert lines == ["live 1"]
+    assert isinstance(source, CatchUpSource) and source.failed_item() == (
+        f"a permission kept the rotated copies out of reach ({old}); the lines before the "
+        f"rotation are lost")  # a directory by its path
     warned = _warnings(caplog)
     assert warned[0] == (f"[{SECTION}] {path}: cannot list {old} while looking for rotated "
                          f"copies (Permission denied)")
@@ -1672,7 +1675,8 @@ def test_an_entry_whose_kind_needs_an_lstat_the_directory_refuses_counts_as_deni
     everything, archives, problems = scan_directories([str(old)], "router.log")
     assert everything == [] and archives == []
     assert problems == [(f"cannot examine 2 of the 2 entries of {old} while looking for rotated "
-                         f"copies (Permission denied); is the directory searchable?", 13)]
+                         f"copies (Permission denied); is the directory searchable?", 13,
+                         str(old))]
 
 
 # -- logrotate's extension directive (issue #51) ------------------------------------------------
@@ -1839,3 +1843,88 @@ def test_the_saved_identity_wins_a_key_tie_against_a_sibling_with_the_same_first
     assert source.plan.match is not None
     assert Path(source.plan.match.path).name == "worker.log.1"
     assert lines == ["since 1", "since 2", "live 1"]
+
+
+def test_a_permission_names_the_failed_item_a_corrupt_copy_does_not(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The owner's call on #38: a permission that kept the copies out of reach when nothing
+    matched is a failed item the run collects (Plan.denied); a corrupt copy stays a warning."""
+    path, saved = _two_rotations(tmp_path)
+    holder = str(tmp_path / "router.log.2")
+    real_open = open_log
+
+    def refuse(target: str, *, follow_links: bool = False) -> BinaryStream:
+        if target == holder:
+            raise PermissionError(13, "Permission denied", target)
+        return real_open(target, follow_links=follow_links)
+
+    monkeypatch.setattr("logalert.rotation.open_log", refuse)
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and lines == ["live 1"]
+    assert source.plan.denied == ("a permission kept the rotated copies out of reach "
+                                  "(router.log.2); the lines before the rotation are lost")
+    monkeypatch.setattr("logalert.rotation.open_log", real_open)
+    bogus = tmp_path / "bogus"
+    bogus.mkdir()
+    other = bogus / "router.log"
+    saved = seen(other, OLD)
+    other.unlink()
+    (bogus / "router.log.1.gz").write_bytes(b"not gzip at all" + NLB)
+    other.write_bytes(LIVE)
+    source, lines, _ = run(other, saved)
+    assert isinstance(source, CatchUpSource) and lines == ["live 1"]
+    assert source.plan.denied == ""
+
+
+def test_a_refused_older_copy_is_no_item_when_the_holder_is_found(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """The item is for the loss: an older copy a permission refuses while the holder is
+    found by content costs nothing but the warning."""
+    path, saved = _two_rotations(tmp_path)
+    two = tmp_path / "router.log.2"
+    holder = tmp_path / "router.log.2.gz"
+    holder.write_bytes(gzip.compress(two.read_bytes()))  # a new inode: the content stage
+    two.unlink()
+    third = tmp_path / "router.log.3.gz"
+    third.write_bytes(gzip.compress(b"ancient" + NLB))
+    stamp = holder.stat().st_mtime
+    os.utime(third, (stamp, stamp))  # recent enough for the content stage, and tried first
+    real_open = open_log
+    opened: list[str] = []
+
+    def refuse(target: str, *, follow_links: bool = False) -> BinaryStream:
+        opened.append(os.path.basename(target))
+        if target == str(third):
+            raise PermissionError(13, "Permission denied", target)
+        return real_open(target, follow_links=follow_links)
+
+    monkeypatch.setattr("logalert.rotation.open_log", refuse)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and "router.log.3.gz" in opened
+    assert lines == ["since 1", "middle 1", "live 1"]
+    assert source.failed_item() == ""
+    assert [w for w in _warnings(caplog) if "could not be read" in w] == [
+        f"[{SECTION}] {path}: rotated copy {third} could not be read (Permission denied); "
+        f"skipped"]
+
+
+def test_a_chain_member_a_permission_refuses_is_the_item_too(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The owner's rationale covers the chain: a member the mode keeps out of reach loses
+    its lines the same way, so the run gets the item (review)."""
+    path, saved = _two_rotations(tmp_path)
+    member = str(tmp_path / "router.log.1")
+    real_open = open_log
+
+    def refuse(target: str, *, follow_links: bool = False) -> BinaryStream:
+        if target == member:
+            raise PermissionError(13, "Permission denied", target)
+        return real_open(target, follow_links=follow_links)
+
+    monkeypatch.setattr("logalert.rotation.open_log", refuse)
+    source, lines, cursor = run(path, saved)
+    assert isinstance(source, CatchUpSource) and lines == ["since 1", "live 1"]
+    assert source.failed_item() == ("a permission kept a rotated copy out of reach "
+                                    "(router.log.1); its lines are lost")
+    assert cursor is not None and cursor.ino == path.stat().st_ino  # moved on

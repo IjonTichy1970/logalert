@@ -171,6 +171,7 @@ def test_the_causes_paragraph_quotes_every_cause_in_the_logs_own_words() -> None
     for cause in (*CAUSES, CAUSE_SECOND_ROTATION, CAUSE_UNREADABLE, CAUSE_UNSEARCHABLE,
                   CAUSE_NO_FIRST_LINE):
         assert "`" + cause + "`" in paragraph, cause
+    assert "a permission kept the rotated copies out of reach" in paragraph  # the item
     for shape in ("could not be read (Permission denied); skipped",
                   "cannot list /var/log/old while looking for rotated copies (Permission denied)",
                   "entries of /var/log/old while looking for rotated copies (Permission denied); "

@@ -141,12 +141,12 @@ its notes.
   `--from-start` file got no entry, was first-sighted at its end next run,
   and its lines were never sent.
 
-- `[contract]` **A rotated copy the user cannot read, and a directory it
-  cannot list or search, are one warning each, and the no-copy line names the
-  permission as its first cause** (#38). The read failure was warned about
-  twice, the unsearchable directory dropped without a word, and the causes
-  line named four causes the run had just ruled out. The exit code stays 0,
-  #8's rule; a failed item instead is the owner's call, on the issue.
+- `[contract]` **A rotated copy a permission keeps out of reach is a failed
+  item (exit 1), the position moving on all the same; a copy or directory the
+  user cannot read is one warning, and the no-copy line names the permission
+  first** (#38). The read failure was warned about twice, the unsearchable
+  directory dropped without a word, and the causes line named four causes the
+  run had just ruled out. A corrupt copy stays a warning.
 
 - `[contract]` **logrotate's `extension` form is a rotated copy:
   `router.1.log.gz` is read after a rotation and left out of a glob beside

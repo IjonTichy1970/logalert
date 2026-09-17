@@ -67,8 +67,12 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     errno's words (issue #38: the read failure was warned about twice, once per search
     stage, and the stat-time failure was dropped without a word), and the no-copy warning
     then names the permission as its first cause instead of four causes the run itself has
-    ruled out. The exit code stays untouched -- #8's rule; whether the permission should be
-    a failed item instead is the owner's call, recorded on the issue.
+    ruled out. When a permission was the cause and nothing matched, the run is exit 1 for it
+    (the owner's call, 2026-09-17: a permission is the operator's to fix, and a quiet
+    journal line after every rotation is the watch-gone-quiet shape #18 refused) -- the
+    ``Plan`` names the item and the run loop collects it -- while the position still moves
+    on to the live file: a kept cursor would leave the section stuck behind a mode that is
+    usually permanent. A corrupt or unsupported copy stays a warning.
   * The live file may be ABSENT after a rotation (``nocreate``). With a cursor on record the search
     runs anyway; the cursor then describes the last archive read, so the next run -- when the live
     file is back under a new inode -- resolves that archive by inode or first line and reads
@@ -289,7 +293,7 @@ def _rank(archive: Archive) -> int:
 
 
 def scan_directories(directories: list[str], base: str
-                     ) -> tuple[list[Archive], list[Archive], list[tuple[str, int | None]]]:
+                     ) -> tuple[list[Archive], list[Archive], list[tuple[str, int | None, str]]]:
     """Every regular file in the directories (for the inode stage), the archives of ``base``
     among them (for the content stage and the chain), compression-in-progress pairs collapsed
     to the uncompressed member -- and the problems met on the way, one message each with its
@@ -298,13 +302,13 @@ def scan_directories(directories: list[str], base: str
     links are skipped;
     hard links to one file keep the better-named entry."""
     by_identity: dict[tuple[int, int], Archive] = {}
-    problems: list[tuple[str, int | None]] = []
+    problems: list[tuple[str, int | None, str]] = []  # (message, errno, the directory)
     for directory in directories:
         try:
             entries = list(os.scandir(directory))
         except OSError as exc:
             problems.append((f"cannot list {directory} while looking for rotated copies "
-                             f"({_said(exc)})", exc.errno))
+                             f"({_said(exc)})", exc.errno, directory))
             continue
         examined = denied = 0
         reason = ""
@@ -349,7 +353,7 @@ def scan_directories(directories: list[str], base: str
         if denied:
             problems.append((f"cannot examine {denied} of the {examined} entries of {directory} "
                              f"while looking for rotated copies ({reason}); is the directory "
-                             f"searchable?", code))
+                             f"searchable?", code, directory))
     everything = list(by_identity.values())
     twins: dict[tuple[str, str, bool], list[Archive]] = {}
     for archive in everything:
@@ -492,6 +496,8 @@ class Plan:
     stage: str = ""  # "inode" | "content" | "" (nothing matched)
     searched: list[str] = field(default_factory=list)
     verified: "Verified | None" = None  # the match's open handle, positioned at the offset
+    denied: str = ""  # the failed item when a permission kept the copies out of reach and
+    #                    nothing matched (issue #38, the owner's call); the run collects it
 
 
 @dataclass
@@ -535,6 +541,7 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
     #   inode, never because an unrelated file appeared in the directory
     renamed: set[str] = set()
     denied = False  # a permission refused a copy in some listing (issue #38)
+    refused: list[str] = []  # what the permissions kept out of reach, for the failed item
     warned: set[str] = set()  # the directory problems, logged once across the listings
     unsearchable = False  # one of them was a permission
     kept: dict[str, Verified] = {}
@@ -548,7 +555,11 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
         answer = _content_matches(section, path, archive, saved, by_content=by_content)
         if answer is None or isinstance(answer, Denied):
             unreadable.add((archive.path, archive.ino, archive.dev))
-            denied = denied or isinstance(answer, Denied)  # a permission, not a corrupt file
+            if isinstance(answer, Denied):  # a permission, not a corrupt file
+                denied = True
+                name = _named(archive.path, real)
+                if name not in refused:
+                    refused.append(name)
             return False
         if isinstance(answer, Renamed):
             renamed.add(archive.path)
@@ -562,12 +573,14 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
         """One listing of the directories; what it saw, by name and identity."""
         nonlocal everything, archives, unsearchable
         everything, archives, problems = scan_directories(directories, os.path.basename(real))
-        for problem, code in problems:
+        for problem, code, directory in problems:
             if problem not in warned:  # the comparison listing meets the same ones
                 warned.add(problem)
                 log.warning("[%s] %s: %s", section, path, problem)
             if code in (errno.EACCES, errno.EPERM):  # a missing archive_dir is not one
                 unsearchable = True
+                if directory not in refused:
+                    refused.append(directory)
         if exclude is not None:
             everything = [a for a in everything if (a.ino, a.dev) != exclude]
             archives = [a for a in archives if (a.ino, a.dev) != exclude]
@@ -611,6 +624,9 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
                 leftover.close()
             _nothing_matched(section, path, saved, verdict, directories, renamed=bool(renamed),
                              unreadable=denied, unsearchable=unsearchable)
+            if refused:  # the live file is read from 0 (an absent one never surfaces the plan)
+                plan.denied = (f"a permission kept the rotated copies out of reach "
+                               f"({', '.join(refused)}); the lines before the rotation are lost")
             return plan
         plan.stage = "inode" if (plan.match.ino, plan.match.dev) == (saved.ino, saved.dev) \
             else "content"
@@ -644,6 +660,14 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
         for leftover in kept.values():
             leftover.close()
         raise
+
+
+def _named(target: str, real: str) -> str:
+    """How a failed item names a copy: by its name beside the log, by its path elsewhere
+    (the stderr line travels without the log; the operator looks beside the live file)."""
+    if os.path.dirname(target) == os.path.dirname(real):
+        return os.path.basename(target)
+    return target
 
 
 def _newest_older_fit(section: str, path: str, older: list[Archive], saved: Cursor,
@@ -728,6 +752,7 @@ class Segment:
         self.finished = False
         self.yielded = False  # at least one line came out of it
         self.renamed = False  # renamed or gone at its open: the stream stops here (issue #32)
+        self.denied = False  # a permission refused it: the run's failed item (issue #38)
         self.handle: BinaryStream | None = verified.handle if verified else None
 
     def lines(self) -> Iterator[Line]:
@@ -770,6 +795,7 @@ class Segment:
                 self.finished = True
         except _READ_ERRORS as exc:
             self.finished = True  # nothing more will come of it this run
+            self.denied = isinstance(exc, PermissionError)
             log.warning("[%s] %s: rotated copy could not be read past offset %d (%s); "
                         "continuing with the next file", self.section, self.path,
                         self.offset, _said(exc))
@@ -875,6 +901,16 @@ class CatchUpSource:
         (issue #31; the same surface as ``LogFile``, never consumed here -- a catch-up has
         an entry -- and a consumer must not move ``last_seen`` backwards)."""
         return replace(self.saved, last_seen=timestamp(now))
+
+    def failed_item(self) -> str:
+        """What the run records as a failed item (issue #38, the owner's call): the plan's,
+        when a permission kept the copies out of reach and nothing matched, or the chain
+        members a permission refused -- their lines are lost the same way."""
+        refused = [_named(s.path, self.realpath) for s in self.segments if s.denied]
+        if refused:
+            return (f"a permission kept a rotated copy out of reach ({', '.join(refused)}); "
+                    f"its lines are lost")
+        return self.plan.denied
 
     def cursor(self, now: datetime | None = None) -> Cursor:
         unfinished = [s for s in self.segments if s.started and not s.finished]
