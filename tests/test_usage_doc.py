@@ -54,3 +54,18 @@ def test_the_exit_code_table_names_every_code() -> None:
     table = text[text.index("## Exit codes"):text.index("## Configuration reference")]
     for code in ("0", "1", "2", "130"):
         assert f"| {code} |" in table, f"exit {code} is not in the table"
+
+
+def test_the_mail_section_names_the_report_cap_and_the_escapes_from_a_refused_message() -> None:
+    """Issue #25: a message a relay refuses for its size was rebuilt and refused every run,
+    and the document never said so nor named a way out. The cap and the three escapes are
+    what an operator needs at 3 a.m.; a dropped sentence reddens here."""
+    text = _text()
+    reference = text[text.index("## Configuration reference"):text.index("## Position tracking")]
+    assert "cut at 1 MiB" in reference  # the max_lines row
+    mail = text[text.index("## Mail"):text.index("## Logging")]
+    assert "refused for the same reason every" in mail
+    for escape in ("`max_lines`", "`exclude_regex`", "`--reset-state <file>`"):
+        assert escape in mail, escape
+    table = text[text.index("## Troubleshooting"):]
+    assert "refusal in cron's mail every run" in table

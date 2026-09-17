@@ -25,6 +25,46 @@ its notes.
   `f"#{n}" not in text` accepted `#1` on the strength of a cited `#10`.
   A regex boundary `(?<!\d)#N(?!\d)` prevents false negatives.
 
+- `[internal]` **A test pins STARTTLS to a verifying SSL context** (#40).
+  `starttls()` without the context passed the whole suite, and the stdlib's
+  default there verifies nothing.
+
+- `[contract]` **The run lock is `0600`; a stale-lock line says when the
+  recorded holder is gone** (#27). `flock` needs no write access, so a lock any
+  local user could open read-only was a lock any local user could hold. A lock
+  left `0644` by 0.1.0 is tightened by the next run; the gone-holder line points
+  at `fuser` instead of a dead PID.
+
+- `[contract]` **A `state_file` that is a symbolic link is refused** (#39). A
+  link never worked as a redirect: the first save replaced the link itself with
+  a regular file, silently, and the root-refusal rule judged the link's target.
+
+- `[contract]` **A listed symbolic link is followed only when its owner is
+  root, the running user or the file's owner** (#26). In a directory another
+  user owns, what a listed name resolves to is that user's choice; a link they
+  plant towards a file that is not theirs is now a failed item, not a mail.
+  Root's `/var/log/foo -> /data/foo` and an application's own `current ->
+  today.log` keep working.
+
+- `[internal]` **Logs, archives and the `file:` log are opened by descriptor,
+  never by name after a check** (#29). A FIFO swapped in between the check and
+  the open blocked `open(2)` for good, with the lock held; a non-blocking open
+  and `fstat` on what was opened close that window.
+
+- `[contract]` **A report is cut at 1 MiB of text, and the trailer says so**
+  (#25). A message a relay refused for its size was rebuilt from the same
+  position and refused every run, and the section stopped alerting; 1 MiB is
+  1.4 MB on the wire as base64, up to 3.2 MB as quoted-printable, under a
+  default limit either way. `docs/USAGE.md` names the escapes from a message
+  refused for any other reason every run.
+
+- `[contract]` **`scan_timeout` bounds one file's scan (300 s; `0` is off), and
+  `--check-config` warns about a regex with a nested quantifier** (#28). Such a
+  regex runs for hours on one long line of ordinary words, holding the lock;
+  past the bound the file is a failed item naming the line and the pattern,
+  its position kept. Enforced on POSIX; Windows reports the key and cannot
+  enforce it.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

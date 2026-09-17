@@ -21,8 +21,9 @@ the records themselves are emitted by the other modules on the ``logalert.*`` lo
     open failure out of ``logger.info()`` into the caller, which would abort a run at its first
     record. It is opened by us, like the lock: ``O_NOFOLLOW`` (a symlink planted at the path by
     another user would have a root run append into any file of that user's choosing) and a
-    regular-file check (a FIFO with no reader blocks ``open(2)`` for good, before the lock, so
-    cron runs would pile up); a state file, the run lock or the config file as the destination
+    regular-file check, with ``O_NONBLOCK`` on the open itself so a FIFO swapped in after the
+    check is ``ENXIO`` at once (issue #29; a FIFO with no reader blocks ``open(2)`` for good,
+    before the lock, so cron runs would pile up); a state file, the run lock or the config file
     is refused by the loader and by ``--log``. ``udp:`` is built only when configured -- a
     datagram to a port nobody listens on is silent forever, the "logs nowhere" fault -- and an
     unresolvable host raises at construction; ``udp:[2001:db8::1]:514`` is the IPv6 spelling.
@@ -63,6 +64,9 @@ from typing import TextIO
 
 from logalert.config import udp_address
 from logalert.mail import clean_header
+
+if sys.platform != "win32":
+    import fcntl
 
 LOGGER = "logalert"
 SYSLOG_SOCKETS = ("/dev/log", "/var/run/log", "/var/run/syslog")
@@ -159,13 +163,22 @@ class _File(_Loud, logging.FileHandler):
             raise IsADirectoryError(errno.EISDIR, "is a directory")
         if not stat.S_ISREG(mode):
             raise OSError(errno.EINVAL, "not a regular file")
-        # O_BINARY: the CRT would translate the text layer's newlines a second time
+        # O_BINARY: the CRT would translate the text layer's newlines a second time.
+        # O_NONBLOCK (issue #29): a FIFO swapped in after the lstat is ENXIO at once instead
+        # of an open(2) that waits for a reader, before the lock, with cron piling up behind
         flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-                 | getattr(os, "O_BINARY", 0))
-        fd = os.open(path, flags, 0o644)
+                 | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+        try:
+            fd = os.open(path, flags, 0o644)
+        except OSError as exc:
+            if exc.errno == errno.ENXIO:
+                raise OSError(errno.EINVAL, "not a regular file") from None
+            raise
         if not stat.S_ISREG(os.fstat(fd).st_mode):  # swapped between the lstat and the open
             os.close(fd)
             raise OSError(errno.EINVAL, "not a regular file")
+        if sys.platform != "win32":
+            fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
         return open(fd, "a", encoding=self.encoding, errors=self.errors)
 
 

@@ -253,6 +253,29 @@ def test_check_state_dir_real_permission_denied(tmp_path: Path) -> None:
         locked.chmod(0o700)
 
 
+def test_a_symlinked_state_file_is_refused_and_its_target_untouched(tmp_path: Path) -> None:
+    """A link at state_file never worked as a redirect: the first save replaced the link
+    itself with a regular file (issue #39). It is refused up front, with the log's wording,
+    before anything is written -- a link to a valid state and a dangling one alike."""
+    if sys.platform == "win32":
+        pytest.skip("symbolic links need a privilege on Windows; runs in the sandbox and on CI")
+    real = tmp_path / "real.json"
+    State(str(real)).save()
+    before = real.read_bytes()
+    link = tmp_path / "state.json"
+    link.symlink_to(real)
+    with pytest.raises(StateError) as exc:
+        check_state_dir(str(link))
+    assert str(exc.value) == f"state file {link} is a symbolic link -- name the real path"
+    assert link.is_symlink() and real.read_bytes() == before
+    dangling = tmp_path / "gone.json"
+    dangling.symlink_to(tmp_path / "nowhere.json")
+    with pytest.raises(StateError, match="is a symbolic link -- name the real path"):
+        check_state_dir(str(dangling))
+    assert dangling.is_symlink()
+    check_state_dir(str(real))  # the real path itself passes
+
+
 def test_state_file_is_written_0600(tmp_path: Path) -> None:
     if sys.platform == "win32":
         pytest.skip("mode bits are fabricated on Windows; runs in the sandbox and on CI")

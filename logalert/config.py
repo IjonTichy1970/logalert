@@ -56,6 +56,7 @@ DEFAULT_SENDMAIL_PATH = "/usr/sbin/sendmail"
 DEFAULT_SMTP_PORT = 25
 DEFAULT_MAIL_TIMEOUT = 60.0
 DEFAULT_LOCK_STALE = 3600
+DEFAULT_SCAN_TIMEOUT = 300  # seconds per file (issue #28); 0 = no bound
 DEFAULT_STATE_TTL_DAYS = 30
 DEFAULT_MAX_LINES = 200
 
@@ -80,11 +81,18 @@ GLOBAL_KEYS: frozenset[str] = frozenset(
     {
         "from", "state_file", "log", "transport", "sendmail_path",
         "smtp_host", "smtp_port", "smtp_starttls", "mail_timeout",
-        "lock_stale", "state_ttl", "subject_suffix",
+        "lock_stale", "state_ttl", "subject_suffix", "scan_timeout",
     }
 )
 
 _PRIORITY_TAG = re.compile(r"^\[(high|medium|low)\] (.+)$", re.S)
+# The textbook catastrophic-backtracking shape (issue #28): a group whose body ends in a
+# quantifier, itself quantified -- (x+)+, (x*)*, (\w+\s?)+. A warning for --check-config,
+# never a refusal: the shapes that hang are not enumerable, and this one is the one
+# operators write by hand. An unescaped + * ? or a {n,m} RANGE before the ) counts; a fixed
+# {n} count and an escaped literal do not (review: (\d{2})+ is polynomial, (a\?)+ is a
+# literal).
+_NESTED_QUANTIFIER = re.compile(r"(?<!\\)(?:[+*?]|\{\d*,\d*\}\??)\)[+*{]")
 # Bare address: an RFC 5322 dot-atom local part (no quotes, no display name, no angle
 # brackets) and a domain of letters, digits, dots and hyphens. Deliberately narrower than
 # what mail systems accept: what a cron job hands to sendmail must be unambiguous.
@@ -143,6 +151,7 @@ class Settings:
     smtp_starttls: bool = False
     mail_timeout: float = DEFAULT_MAIL_TIMEOUT
     lock_stale: int = DEFAULT_LOCK_STALE
+    scan_timeout: int = DEFAULT_SCAN_TIMEOUT  # 0: no bound
     state_ttl_days: int = DEFAULT_STATE_TTL_DAYS
     subject_suffix: bool = True
 
@@ -236,6 +245,7 @@ def _load_settings(section: configparser.SectionProxy, warnings: list[str]) -> S
         mail_timeout=_number(where, section, "mail_timeout", DEFAULT_MAIL_TIMEOUT,
                              high=MAX_MAIL_TIMEOUT),
         lock_stale=_int(where, section, "lock_stale", DEFAULT_LOCK_STALE, low=1),
+        scan_timeout=_int(where, section, "scan_timeout", DEFAULT_SCAN_TIMEOUT, low=0),
         state_ttl_days=_int(where, section, "state_ttl", DEFAULT_STATE_TTL_DAYS, low=1),
         subject_suffix=_bool(where, section, "subject_suffix", True),
     )
@@ -357,12 +367,12 @@ def _load_watch(name: str, section: configparser.SectionProxy, warnings: list[st
     section_priority = _enum(where, section, "priority", PRIORITIES, None)
     patterns: list[Pattern] = []
     for key in PATTERN_KEYS:
-        patterns.extend(_patterns(where, section, key, is_exclude=False))
+        patterns.extend(_patterns(where, section, key, is_exclude=False, warnings=warnings))
     if not patterns:
         raise ConfigError(f"{where}: at least one of {', '.join(PATTERN_KEYS)} is required")
     excludes: list[Pattern] = []
     for key in EXCLUDE_KEYS:
-        excludes.extend(_patterns(where, section, key, is_exclude=True))
+        excludes.extend(_patterns(where, section, key, is_exclude=True, warnings=warnings))
 
     archive_dir = _optional(where, section, "archive_dir")
     if archive_dir is not None:
@@ -392,7 +402,8 @@ def _load_watch(name: str, section: configparser.SectionProxy, warnings: list[st
 
 
 def _patterns(
-    where: str, section: configparser.SectionProxy, key: str, *, is_exclude: bool
+    where: str, section: configparser.SectionProxy, key: str, *, is_exclude: bool,
+    warnings: list[str] | None = None
 ) -> list[Pattern]:
     is_regex = "regex" in key
     ignore_case = key.startswith("i")
@@ -413,6 +424,10 @@ def _patterns(
             # re.compile also raises OverflowError (a{99999999999}) and RecursionError
             except (re.error, OverflowError, RecursionError) as exc:
                 raise ConfigError(f"{where} {key}: cannot compile {text!r}: {exc}") from exc
+            if warnings is not None and _NESTED_QUANTIFIER.search(text):
+                warnings.append(f"{where} {key}: {text!r}: a quantified group ending in a "
+                                f"quantifier can backtrack without bound on a long line; "
+                                f"simplify it (see USAGE.md)")
         result.append(
             Pattern(
                 text=text, regex=is_regex, ignore_case=ignore_case, priority=priority,
@@ -721,8 +736,11 @@ def describe(config: Config, sender: str | None = None, state_file: str | None =
     else:
         out.append(f"state_file: {settings.state_file}")
     out.append(f"log: {log if log is not None else settings.log}")
+    bound = (f"{settings.scan_timeout}s" if settings.scan_timeout else "off")
+    if settings.scan_timeout and sys.platform == "win32":
+        bound += " (not enforced on this platform)"
     out.append(f"mail_timeout: {settings.mail_timeout:g}s; lock_stale: {settings.lock_stale}s; "
-               f"state_ttl: {settings.state_ttl_days} days; "
+               f"scan_timeout: {bound}; state_ttl: {settings.state_ttl_days} days; "
                f"subject_suffix: {'yes' if settings.subject_suffix else 'no'}")
     for watch in config.watches:
         literal = sum(1 for p in watch.patterns if not p.regex)

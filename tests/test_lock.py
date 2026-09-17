@@ -210,3 +210,86 @@ def test_stale_verdict_is_confirmed_by_a_second_read(
         with pytest.raises(LockBusy) as exc:
             RunLock(str(path), 3600).acquire()
     assert exc.value.stale is True and exc.value.pid == 4242 and len(naps) == 2
+
+
+# -- issue #27: the lock's mode, and a stale line that does not blame a dead PID ---------------
+
+
+def _dead_pid() -> int:
+    """A PID that was a process and is not: spawned, exited, reaped."""
+    with subprocess.Popen([sys.executable, "-c", "pass"]) as proc:
+        proc.wait(timeout=30)
+    return proc.pid
+
+
+def test_the_lock_is_0600_and_an_older_0644_lock_is_tightened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """flock needs no write access: a lock others could open read-only was a lock others
+    could hold (issue #27). A lock left at 0644 by 0.1.0 heals when its owner next takes it.
+    The creation mode is checked with the heal disabled: otherwise a lock created 0644 and
+    tightened a microsecond later would pass, and that microsecond is an open."""
+    if sys.platform == "win32":
+        pytest.skip("mode bits are fabricated on Windows; runs in the sandbox and on CI")
+    path = tmp_path / "lock"
+    monkeypatch.setattr(lock_module, "_tighten", lambda fd: None)
+    with RunLock(str(path), 3600):
+        assert path.stat().st_mode & 0o777 == 0o600  # created so, not healed so
+    monkeypatch.undo()
+    path.chmod(0o644)
+    with RunLock(str(path), 3600):
+        assert path.stat().st_mode & 0o777 == 0o600
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_a_stale_line_names_a_gone_holder_instead_of_blaming_its_pid() -> None:
+    """The stale verdict is about the recorded start time; whether that PID still exists is
+    a second question, answered on POSIX (``os.kill(pid, 0)``) and not on Windows, where the
+    probe would terminate the process."""
+    gone = _dead_pid()
+    busy = LockBusy("/var/lib/logalert/lock", gone, started=time.time() - 7200, stale_after=3600)
+    assert busy.stale is True
+    if sys.platform == "win32":
+        assert busy.holder_gone is None
+        assert busy.describe() == (f"another run (PID {gone}) has held the lock "
+                                   f"/var/lib/logalert/lock for 7200s")
+        return
+    assert busy.holder_gone is True
+    assert busy.describe() == (f"the recorded holder PID {gone} is gone; another process holds "
+                               f"the lock /var/lib/logalert/lock (fuser /var/lib/logalert/lock "
+                               f"names it)")
+    # a stale holder that still exists (this process) is named as before
+    alive = LockBusy("/var/lib/logalert/lock", os.getpid(), started=time.time() - 7200,
+                     stale_after=3600)
+    assert alive.holder_gone is False
+    assert alive.describe().startswith(f"another run (PID {os.getpid()}) has held the lock")
+    # and a fresh holder is never probed: cron overlap is normal
+    fresh = LockBusy("/var/lib/logalert/lock", gone, started=time.time() - 5, stale_after=3600)
+    assert fresh.stale is False and fresh.holder_gone is None
+    assert fresh.describe().startswith(f"another run (PID {gone}) has held the lock")
+
+
+def test_holder_gone_answers_nothing_for_no_pid_or_a_non_positive_one() -> None:
+    assert lock_module.holder_gone(None) is None
+    assert lock_module.holder_gone(0) is None  # os.kill(0, 0) would signal the process group
+    assert lock_module.holder_gone(-1) is None
+    # a hand-edited line with a number no kernel could hand out: os.kill would raise
+    # OverflowError past the OSError handlers and out of acquire() as a traceback (review)
+    busy = LockBusy("/x/lock", 10**30, started=0.0, stale_after=1, now=100.0)
+    assert busy.stale is True and busy.holder_gone is None
+    assert busy.describe().startswith("another run (PID 1000000000000000000000000000000)")
+
+
+def test_a_live_process_of_another_user_with_the_recorded_pid_is_not_the_holder(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """EPERM from the probe means a process exists as another user's: with a 0600 lock that
+    cannot be the holder, so the PID was reused (review). Simulated: the real answer needs
+    another user's process, which the sandbox's root run has (PID 1)."""
+    if sys.platform == "win32":
+        pytest.skip("os.kill(pid, 0) is a termination on Windows; the probe is POSIX-only")
+
+    def eperm(pid: int, sig: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "kill", eperm)  # the one os module, as lock.py sees it
+    assert lock_module.holder_gone(4242) is True

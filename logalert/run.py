@@ -32,6 +32,11 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     created during the outage is read whole once the directory is back. A listed path is
     never new, wherever a glob also matches it: its first sight is #7's, unchanged; a
     path is one path however it is spelled (``normcase``, ``normpath``).
+  * A file's scan is bounded by ``scan_timeout`` seconds on POSIX (issue #28: ``SIGALRM``
+    reaches into a regex that backtracks without bound, measured; a thread cannot, and
+    Windows has no interval timer): past it the file is a failed item naming the line and
+    the pattern being tried, its cursor stays, the section continues -- one loud exit 1
+    instead of a held lock and an hour of quiet turn-aways.
   * The section's outcome: nothing matched -> its cursors move and the state is saved; a
     match -> ONE message composed and delivered; accepted (a partial refusal is accepted --
     the recipient who got it must not get it twice -- with the refused ones as failed items)
@@ -63,7 +68,11 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
 
 import logging
 import os
+import signal
 import sys
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -71,7 +80,7 @@ from logalert.config import Config, ConfigError, Watch
 from logalert.globs import expand, is_glob
 from logalert.lock import LockBusy, RunLock
 from logalert.mail import Mail, clean_header, compose
-from logalert.match import FileReport, scan
+from logalert.match import FileReport, progress, scan
 from logalert.rotation import open_source
 from logalert.state import (
     Cursor,
@@ -89,6 +98,42 @@ log = logging.getLogger("logalert.run")
 EXIT_OK = 0
 EXIT_ATTENTION = 1  # ran, but something needs a look
 EXIT_USAGE = 2  # usage or configuration error; nothing ran
+
+
+class ScanTimeout(BaseException):
+    """A file's scan ran past ``scan_timeout``; the message names where it was. A
+    ``BaseException``, like ``KeyboardInterrupt``: it is raised from a signal handler at an
+    arbitrary bytecode boundary, and an ``Exception`` landing inside a log call would be
+    swallowed by ``logging.Handler.emit`` (review) -- the bound gone and the activity log
+    declared dead. Nothing in the package catches ``BaseException`` except to clean up and
+    re-raise."""
+
+
+@contextmanager
+def scan_bound(seconds: int) -> Iterator[None]:
+    """``ScanTimeout`` out of whatever the main thread is doing ``seconds`` from now --
+    POSIX only, main thread only (a signal handler is installable nowhere else), and
+    ``0`` is no bound. The previous handler and timer are restored on the way out."""
+    if (seconds <= 0 or sys.platform == "win32"
+            or threading.current_thread() is not threading.main_thread()):
+        yield
+        return
+    else:
+
+        def expired(signum: int, frame: object) -> None:
+            where = f"at line {progress.line}" if progress.line else "before the first line"
+            pattern = progress.pattern  # None while reading: a stall that is not a regex
+            what = (f"while trying {'regex' if pattern.regex else 'pattern'} {pattern.text!r}"
+                    if pattern is not None else "while reading")
+            raise ScanTimeout(f"scanning exceeded scan_timeout ({seconds} s) {where} {what}")
+
+        previous = signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        try:
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
 
 
 @dataclass(frozen=True)
@@ -227,13 +272,20 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
             continue
         if source is None:
             continue  # absent this run; the cursor and its last_seen stay
+        progress.file, progress.line, progress.pattern = path, 0, None
         try:
             with source:
-                report = scan(path, source.lines(), watch, context=context,
-                              before=source.context_before, cap=watch.max_lines)
+                with scan_bound(config.settings.scan_timeout):
+                    report = scan(path, source.lines(), watch, context=context,
+                                  before=source.context_before, cap=watch.max_lines)
+                # outside the bound (review): an alarm handled on the way out of it must
+                # not leave a cursor here for _advance to save past lines never mailed
                 cursors[path] = source.cursor()
         except OSError as exc:  # an archive vanishing mid-read, a corrupt stream
             outcome.fail(f"[{watch.name}] {path}: {_reason(exc, path)}")
+            continue
+        except ScanTimeout as exc:  # the cursor stays: the file is re-read next run
+            outcome.fail(f"[{watch.name}] {path}: {exc}")
             continue
         log.info("[%s] %s: %d line(s) read, %d matched", watch.name, path, report.lines,
                  report.matched)

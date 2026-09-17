@@ -253,7 +253,8 @@ def reset_state(config: Config, target: str, path: str) -> int:
         check_state_dir(path)
         lock.acquire()
     except LockBusy as exc:
-        stuck = " (older than lock_stale -- a stuck run?)" if exc.stale else ""
+        stuck = (" (older than lock_stale -- a stuck run?)"
+                 if exc.stale and not exc.holder_gone else "")  # the gone line answers it
         print(f"logalert: {exc}{stuck}; nothing was reset", file=sys.stderr)
         return EXIT_ATTENTION
     except StateError as exc:

@@ -140,7 +140,7 @@ The file's rules:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `from` | the running user at this host | The From address of the alerts, a bare `local@domain`. The default is `<user>@<hostname>`; when that has no domain part, or a local-only one (`.local`, `.localdomain`, `.localhost`), every run logs a warning: such mail may not travel beyond the host. Set it explicitly on such hosts. |
-| `state_file` | `/var/lib/logalert/state.json` | Where the position in each file is kept between runs. The directory must exist and be writable by the user cron runs logalert as; logalert never creates it (a root run would leave it root-owned). The file is written `0600`; the run lock is the file `lock` beside it. Never under the venv. |
+| `state_file` | `/var/lib/logalert/state.json` | Where the position in each file is kept between runs. The directory must exist and be writable by the user cron runs logalert as; logalert never creates it (a root run would leave it root-owned). The file is written `0600`, and so is the run lock, the file `lock` beside it (a lock any local user could open would be a lock any local user could hold). A `state_file` that is a symbolic link is refused (`is a symbolic link -- name the real path`): a link never worked as a redirect, since the first save would replace the link itself. Never under the venv. |
 | `log` | `syslog` | Where logalert writes its own activity: `syslog`, `stderr`, `file:/absolute/path` (outside the venv), or `udp:host:port` (`udp:[2001:db8::1]:514` for an IPv6 address; explicit only; never a fallback). See [Logging](#logging). |
 | `transport` | `auto` | How alerts leave the box: `auto` uses the local sendmail binary when it exists and otherwise refuses to start, saying what to install; `sendmail`; `smtp` to a relay. |
 | `sendmail_path` | `/usr/sbin/sendmail` | The sendmail binary (postfix's, dma's, msmtp's `sendmail` wrapper). Invoked as `sendmail -i -f <From> <recipients>`. |
@@ -149,6 +149,7 @@ The file's rules:
 | `smtp_starttls` | `no` | Ask for STARTTLS with the platform's default certificate verification; a relay that cannot is a delivery failure, never a silent downgrade. |
 | `mail_timeout` | `60` | Seconds to wait for the mail system. For sendmail the whole child; for SMTP each socket operation (a slow relay can hold a run for a few multiples of it and still succeed). At most 3600. |
 | `lock_stale` | `3600` | A run that finds another run holding the lock exits 0 quietly -- cron overlap is normal -- unless the holder is older than this many seconds, which is exit 1: `stale lock: another run (PID N) has held the lock <path> for Ns`. |
+| `scan_timeout` | `300` | Seconds one file's scan may take before it is given up as a failed item naming the line and the pattern being tried (`scanning exceeded scan_timeout (300 s) at line N while trying regex '...'`); its position stays, the section's other files are processed. `0` turns the bound off. A scan that is legitimately long -- a first read of a multi-GB file on a slow machine -- needs a higher value, or `0` for that run; the message names the key. Enforced on Linux and the BSDs (an interval timer); on Windows `--check-config` says `not enforced on this platform`. |
 | `state_ttl` | `30` | Days after which the saved position of a file that has not been seen is forgotten (logged as `forgotten`). A file that is back after that is a first sight again. |
 | `subject_suffix` | `yes` | Append ` -- N match(es)` to every Subject, a literal a mail filter can key on. `no` for the bare subject. |
 
@@ -158,16 +159,16 @@ The file's rules:
 | --- | --- | --- |
 | `subject` | required | The Subject of the alert, verbatim (plus the suffix above). |
 | `to` | required | The recipients, one per line or comma-separated. |
-| `files` | required | The log files to read, absolute, one per line; an entry with `*`, `?` or `[` is a glob, expanded at every run ([Globs](#globs)). Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly. A file the list names more than once, or a glob matches after it was named, is read once. |
+| `files` | required | The log files to read, absolute, one per line; an entry with `*`, `?` or `[` is a glob, expanded at every run ([Globs](#globs)). Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly. A file the list names more than once, or a glob matches after it was named, is read once. A listed symbolic link is followed only when its owner is root, the running user or the file's owner ([Globs](#globs)). |
 | `patterns` | | Literal text, matched case-SENSITIVELY against the whole line. A line matches when any pattern of any of the four shapes is found in it. |
 | `ipatterns` | | Literal text, case-insensitive. |
-| `regex` | | Python regular expressions (`re.search`), case-sensitive. |
+| `regex` | | Python regular expressions (`re.search`), case-sensitive. `re` has no backtracking limit: a nested or ambiguous quantifier (`(x+)+`, `(x*)*`, `(\w+\s?)+`) can run for hours on one long line of ordinary words, holding the lock -- `--check-config` warns about that shape, and `scan_timeout` bounds the damage. An anchor or a delimiter class (`[^ ]+`) usually stops it. |
 | `iregex` | | Regular expressions, case-insensitive. |
 | `exclude`, `iexclude`, `exclude_regex`, `iexclude_regex` | | Noise: a line that matched a pattern but also matches one of these is dropped, and the count of dropped lines is in the mail's summary. The same four shapes. |
 | `priority` | off | `high`, `medium` or `low`. The priority system is OFF unless a section sets this or a pattern carries a tag; when on, the mail carries `X-Logalert-Priority` plus the conventional `X-Priority` (`1`/`3`/`5`) and `Importance` (`high`/`normal`/`low`), the highest across the mail's matches. A pattern can carry its own tag: `[high] Requesting reboot` (lowercase, one space); any other bracketed prefix is part of the literal. |
 | `report` | `inline` | `inline` puts the report in the body; `attachment` attaches it as `<section>-<YYYYmmddTHHMM>.txt`, the section name reduced to ASCII letters, digits, `.`, `_` and `-` and cut to 40 characters (see [Mail](#mail)). The body opens with a summary either way. `--attach` forces the attachment for one run. |
 | `context` | the command line's `-c` | Lines of context before and after each match, like `grep -C`. Context never crosses from one file into another. |
-| `max_lines` | `200` | At most this many MATCHING lines per email, each with its context, then one trailer `... and N more matching line(s)` with the exact remainder. |
+| `max_lines` | `200` | At most this many MATCHING lines per email, each with its context, then one trailer `... and N more matching line(s)` with the exact remainder. The report is also cut at 1 MiB of text, whatever `max_lines` says (`; the report was cut at 1 MiB` in the trailer): 1.4 MB on the wire as base64, up to 3.2 MB as quoted-printable, under a relay's default size limit either way. |
 | `start` | `end` | Where the first run of a file begins: `end` (no flood of old news) or `beginning`. |
 | `archive_dir` | the log's own directory | Where rotated copies live when they are not beside the log: logrotate's `olddir`, newsyslog's `-a`. |
 | `include_archives` | `no` | Whether a glob reads rotated copies as files of their own ([Globs](#globs)). `yes` is for directories where the dated names ARE the live files (Apache's `rotatelogs`), never for a rotating log. |
@@ -235,6 +236,12 @@ This is `logalert --example-config`, verbatim (a test keeps the two identical):
 # A run that finds another run still holding the lock exits quietly -- unless
 # that run is older than this many seconds, which is reported as a problem.
 #lock_stale = 3600
+
+# Seconds a single file's scan may take before the run gives it up as a failed
+# item naming the line and the pattern (a regex with a nested quantifier can
+# run for hours on one long line, holding the lock). 0 turns the bound off.
+# Enforced on Linux and the BSDs; on Windows it is reported and not enforced.
+#scan_timeout = 300
 
 # Days after which the position of a file that has not been seen is forgotten.
 #state_ttl = 30
@@ -436,10 +443,18 @@ glob matches regular files only, and never through a symbolic link: a link it
 matches, and a link where a wildcard directory component would descend, is
 passed over (a link is a name you never wrote, and a run with more privilege
 than whoever planted it would otherwise mail a file outside the directory);
-list a link by name, which is your own choice. A directory, FIFO or device the
-glob names is passed over too (`/var/log/*` names directories nobody wants
-read), where a listed entry naming one is an error; hard links to one file are
-read once, under the first name in sort order. The matches are read in name
+list a link by name, which is your own choice -- but what a listed name
+resolves to at each run is the choice of whoever owns its directory, so a
+listed link is followed only when its owner is root, the user logalert runs
+as, or the owner of the file it points to (root's `/var/log/foo -> /data/foo`
+and an application's own `current -> today.log` work; a link another user
+planted towards a file that is not theirs is a failed item, `is a symbolic
+link owned by <user> to a file owned by <other>; not followed`). A link to
+another link is refused (`points at another symbolic link`); name the file. A
+directory, FIFO or device the glob names is passed over too (`/var/log/*`
+names directories nobody wants read), where a listed entry naming one is an
+error; hard links to one file are read once, under the first name in sort
+order. The matches are read in name
 order, so a daily directory reads in date order, and each match is one file
 with its own position in the state, spelled as `--check-config` lists it --
 that spelling is what `--reset-state` takes (given the glob itself,
@@ -571,7 +586,13 @@ reported (`refused: <recipient> -- <reply>`) with the others delivered, exit 1
 refused recipient is not re-sent those lines (the others must not get them
 twice); every recipient refused, a rejected message, a dropped connection or no
 reply within `mail_timeout` is a failed delivery, and the section's position is
-kept so the next run re-sends it.
+kept so the next run re-sends it. A message refused for the same reason every
+run -- a relay's size limit below the 1 MiB report cap, a content filter -- is
+rebuilt from the same position and refused again: exit 1 every run, and
+everything written after the block waits behind it. The escapes: lower
+`max_lines` for one run (the message shrinks, is accepted, and the position
+moves past the whole block), an `exclude_regex` for the offending shape, or
+`--reset-state <file>`, which forgets what is pending.
 
 **`--test-mail SECTION`** sends one real one-line message to that section's
 recipients and prints what happened:
@@ -685,16 +706,20 @@ configured destination still gets INFO and above.
 | --- | --- | --- |
 | Nothing arrives, cron is quiet | The first run of a file starts at its end, so lines already there are never mailed; or the message is queued in the MTA | Append a matching line and wait for the next run, or run `logalert -n` and see what it would send; `mailq` for a queued message; `journalctl -t logalert` for what each run did |
 | `transport = auto but /usr/sbin/sendmail does not exist: ...` (exit 2) | No MTA on the host | Install one (`postfix`, `dma`, `msmtp-mta`; `dma` is in FreeBSD's base) or set `transport = smtp` and `smtp_host` |
+| The same `sendmail exit N` / `552` refusal in cron's mail every run, and nothing new from that section | The relay refuses the message for what it is (its size below the 1 MiB report cap, a content filter), and the run re-sends the same message each time -- everything behind it waits | Lower `max_lines` for one run so the block is accepted and the position moves past it; an `exclude_regex` for the shape; or `--reset-state <file>` (what is pending is forgotten). The MTA's log names the reason |
 | `... failed: [router-disk] sendmail exit 75 (EX_TEMPFAIL): ...; see the log` in cron's mail (exit 1), or `logalert: not delivered via sendmail (...): sendmail exit 75 (EX_TEMPFAIL): ...` from `--test-mail` | The MTA could not accept the message (its queue, its configuration) | The MTA's log; the run kept the section's position, so the next run re-sends (a `--test-mail` failure keeps nothing: there is no position) |
 | The same lines arrive twice | A delivery whose state could not be saved afterwards (`state not saved` in the log) -- the mail went out, then the next run re-sent it | Make the state directory writable by the running user (`state directory ... is not writable`); the run refuses to send when it cannot save, once it knows |
 | `[section] /var/log/x.log: Permission denied` (exit 1) | The running user cannot read that file; the other files of the section were processed | Grant read access (a group, ACLs) or run as a user that has it |
 | `state file ... belongs to <user>; a run as root would leave it root-owned ...` -- or, before the first run, `state directory ... belongs to <user>; ...` (exit 1) | A root run against a cron user's state | Run as that user: `sudo -u <user> logalert ...` |
-| `stale lock: another run (PID N) has held the lock ... for Ns` (exit 1) | A run still alive and holding the lock for longer than `lock_stale` -- a stuck run, or one that genuinely takes that long. Not a leftover file: the lock is an OS lock, released the moment its holder exits or is killed; the last holder's line stays in the `lock` file by design and turns nobody away | Look at PID N (`ps -o pid,etime,cmd -p N`; `cat` the `lock` file beside the state file shows the holder's PID and start time) and end it if it is stuck -- the lock is released with it; raise `lock_stale` if runs really take that long. Do not remove the `lock` file: while the holder lives, the next run would lock a fresh file and overlap it |
+| `stale lock: another run (PID N) has held the lock ... for Ns` (exit 1) | A run still alive and holding the lock for longer than `lock_stale` -- a stuck run, or one that genuinely takes that long. Not a leftover file: the lock is an OS lock, released the moment its holder exits or is killed; the last holder's line stays in the `lock` file by design and turns nobody away | Look at PID N (`ps -o pid,etime,cmd -p N`; `cat` the `lock` file beside the state file shows the holder's PID and start time) and end it if it is stuck -- the lock is released with it; raise `lock_stale` if runs really take that long. If `ps` shows PID N is not logalert, the PID was reused: `fuser <lock>` as root names the holder. Do not remove the `lock` file: while the holder lives, the next run would lock a fresh file and overlap it |
+| `stale lock: the recorded holder PID N is gone; another process holds the lock ... (fuser ... names it)` (exit 1) | The last run that wrote the file has exited (or PID N now belongs to another user's process, which cannot hold a `0600` lock), and something else holds the lock: a run stalled between taking the lock and writing its line, or another process that opened the file and locked it | `fuser <lock>` (or `lsof <lock>`), run as root -- as the running user it cannot see another user's process -- names the holder; end it if it should not be there. The lock is `0600` (one left `0644` by an earlier version is tightened by the next run that takes it), so only the running user and root can open it |
 | `warning: no usable syslog socket (...); logging to stderr` in cron's mail every run | No syslog daemon, or the socket is somewhere else | Start rsyslog / journald, or set `log = file:/var/log/logalert.log` |
 | `warning: From address '...' has no domain part; set from = in [logalert]` | The default From is `<user>@<short hostname>` | Set `from = logalert@example.net` |
 | `'...' is not a bare local@domain address` (exit 2; as `[logalert] from:`, `[<section>] to:` or `--from:`) | A display name, angle brackets or spaces in an address; a leading `-` is refused separately as `'...' starts with '-'` | Bare addresses only |
+| `scanning exceeded scan_timeout (300 s) at line N while trying regex '...'` (exit 1), or `stale lock` every run with PID N alive at 100 % CPU | A regex with a nested quantifier on a long line (`(x+)+`, `(\w+\s?)+`): `re` backtracks without bound; on Windows nothing bounds it | Simplify the regex (an anchor, a delimiter class instead of `\w+\s?`); the file is re-read next run, so `--reset-state <file>` skips the line if the log must keep it; `--check-config` names the shape |
 | A pattern starting with `#` or `;` never matches | The parser drops such a continuation line as a comment | A regex with the escape: `\#`, `\;` |
 | `no rotated copy holds the saved position ...` in the log after every rotation | The archives are elsewhere, or fewer are kept than rotations happen between runs | Set `archive_dir`, or run logalert more often than the rotation |
 | `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config (or as `--check-config` lists a glob's match), or the file was never seen; given the glob itself it says `is a glob` | Use the exact path; `--reset-state` with no path forgets everything |
 | A glob mails nothing, or a file it should read is missing from `--check-config` | The glob matches nothing where it looks (`matches nothing`), or the file is left out as a rotated copy (`left out:` -- a name ending in `.N` or a date such as `app.2024`, a `.bak` or `.gz` twin), or it is not a regular file or is a symbolic link (`passed over:`) | `logalert --check-config` names every match and everything left out; list a wanted file by name, or set `include_archives = yes` for a directory of dated live files |
+| `[section] /var/log/app/current: is a symbolic link owned by app to a file owned by root; not followed (...)` (exit 1) | A listed path is a link whose owner is neither root, nor the running user, nor the owner of the file it points to -- in a directory another user owns, what the name resolves to is that user's choice | List the file itself, or make the link root's (`chown -h root <link>`); a link another user planted is the reason the rule exists |
 | `[section] /var/log/hosts/*/messages: cannot list /var/log/hosts (Permission denied)` (exit 1) | The running user cannot list a directory the glob needs to look into; the files of the section that were reachable were processed | Grant read and search permission on the directory, or run as a user that has it |
