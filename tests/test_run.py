@@ -1054,6 +1054,37 @@ def test_dry_run_with_an_unreadable_file_is_exit_1_with_the_line(
     assert site.calls() == []
 
 
+# -- issue #50: a glob's quiet files are one summary, not a record each -------------------------
+
+
+def test_a_globs_quiet_files_are_debug_records_and_one_info_summary(
+        site: Site, caplog: pytest.LogCaptureFixture) -> None:
+    """Measured: 2 000 one-line files under one glob wrote 2 002 INFO records per run, every
+    run. A glob's file with nothing new is DEBUG; the glob gets one INFO summary; a glob's
+    file WITH new lines and every listed file keep their own INFO record."""
+    hosts = site.root / "hosts"
+    for name in ("alpha", "beta", "gamma"):
+        (hosts / name).mkdir(parents=True)
+        (hosts / name / "messages").write_text("up" + NL, encoding="utf-8", newline=NL)
+    glob = (hosts / "*" / "messages").as_posix()
+    site.write_config(firewall_files=site.firewall.as_posix() + NL + f"    {glob}")
+    site.prime()
+    site.append(hosts / "beta" / "messages", "DENY 192.0.2.9", "DENY 192.0.2.10")  # two
+    caplog.set_level(logging.DEBUG, logger="logalert.run")
+    assert site.run() == 0
+    records = [(r.levelname, r.getMessage()) for r in caplog.records
+               if "line(s) read" in r.getMessage() or "file(s)" in r.getMessage()]
+    listed = f"[firewall] {site.firewall.as_posix()}: 0 line(s) read, 0 matched"
+    busy = f"[firewall] {(hosts / 'beta' / 'messages').as_posix()}: 2 line(s) read, 2 matched"
+    assert ("INFO", listed) in records  # a listed file: its heartbeat, new lines or not
+    assert ("INFO", busy) in records  # a glob's file with new lines: its own record
+    for quiet in ("alpha", "gamma"):
+        message = f"[firewall] {(hosts / quiet / 'messages').as_posix()}: 0 line(s) read, 0 matched"
+        assert ("DEBUG", message) in records and ("INFO", message) not in records
+    assert ("INFO", f"[firewall] {glob}: 3 file(s), 1 with new lines, 2 matched") in records
+    assert len(site.calls()) == 1  # the match was mailed as before
+
+
 # -- issue #28: a file's scan is bounded by scan_timeout ----------------------------------------
 
 

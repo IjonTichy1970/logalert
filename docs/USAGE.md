@@ -653,7 +653,10 @@ becomes a space.
 Every run records its activity: the start (config path, section count), per file
 the lines read and matched and how the position was resolved when there is
 something to say (first sight, rotated, truncated; a plain continue is a DEBUG
-record, seen under `--debug`), per section the message sent with its recipients,
+record, seen under `--debug`) -- a file a glob matched with nothing new is a
+DEBUG record too, and each glob gets one INFO summary per run (`<glob>: N
+file(s), M with new lines, K matched`), so a daily directory does not write a
+line per file per run -- per section the message sent with its recipients,
 size and `Message-ID` -- or the failure with the transport's answer -- every
 failed item at ERROR, every expired position, and the exit code at the end. The
 lines are one line each, the level shown as a word for `warning:`, `error:` and

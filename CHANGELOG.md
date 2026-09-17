@@ -71,6 +71,12 @@ its notes.
   its log, and `--check-config` warns when a listed entry is one (it was read
   as a live log and mailed whole after every rotation).
 
+- `[contract]` **A glob's file with nothing new is a DEBUG record, and each glob
+  gets one INFO summary per run** (#50). A daily directory or a host tree wrote
+  a `0 line(s) read` line per file per run -- thousands of identical records
+  burying the ones the section exists for. A listed file, and a glob's file
+  with new lines, keep their own record.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

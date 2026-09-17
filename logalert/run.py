@@ -60,7 +60,9 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     ``--debug`` attaches a DEBUG handler on stderr, breaking cron-quiet on purpose.
   * The activity log (``logalert.activity`` wires its destinations, issue #13; the library
     ``NullHandler`` swallows it otherwise): the start (config path, section count) first of
-    all, per file the lines read and matched, per section the delivery (``transport`` logs
+    all, per file the lines read and matched -- at DEBUG for a glob's file with nothing new,
+    with one INFO summary per glob (issue #50: a daily directory under a glob wrote its
+    hundreds of identical lines on every run), per section the delivery (``transport`` logs
     it) or the failure with the transport's answer and the Message-ID, every failed item
     once at ERROR where it is collected, every expired entry, and the exit code at the end
     -- on every exit the run returns (a killed run, Ctrl-C included, leaves no end line).
@@ -255,7 +257,10 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
     reports: list[FileReport] = []
     cursors: dict[str, Cursor] = {}
     paths, seen = _files(watch, outcome)
+    tally: dict[str, list[int]] = {}  # per glob: files matched, with new lines, lines matched
     for path, globs in paths:
+        for glob in globs:
+            tally.setdefault(glob, [0, 0, 0])[0] += 1
         saved = state.get(watch.name, path)
         from_start = options.from_start or watch.start == "beginning"
         if globs and saved is None and not from_start:
@@ -287,9 +292,19 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
         except ScanTimeout as exc:  # the cursor stays: the file is re-read next run
             outcome.fail(f"[{watch.name}] {path}: {exc}")
             continue
-        log.info("[%s] %s: %d line(s) read, %d matched", watch.name, path, report.lines,
-                 report.matched)
+        # a glob's quiet file is a DEBUG record and counted in the glob's summary (issue
+        # #50: a daily directory or a host tree wrote thousands of identical lines per run);
+        # a listed file, or a glob's file with new lines, keeps its own INFO record
+        level = logging.DEBUG if globs and not report.lines else logging.INFO
+        log.log(level, "[%s] %s: %d line(s) read, %d matched", watch.name, path,
+                report.lines, report.matched)
+        for glob in globs:
+            tally[glob][1] += bool(report.lines)
+            tally[glob][2] += report.matched
         reports.append(report)
+    for glob, (files, busy, matched) in tally.items():
+        log.info("[%s] %s: %d file(s), %d with new lines, %d matched", watch.name, glob,
+                 files, busy, matched)
 
     if not any(report.matched for report in reports):
         _advance(watch, state, cursors, options, outcome, started, seen, delivered=False)
