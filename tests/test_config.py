@@ -106,7 +106,7 @@ def test_example_config_parses_when_every_line_is_uncommented(tmp_path: Path) ->
     assert router.priority == "medium" and router.report == "inline" and router.context == 0
     assert router.archive_dir == (tmp_path / "archive").as_posix()
     assert [p.text for p in router.patterns if p.regex][1] == "\\#\\d+ .*failed"
-    assert fw.report == "attachment" and fw.max_lines == 1000 and len(fw.files) == 2
+    assert fw.report == "attachment" and fw.max_lines == 1000 and len(fw.files) == 1  # #44
     assert fw.patterns[0].ignore_case and fw.excludes[0].regex
     assert config.settings.from_address == "logalert@example.net"
     assert config.settings.smtp_host == "mail.example.net"
@@ -413,7 +413,7 @@ def test_example_second_watch_parses_when_uncommented(tmp_path: Path) -> None:
     config = load_config(write(tmp_path, text))
     assert [w.name for w in config.watches] == ["router-disk", "firewall-denies"]
     fw = config.watches[1]
-    assert fw.report == "attachment" and fw.max_lines == 1000 and len(fw.files) == 2
+    assert fw.report == "attachment" and fw.max_lines == 1000 and len(fw.files) == 1  # #44
     assert fw.patterns[0].ignore_case and fw.excludes[0].regex
 
 
@@ -640,6 +640,50 @@ def test_module_run_check_config(tmp_path: Path) -> None:
 ])
 def test_is_address_is_the_loaders_rule(value: str, ok: bool) -> None:
     assert is_address(value) is ok
+
+
+# -- issue #44: a listed rotated copy of another listed entry is a --check-config warning ----
+
+
+@pytest.mark.parametrize("copy, warned", [
+    ("router.log.0.gz", True), ("router.log.1", True), ("router.log-20260917", True),
+    ("router.log.2026-09-17.xz", True), ("router.log.gz", True),
+    ("router.log2", False), ("router.log.bak", False), ("other.log", False),
+])
+def test_a_listed_rotated_copy_of_a_listed_log_is_a_check_config_warning(
+        tmp_path: Path, copy: str, warned: bool) -> None:
+    """The example's firewall watch listed firewall.log AND firewall.log.0.gz: read as a live
+    log, the copy was mailed whole after every rotation, and its cursor confirmed by a full
+    decompression every run. A warning, never a refusal: a static archive listed on purpose
+    is legitimate (a .bak is a hand copy the catch-up does not chain, so it is not one)."""
+    live = (tmp_path / "router.log").as_posix()
+    other = (tmp_path / copy).as_posix()
+    config = load_config(write(tmp_path, watch(tmp_path, files=f"{live}\n    {other}")))
+    expected = (f"[router-disk] files: {other} is a rotated copy of {live}; the catch-up reads "
+                f"the copies itself, and a listed copy is mailed whole after every rotation -- "
+                f"list the live file only")
+    assert config.warnings == ((expected,) if warned else ())
+    assert len(config.watches[0].files) == 2  # the run is unchanged either way
+
+
+def test_the_rotated_copy_warning_needs_the_same_directory_and_skips_globs(
+        tmp_path: Path) -> None:
+    (tmp_path / "old").mkdir()
+    live = (tmp_path / "router.log").as_posix()
+    elsewhere = (tmp_path / "old" / "router.log.1.gz").as_posix()
+    config = load_config(write(tmp_path, watch(tmp_path, files=f"{live}\n    {elsewhere}")))
+    assert config.warnings == ()  # another directory: archive_dir's business, not a listed copy
+    globbed = (tmp_path / "router.log.*").as_posix()
+    config = load_config(write(tmp_path, watch(tmp_path, files=f"{live}\n    {globbed}")))
+    assert config.warnings == ()  # a glob leaves rotated copies out on its own (#18)
+    host = (tmp_path / "192.0.2").as_posix()
+    another = (tmp_path / "192.0.2.1").as_posix()
+    config = load_config(write(tmp_path, watch(tmp_path, files=f"{host}\n    {another}")))
+    assert config.warnings == ()  # a host's file, not a copy (archive_suffix's own rule)
+    copy = (tmp_path / "router.log.1").as_posix()
+    twice = f"{live}\n    {copy}\n    {live}\n    {copy}"
+    config = load_config(write(tmp_path, watch(tmp_path, files=twice)))
+    assert len(config.warnings) == 1  # an entry listed twice is read once and warned once
 
 
 # -- issue #28: scan_timeout and the nested-quantifier warning ------------------------------

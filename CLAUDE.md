@@ -33,12 +33,12 @@ verdict** -- an announced skip reads as green at a glance.
 Expected announced skips on the Windows host: `changelog refs` ("no release
 commit yet", until the first release) and `pytest` (the POSIX-only tests --
 file modes, a FIFO, symlinks, the real-`logrotate` module, the POSIX-only lock
-probe -- each saying "runs in the sandbox and on CI"; 35 as of #26). In the
-root sandbox the non-root tests skip instead, saying "expected in the root
-sandbox; CI runs it" (6 as of #18), plus one Windows-only test ("the read-only
-attribute is a Windows shape"); as `nobody` the one root-only test skips
-("needs root to plant another user's link"), and the Linux stage carries that
-scenario on CI.
+probe, a rename under an open handle -- each saying "runs in the sandbox and on
+CI"; 45 as of #32). In the root sandbox the non-root tests skip instead, saying
+"expected in the root sandbox; CI runs it" (7 as of #32), plus one Windows-only
+test ("the read-only attribute is a Windows shape"); as `nobody` the one
+root-only test skips ("needs root to plant another user's link"), and the Linux
+stage carries that scenario on CI.
 Any other announced skip is worth reading. mypy on this host is the
 pure-Python build (`pip install --no-binary mypy mypy`): the compiled wheel's
 DLL is blocked by an Application Control policy. **mypy here checks nothing

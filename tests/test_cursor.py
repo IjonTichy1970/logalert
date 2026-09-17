@@ -536,6 +536,173 @@ def test_a_listed_link_of_our_own_is_followed_and_realpath_is_the_target(
         open_log(str(hop), follow_links=True)
 
 
+# -- issue #44: a listed compressed file costs one pass at first sight and none when unchanged
+
+
+class _RawCounter:
+    """Counts the compressed bytes read from the descriptor's file object -- passes over the
+    stream, when divided by the file's size."""
+
+    def __init__(self) -> None:
+        self.bytes = 0
+
+    def wrap(self, handle: io.BufferedReader) -> io.BufferedReader:
+        counter = self
+        original_read1, original_read = handle.read1, handle.read
+
+        def read1(n: int = -1) -> bytes:
+            data = original_read1(n)
+            counter.bytes += len(data)
+            return data
+
+        def read(n: int = -1) -> bytes:
+            data = original_read(n)
+            counter.bytes += len(data)
+            return data
+
+        setattr(handle, "read1", read1)  # noqa: B010  # instance attributes, as the wrapper does
+        setattr(handle, "read", read)  # noqa: B010
+        return handle
+
+
+def _counting(monkeypatch: pytest.MonkeyPatch) -> _RawCounter:
+    counter = _RawCounter()
+    real_open = open
+
+    def counting_open(fd: Any, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(fd, *args, **kwargs)
+        return counter.wrap(handle) if isinstance(fd, int) else handle
+
+    monkeypatch.setattr("logalert.cursor.open", counting_open, raising=False)  # shadows the builtin
+    return counter
+
+
+def test_a_listed_compressed_file_is_one_pass_at_first_sight_and_none_unchanged(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Measured before this change: first sight at the end cost four decompressions (the
+    end seek, the seek back for the last boundary, count_newlines, the reader's seek) and
+    every later run one (the confirming seek to the saved offset, to read nothing) -- seconds
+    per GB per run for a file that never changes. Now: one pass, then none."""
+    counter = _counting(monkeypatch)
+    path = tmp_path / "router.log.1.gz"
+    # lines that compress poorly (random hex), so the archive is far larger than the slack
+    # below and a second pass cannot hide inside it
+    plain = b"".join(b"line %d %s\n" % (i, os.urandom(100).hex().encode())
+                     for i in range(20_000))
+    path.write_bytes(gzip.compress(plain))
+    size = path.stat().st_size
+    log, lines = scan(path, None)
+    assert lines == [] and log.offset == len(plain) and log.start_line == 20_000
+    # one pass, plus the fingerprint's read-ahead (gzip pulls 128 KiB of compressed input for
+    # 4 KiB of text, then the seek back to 0 re-reads it) and one chunk: the measured 4.2 is gone
+    slack = 128 * 1024 + 65536
+    assert counter.bytes <= size + slack, (counter.bytes, size)
+    saved = log.cursor()
+    assert saved.size == size and saved.mtime == path.stat().st_mtime
+    counter.bytes = 0
+    caplog.set_level(logging.DEBUG, logger="logalert")
+    log2, lines2 = scan(path, saved)
+    assert lines2 == [] and log2.unchanged and counter.bytes == 0  # not opened at all
+    assert log2.cursor() == replace(saved, last_seen=log2.cursor().last_seen)
+    assert "unchanged since the last read" in caplog.text
+    # rewritten with more content but the SAME mtime (put back by hand): the size alone says
+    # it changed, and it is read again from the saved offset, one pass
+    path.write_bytes(gzip.compress(plain + b"new line\n"))
+    assert saved.mtime is not None
+    os.utime(path, (saved.mtime, saved.mtime))
+    saved = replace(saved, ino=path.stat().st_ino)  # the rewrite may change the inode
+    counter.bytes = 0
+    log3, lines3 = scan(path, saved)
+    assert texts(lines3) == ["new line"] and not log3.unchanged
+    assert 0 < counter.bytes <= path.stat().st_size + slack
+    # and the same size with a new mtime: read again too (the mtime alone says it changed)
+    later = replace(log3.cursor(), size=path.stat().st_size, mtime=path.stat().st_mtime - 60)
+    counter.bytes = 0
+    log3b, _ = scan(path, later)
+    assert not log3b.unchanged and counter.bytes > 0
+    # from the start: one pass too, and the cursor is settled at the end
+    counter.bytes = 0
+    log4, lines4 = scan(path, None, from_start=True)
+    assert len(lines4) == 20_001 and counter.bytes <= path.stat().st_size + slack
+    assert log4.cursor().size == path.stat().st_size
+
+
+def test_size_and_mtime_are_recorded_only_for_a_compressed_file_read_to_its_end(
+        tmp_path: Path) -> None:
+    """A plain file changes with every append and is never short-circuited. A compressed
+    stream with an unterminated tail IS settled (review): re-reading an unchanged stream
+    from where the read stopped yields nothing -- the boundaries are a function of the
+    bytes alone -- and once the file changes its size or mtime differ and the completed
+    line is read from that offset. A copytruncate snapshot cut mid-line is that shape."""
+    plain = tmp_path / "router.log"
+    plain.write_bytes(b"a\nb\n")
+    log, _ = scan(plain, None, from_start=True)
+    assert log.cursor().size is None and log.cursor().mtime is None
+    tail = tmp_path / "router.log.gz"
+    tail.write_bytes(gzip.compress(b"a\nb\nunterminated"))
+    log2, lines = scan(tail, None, from_start=True)
+    assert texts(lines) == ["a", "b"] and log2.offset == 4
+    saved = log2.cursor()
+    assert saved.size == tail.stat().st_size  # settled at the last complete line
+    log2b, again = scan(tail, saved)
+    assert log2b.unchanged and again == []  # not decompressed, nothing to say
+    tail.write_bytes(gzip.compress(b"a\nb\nunterminated no more\n"))
+    log2c, completed = scan(tail, replace(saved, ino=tail.stat().st_ino))
+    assert not log2c.unchanged and texts(completed) == ["unterminated no more"]
+    whole = tmp_path / "whole.log.gz"
+    whole.write_bytes(gzip.compress(b"a\nb\n"))
+    log3, _ = scan(whole, None, from_start=True)
+    assert log3.cursor().size == whole.stat().st_size
+
+
+@pytest.mark.parametrize("suffix, pack", [(".gz", gzip.compress), (".bz2", bz2.compress),
+                                          (".xz", lzma.compress)])
+def test_compressed_first_sight_boundaries_match_the_plain_files(
+        tmp_path: Path, suffix: str, pack: Callable[[bytes], bytes]) -> None:
+    """The one-pass first sight decides the boundary exactly as the plain file's does
+    (review: the first version started BEFORE an over-cap unterminated tail and mailed
+    pre-existing content, the one thing first sight promises never to do)."""
+    path = tmp_path / f"router.log{suffix}"
+    path.write_bytes(pack(b"header\n" + b"x" * (LINE_CAP + 1)))  # over the cap: the end
+    log, lines = scan(path, None)
+    assert lines == [] and log.offset == 7 + LINE_CAP + 1 and log.cursor().size is not None
+    path.write_bytes(pack(b"header\n" + b"x" * LINE_CAP))  # exactly the cap: held
+    log, lines = scan(path, None)
+    assert lines == [] and log.offset == 7 and log.start_line == 1
+    path.write_bytes(pack(b"x" * LINE_CAP))  # one unterminated line of the cap: held at 0
+    assert scan(path, None)[0].offset == 0
+    path.write_bytes(pack(b"x" * (LINE_CAP + 1)))  # longer: the end is the boundary
+    assert scan(path, None)[0].offset == LINE_CAP + 1
+    path.write_bytes(pack(b"one\ntwo\n"))
+    log, lines = scan(path, None)
+    assert lines == [] and log.offset == 8 and log.start_line == 2
+
+
+def test_a_listed_link_to_an_unchanged_archive_is_never_short_circuited(tmp_path: Path) -> None:
+    """The owner rule of #26 lives in open_log; a link must reach it every run (review)."""
+    if sys.platform == "win32":
+        pytest.skip("symbolic links need a privilege on Windows; runs in the sandbox and on CI")
+    real = tmp_path / "real.log.gz"
+    real.write_bytes(gzip.compress(b"a\nb\n"))
+    log, _ = scan(real, None, from_start=True)
+    saved = log.cursor()
+    assert saved.size is not None
+    link = tmp_path / "current.log.gz"
+    link.symlink_to(real)
+    log2, lines = scan(link, saved)
+    assert not log2.unchanged and lines == []  # opened through the rule, nothing new
+
+
+def test_a_cut_compressed_archive_is_still_an_oserror_at_first_sight(tmp_path: Path) -> None:
+    """The one-pass first sight reads the stream itself: a stream error must propagate as
+    the OSError the callers expect, never be swallowed into a shorter file."""
+    path = tmp_path / "router.log.gz"
+    path.write_bytes(gzip.compress(b"first\nsecond\n" * 1000)[:-8])
+    with pytest.raises(OSError, match="incomplete or corrupt compressed stream"):
+        open_log_file(SECTION, str(path), None)
+
+
 def test_a_planted_link_is_refused_and_an_applications_own_link_is_followed(
         tmp_path: Path) -> None:
     """The owner rule (issue #26): a link owned by the log directory's owner towards a file
@@ -663,7 +830,9 @@ def test_compressed_files_read_from_an_uncompressed_offset(
     assert texts(lines) == ["first line", "second line", "third"]
     assert log.offset == len(plain)  # the uncompressed stream, not the file size
     assert log.size is None
-    saved = replace(log.cursor(), offset=len(b"first line\n"))
+    # a cursor rewound by hand models a read that stopped before the end: such a cursor never
+    # carries size/mtime (issue #44 records them only when the offset IS the stream's end)
+    saved = replace(log.cursor(), offset=len(b"first line\n"), size=None, mtime=None)
     log2, lines2 = scan(path, saved)
     assert log2.verdict == "continue" and texts(lines2) == ["second line", "third"]
 

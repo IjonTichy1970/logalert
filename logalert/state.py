@@ -16,6 +16,9 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
   * An entry unseen for ``state_ttl`` days expires; ``touch`` records a sighting even when the
     section's mail failed, so a file that is present never expires.
   * ``version`` is the schema version. A file from a newer logalert is refused, not guessed at.
+    A cursor's ``size`` and ``mtime`` (issue #44: what a compressed file looked like when it
+    was last read, so an unchanged archive is not decompressed again) are optional too;
+    0.1.0's reader drops them on save and the schema version stays 1.
     A cursor's ``line`` (the complete lines before ``offset``, so a report can number lines
     as the file does) is optional: a file without it is read, counted once, and updated.
   * A run as root against a state file another user owns is refused up front: ``mkstemp``
@@ -41,6 +44,7 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
 """
 
 import json
+import math
 import os
 import stat
 import sys
@@ -75,6 +79,9 @@ class Cursor:
     realpath: str
     last_seen: str  # ISO 8601 UTC, seconds; the last run that found the file present
     line: int | None = None  # complete lines before offset; None in a file from before #9
+    size: int | None = None  # the file's st_size at the read (issue #44); None before it
+    mtime: float | None = None  # its st_mtime; a compressed file with both unchanged is
+    #                             not opened again
 
 
 RunRecord = dict[str, str]  # glob, as written in ``files`` -> ISO 8601 UTC seconds, the run START
@@ -295,12 +302,18 @@ def _cursor(fields: dict[str, Any], corrupt: Any, where: str) -> Cursor:
     fp, realpath = text("fingerprint", optional=True), text("realpath")
     last_seen = text("last_seen")
     line = integer("line", _MAX_OFFSET) if fields.get("line") is not None else None
+    size = integer("size", _MAX_OFFSET) if fields.get("size") is not None else None
+    mtime = fields.get("mtime")
+    if mtime is not None and (not isinstance(mtime, int | float) or isinstance(mtime, bool)
+                              or not math.isfinite(mtime)):
+        raise corrupt(f"entries{where}: 'mtime' is not a number")
     try:
         parse_timestamp(last_seen)
     except ValueError:
         raise corrupt(f"entries{where}: 'last_seen' is not a UTC timestamp") from None
     return Cursor(offset=offset, ino=ino, dev=dev, fingerprint=fp, realpath=realpath,
-                  last_seen=last_seen, line=line)
+                  last_seen=last_seen, line=line, size=size,
+                  mtime=None if mtime is None else float(mtime))
 
 
 def check_state_dir(state_file: str) -> None:

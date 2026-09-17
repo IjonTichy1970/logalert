@@ -18,6 +18,16 @@ will actually read, and decides how the saved cursor applies:
     the first run is not a flood of old news; ``start = beginning`` / ``--from-start`` read
     from 0. Nothing is emitted; the skipped byte count is logged, as a WARNING.
 
+A listed COMPRESSED file whose inode, device, size and mtime are what the cursor recorded
+is not opened at all (issue #44): nothing new can be in an archive that has not changed,
+and the confirming seek to the saved offset was a full decompression on every run. The
+cursor records the two only when its offset IS the end of the stream (a read that reached
+EOF with no unterminated tail), so a cursor that carries them never has unread bytes
+behind it. Its first sight is one pass: the stream's end, the last line boundary and the
+line count come from a single forward read. A plain file changes size and mtime with
+every append and is never short-circuited; nor is a symbolic link, which goes through the
+owner rule below on every run.
+
 On its own a ``LogFile`` reads a ROTATED or TRUNCATED live file from 0; ``logalert.rotation``
 wraps it to read the rotated copy first, found by the inode and the fingerprint saved here.
 Compressed files (``.gz``, ``.bz2``, ``.xz``; ``.zst`` where the stdlib has
@@ -367,6 +377,7 @@ class LineReader:
         self.line = start_line
         self.path = path
         self.nul_bytes = 0  # NUL bytes skipped at line starts (a copytruncate hole)
+        self.at_end = False  # the last read reached EOF with no unterminated tail behind it
         handle.seek(offset)
 
     def __iter__(self) -> Iterator[Line]:
@@ -417,6 +428,10 @@ class LineReader:
             # it did decompress, read1 hands them over first (measured for gz, bz2, xz)
             chunk = self.handle.read1(_CHUNK)
             if not chunk:
+                # the stream is exhausted: an unterminated tail may remain, and re-reading
+                # it from this offset yields nothing until the file changes (the boundaries
+                # are a function of the bytes alone), which is what the short-circuit needs
+                self.at_end = True
                 return  # what is left is an unterminated tail: re-read next run
             buf = buf[pos:] + chunk
             pos = 0
@@ -434,16 +449,42 @@ class LogFile:
         self.section = section
         self.path = path
         self.saved = saved
+        self.unchanged = False  # a compressed file the cursor already describes: not opened
+        self.handle: BinaryStream
+        self.file_size: int | None  # what the cursor records (issue #44)
+        self.file_mtime: float | None
+        self.size: int | None
+        self.verdict: Verdict
+        self.note: str | None
+        if saved is not None and compressed_suffix(path) is not None and _unchanged(path, saved):
+            self.unchanged = True
+            self.handle = io.BytesIO()  # nothing to read; closes like any handle
+            self.ino, self.dev = saved.ino, saved.dev
+            self.compressed = True
+            self.size = None
+            self.fingerprint = saved.fingerprint
+            self.verdict, self.note = "continue", None
+            self.skipped = 0
+            self.start, self.start_line = saved.offset, saved.line or 0
+            self.reader = LineReader(self.handle, 0, start_line=self.start_line, path=path)
+            self.reader.offset, self.reader.line = saved.offset, saved.line or 0
+            self.file_size, self.file_mtime = saved.size, saved.mtime
+            self.realpath = os.path.realpath(path)
+            log.debug("[%s] %s: unchanged since the last read (size %s, mtime %s); not opened",
+                      section, path, saved.size, saved.mtime)
+            return
         self.handle = open_log(path, follow_links=True)  # a listed path; see open_log
         try:
             st = os.fstat(self.handle.fileno())
             self.ino, self.dev = st.st_ino, st.st_dev
+            self.file_size, self.file_mtime = st.st_size, st.st_mtime
             self.compressed = compressed_suffix(path) is not None
-            self.size: int | None = None if self.compressed else st.st_size
+            self.size = None if self.compressed else st.st_size
             self.fingerprint = fingerprint(self.handle)
             self.verdict, self.note = identify(saved, self.ino, self.dev, self.size,
                                                self.fingerprint)
             self.skipped = 0  # bytes passed over on first sight
+            self._counted: int | None = None  # lines before the start, when a pass counted them
             self.start = self._start_offset(from_start)
             self.start_line = self._start_line()
             self.reader = LineReader(self.handle, self.start, start_line=self.start_line,
@@ -461,6 +502,10 @@ class LogFile:
         if self.verdict == "first-sight":
             if from_start:
                 return 0
+            if self.compressed:
+                # one forward pass gives the end, the last boundary and the line count
+                self.skipped, self._counted = _end_of_last_line_counting(self.handle)
+                return self.skipped
             self.skipped = _end_of_last_line(self.handle)
             return self.skipped
         if self.verdict == "continue" and self.saved is not None:
@@ -484,6 +529,8 @@ class LogFile:
             return 0
         if self.verdict == "continue" and self.saved is not None and self.saved.line is not None:
             return self.saved.line
+        if self._counted is not None:
+            return self._counted  # counted during the first-sight pass (issue #44)
         counted = count_newlines(self.handle, self.start)
         log.debug("[%s] %s: counted %d lines before offset %d (once)", self.section, self.path,
                   counted, self.start)
@@ -540,7 +587,14 @@ class LogFile:
     def cursor(self, now: datetime | None = None) -> Cursor:
         return Cursor(offset=self.reader.offset, ino=self.ino, dev=self.dev,
                       fingerprint=self.fingerprint, realpath=self.realpath,
-                      last_seen=timestamp(now), line=self.reader.line)
+                      last_seen=timestamp(now), line=self.reader.line,
+                      # recorded only for a compressed file read to its end: a cursor that
+                      # carries them says its offset IS the unchanged stream's end
+                      size=self.file_size if self._settled() else None,
+                      mtime=self.file_mtime if self._settled() else None)
+
+    def _settled(self) -> bool:
+        return self.compressed and (self.unchanged or self.reader.at_end)
 
     def close(self) -> None:
         self.handle.close()
@@ -586,10 +640,23 @@ def lines_before(handle: BinaryStream, offset: int, n: int, line: int,
     counted but not returned, as the reader skips them."""
     if n <= 0 or offset <= 0:
         return []
-    start = max(0, offset - (n * (LINE_CAP + 1) + _CHUNK))
+    start = max(0, offset - window_for(n))
     handle.seek(max(0, start - 1))  # one byte more: it says whether the window starts a line
     buf = _read_up_to(handle, offset - max(0, start - 1))
     handle.seek(0)
+    return lines_from_window(buf, start, n, line, path)
+
+
+def window_for(n: int) -> int:
+    """The bytes before the offset that ``n`` context lines can need."""
+    return n * (LINE_CAP + 1) + _CHUNK
+
+
+def lines_from_window(buf: bytes, start: int, n: int, line: int, path: str = "") -> list[Line]:
+    """The parsing half of ``lines_before``: ``buf`` holds the bytes from ``max(0, start - 1)``
+    to the offset (the byte before the window, when there is one, says whether the window
+    starts a line). The rotation catch-up keeps that window from its confirming seek and
+    answers the hook from it without a second decompression (issue #46)."""
     if start > 0:
         # the window's first line is complete only if the byte before it is a newline;
         # otherwise it is the tail of a line that began earlier, and is dropped
@@ -613,6 +680,49 @@ def lines_before(handle: BinaryStream, offset: int, n: int, line: int,
         number -= 1
     numbered.reverse()
     return numbered
+
+
+def _unchanged(path: str, saved: Cursor) -> bool:
+    """Whether a compressed file is what the cursor recorded: same inode and device, same
+    size and mtime. ``lstat``, so a symbolic link is never unchanged: a listed link goes
+    through ``open_log``'s owner rule (issue #26) every run, whatever it points to; an
+    absent file is not unchanged either (the open then says so)."""
+    if saved.size is None or saved.mtime is None:
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return (stat.S_ISREG(st.st_mode) and (st.st_ino, st.st_dev) == (saved.ino, saved.dev)
+            and st.st_size == saved.size and st.st_mtime == saved.mtime)
+
+
+def _end_of_last_line_counting(handle: BinaryStream) -> tuple[int, int]:
+    """``_end_of_last_line`` for a compressed stream, in ONE forward pass that also counts
+    the complete lines before the boundary (issue #44: a seek to the end, a seek back and
+    ``count_newlines`` were three decompressions). Returns (offset, lines before it), with
+    the stream positioned at the offset when it is the end -- the common case."""
+    handle.seek(0)
+    size = 0
+    newlines = 0
+    last_newline = -1  # absolute offset of the last newline seen
+    while True:
+        chunk = handle.read1(_CHUNK)  # a stream error propagates: a cut archive is an OSError
+        if not chunk:
+            break
+        found = chunk.rfind(b"\n")
+        if found >= 0:
+            last_newline = size + found
+        newlines += chunk.count(b"\n")
+        size += len(chunk)
+    # the one rule _end_of_last_line applies (review): a tail longer than LINE_CAP without a
+    # newline is pathological and the end of the stream is the boundary; a shorter held
+    # tail is re-read once it is complete
+    boundary = last_newline + 1  # 0 without a newline
+    offset = size if size - boundary > LINE_CAP else boundary
+    if offset != size:
+        handle.seek(offset)  # a held tail after the boundary: back to it (rare)
+    return offset, newlines
 
 
 def _end_of_last_line(handle: BinaryStream) -> int:

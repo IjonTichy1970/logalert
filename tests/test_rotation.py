@@ -12,12 +12,14 @@ import logging
 import lzma
 import os
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from logalert import rotation
 from logalert.cursor import Line, LogFile
 from logalert.rotation import (
     Archive,
@@ -31,6 +33,7 @@ from logalert.rotation import (
 from logalert.state import Cursor
 
 SECTION = "router-disk"
+NLB = chr(10).encode()  # a newline as bytes, for fixtures built in a comprehension
 NOWHERE = 2**40 + 7  # an inode number no filesystem in a test will hand out
 
 
@@ -921,3 +924,512 @@ def test_non_stem_gz_carries_its_compressed_flag(tmp_path: Path) -> None:
     (tmp_path / "keep.gz").write_bytes(gzip.compress(b"x\n"))
     everything, _ = scan_directories([str(tmp_path)], "router.log")
     assert [a.compressed for a in everything if a.path.endswith("keep.gz")] == [True]
+
+
+# -- issue #46: the matched archive is decompressed once, the hook answered from its tail -------
+
+
+def test_the_matched_archive_is_read_in_one_pass_with_the_context_from_its_tail(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Measured before this change: the content stage seeks to the saved offset on one
+    handle, the segment opens a second and seeks again, and the context hook opens a third
+    and seeks back -- 2.9 passes over a 550 KB archive to read a 30 MB tail. Now the
+    verified handle travels and the hook is answered from the tail kept on the way: one."""
+    counter = {"bytes": 0}
+    real_open = open
+
+    def counting_open(fd: object, *args: object, **kwargs: object) -> object:
+        handle = real_open(fd, *args, **kwargs)  # type: ignore[call-overload]
+        if isinstance(fd, int):
+            original1, original = handle.read1, handle.read  # gzip reads its input via read()
+
+            def read1(n: int = -1) -> bytes:
+                data: bytes = original1(n)
+                counter["bytes"] += len(data)
+                return data
+
+            def read(n: int = -1) -> bytes:
+                data: bytes = original(n)
+                counter["bytes"] += len(data)
+                return data
+
+            handle.read1, handle.read = read1, read
+        return handle
+
+    monkeypatch.setattr("logalert.cursor.open", counting_open, raising=False)
+    path = tmp_path / "router.log"
+    old = b"".join(b"line %d %s" % (i, os.urandom(60).hex().encode()) + NLB
+                   for i in range(5_000))
+    saved = seen(path, old)
+    append(path, b"since 1" + NLB + b"since 2" + NLB)
+    rotate(path, tmp_path / "router.log.1.gz", compress=True)
+    path.write_bytes(b"live 1" + NLB)
+    size = (tmp_path / "router.log.1.gz").stat().st_size
+    counter["bytes"] = 0
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    with source:
+        assert source.plan.verified is not None  # the content stage's handle travelled
+        lines = texts(list(source.lines()))
+        context = source.context_before(2)
+    assert lines == ["since 1", "since 2", "live 1"]
+    assert [line.number for line in context] == [4_999, 5_000]
+    assert texts(context)[-1].startswith("line 4999 ")
+    assert counter["bytes"] <= size + 128 * 1024 + 65536  # one pass, plus gzip's read-ahead
+    assert source.plan.verified.handle.closed  # closed with the source
+
+
+def test_a_context_window_wider_than_the_kept_tail_falls_back_to_a_second_read(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    path = tmp_path / "router.log"
+    old = b"".join(b"x" * 39 + NLB for _ in range(10_000))  # 400 KB: past the 256 KiB tail
+    saved = seen(path, old)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(b"live 1" + NLB)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    caplog.set_level(logging.DEBUG, logger="logalert.rotation")
+    with source:
+        assert texts(list(source.lines())) == ["since 1", "live 1"]
+        near = source.context_before(3)  # inside the tail
+        far = source.context_before(500)  # 500 * 2001 + 65536 > the tail: the second read
+    assert [line.number for line in near] == [9_998, 9_999, 10_000]
+    assert len(far) == 500 and far[-1].number == 10_000 and far[0].number == 9_501
+    assert any("wider than the kept tail" in r.getMessage() for r in caplog.records)
+
+
+def test_an_archive_cut_before_the_saved_offset_is_skipped_and_leaks_no_handle(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The confirming read now happens inside the content stage (issue #46): a stream error
+    there -- a .gz truncated before the saved offset, gzip(1) still writing it -- must be the
+    same WARNING as an unreadable archive, no match, and the handle closed (review)."""
+    path = tmp_path / "router.log"
+    old = b"".join(b"line %d %s" % (i, os.urandom(40).hex().encode()) + NLB for i in range(3_000))
+    saved = seen(path, old)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1.gz", compress=True)
+    archive = tmp_path / "router.log.1.gz"
+    archive.write_bytes(archive.read_bytes()[: archive.stat().st_size // 2])  # cut mid-way
+    path.write_bytes(b"live 1" + NLB)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    import gc
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ResourceWarning)
+        source = open_source(SECTION, str(path), saved)
+        assert isinstance(source, CatchUpSource) and source.plan.match is None
+        with source:
+            assert texts(list(source.lines())) == ["live 1"]
+        gc.collect()
+    assert not [w for w in caught if issubclass(w.category, ResourceWarning)], caught
+    assert any("could not be read" in r.getMessage() for r in caplog.records)
+    assert any("no rotated copy holds the saved position" in r.getMessage()
+               for r in caplog.records)
+
+
+# -- issue #32: a rotation that lands during the catch-up -----------------------------------------
+
+
+def _two_rotations(tmp_path: Path) -> tuple[Path, Cursor]:
+    """A log seen at OLD, then rotated twice between runs: .2 holds OLD + 'since 1', .1 holds
+    'middle 1', the live file 'live 1'. The catch-up's plan: match .2, chain [.1], then live."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(b"middle 1" + NLB)
+    (tmp_path / "router.log.1").replace(tmp_path / "router.log.2")
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(b"live 1" + NLB)
+    return path, saved
+
+
+def _shift(tmp_path: Path, deepest: int, fresh: bytes) -> None:
+    """logrotate's shift: .N -> .N+1 down to .1 -> .2, the live file -> .1, a fresh live."""
+    for n in range(deepest, 0, -1):
+        (tmp_path / f"router.log.{n}").replace(tmp_path / f"router.log.{n + 1}")
+    (tmp_path / "router.log").replace(tmp_path / "router.log.1")
+    (tmp_path / "router.log").write_bytes(fresh + NLB)
+
+
+def _third_rotation(tmp_path: Path) -> None:
+    """The shift once more after _two_rotations: .2 -> .3, .1 -> .2, live -> .1, 'live 2'."""
+    _shift(tmp_path, 2, b"live 2")
+
+
+def test_a_rotation_after_the_plan_stops_the_stream_and_the_next_run_resumes(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Measured in the audit: the old answer ('renamed under us; skipped this run') went on to
+    the live file, landed the cursor there, and 'middle 1' was lost for good. Now the stream
+    stops at the renamed member, the cursor is the last archive read, and the next run reads
+    everything once."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _two_rotations(tmp_path)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    _third_rotation(tmp_path)  # between the plan and the chain member's open
+    with source:
+        first = texts(list(source.lines()))
+        stopped = source.cursor()
+    assert first == ["since 1"]  # the match's tail, then the stop
+    assert stopped.ino == (tmp_path / "router.log.3").stat().st_ino  # the match, at its end
+    assert stopped.offset == len(OLD) + len(b"since 1" + NLB)
+    assert any("router.log.1 was renamed or removed under us (a rotation during the run); "
+               "stopping here, the next run resumes after router.log.2 (the names are from "
+               "before the rotation)" in r.getMessage() for r in caplog.records)
+    _, rest, cursor = run(path, stopped)
+    assert rest == ["middle 1", "live 1", "live 2"]  # every line once, none twice
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+
+
+def test_a_rotation_mid_chain_lands_the_cursor_on_the_last_archive_read(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Three rotations behind, the rotation lands after the first chain member was read and
+    before the second is opened: the cursor is that member's end (not the match's, not the
+    live file's), and the next run carries on from it."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _two_rotations(tmp_path)
+    _third_rotation(tmp_path)  # .3 = OLD + since 1, .2 = middle 1, .1 = live 1, live = live 2
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    with source:
+        stream = source.lines()
+        first = [next(stream).text, next(stream).text]  # .3's tail, then .2 whole
+        _shift(tmp_path, 3, b"live 3")  # .2 is read to its end; .1 is not open yet
+        first += texts(list(stream))
+        stopped = source.cursor()
+    assert first == ["since 1", "middle 1"]
+    assert stopped.ino == (tmp_path / "router.log.3").stat().st_ino  # 'middle 1', at its end
+    assert stopped.offset == len(b"middle 1" + NLB)
+    assert any("the next run resumes after router.log.2" in r.getMessage()
+               for r in caplog.records)  # the name the plan saw
+    _, rest, cursor = run(path, stopped)
+    assert rest == ["live 1", "live 2", "live 3"]  # every line once, none twice
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+
+
+def test_a_chain_member_compressed_away_after_the_plan_stops_the_stream(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """logrotate's compress step: the copy the plan listed as router.log.1 is gzipped into
+    router.log.1.gz and unlinked before its turn. Skipping it lost its lines for good (the
+    old 'continuing with the next file'); now the run stops and the next one reads the
+    .gz. Real on every platform: the member is not open when it goes."""
+    path, saved = _two_rotations(tmp_path)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    (tmp_path / "router.log.1").unlink()
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    with source:
+        got = texts(list(source.lines()))
+        stopped = source.cursor()
+    assert got == ["since 1"]
+    assert stopped.ino == (tmp_path / "router.log.2").stat().st_ino
+    assert any("router.log.1 was renamed or removed under us" in r.getMessage()
+               for r in caplog.records)
+    assert not any("could not be read" in r.getMessage() for r in caplog.records)
+    _, rest, cursor = run(path, stopped)
+    assert rest == ["middle 1", "live 1"]  # from the .gz, then the live file: once each
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+
+
+def test_an_impostor_at_a_chain_members_name_is_never_read(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """TEST-7: a different file under the name the plan saw -- its lines are not this log's.
+    The (ino, dev) guard in Segment.lines is what refuses it; a mutant dropping the guard
+    mails the impostor's lines as the log's."""
+    path, saved = _two_rotations(tmp_path)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    (tmp_path / "router.log.1").replace(tmp_path / "elsewhere")  # the real member moved
+    (tmp_path / "router.log.1").write_bytes(b"IMPOSTOR" + NLB)  # a new inode under its name
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    with source:
+        got = texts(list(source.lines()))
+        stopped = source.cursor()
+    assert got == ["since 1"] and "IMPOSTOR" not in got
+    assert stopped.ino == (tmp_path / "router.log.2").stat().st_ino
+    assert any("was renamed or removed under us" in r.getMessage() for r in caplog.records)
+
+
+def test_a_rotation_between_the_scan_and_the_content_stage_is_found_by_a_rescan(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The plan scanned the directory, then the rotation moved every name before the first
+    candidate was opened: every candidate was 'renamed under us', the plan found nothing, and
+    the live file was read from 0 under a warning naming four wrong causes -- the matched
+    archive's tail lost. Now the plan scans again, once."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _two_rotations(tmp_path)
+    real_scan = rotation.scan_directories
+    calls = {"n": 0}
+
+    def scan_then_rotate(directories: list[str], base: str) -> object:
+        found = real_scan(directories, base)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _third_rotation(tmp_path)  # after the scan, before any candidate's open
+        return found
+
+    monkeypatch.setattr(rotation, "scan_directories", scan_then_rotate)
+    caplog.set_level(logging.INFO, logger="logalert")
+    _, lines, cursor = run(path, saved)
+    assert calls["n"] == 2  # scanned twice: the rescan
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)  # recovered quietly
+    # the live file this run opened before the plan is 'router.log.1' by now; its handle
+    # is read to the end, and the new live file is the next run's
+    assert lines == ["since 1", "middle 1", "live 1"]
+    assert cursor is not None and cursor.ino == (tmp_path / "router.log.1").stat().st_ino
+    assert any("scanning again" in r.getMessage() for r in caplog.records)
+    assert not any("no rotated copy holds" in r.getMessage() for r in caplog.records)
+    monkeypatch.undo()
+    _, rest, cursor = run(path, cursor)
+    assert rest == ["live 2"]  # every line once across the two runs
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+
+
+def test_a_second_rename_inside_one_plan_reaches_the_warning_with_its_cause(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rescan is once: renamed under again, the plan gives up as before, and the
+    warning's first cause says why (the old text named four causes, none of them this)."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _two_rotations(tmp_path)
+    real_scan = rotation.scan_directories
+    calls = {"n": 0}
+
+    def scan_then_rotate(directories: list[str], base: str) -> object:
+        found = real_scan(directories, base)
+        calls["n"] += 1
+        if calls["n"] <= 2:  # the second pass is renamed under too; a third would find it
+            _shift(tmp_path, calls["n"] + 1, b"live %d" % (calls["n"] + 1))
+        return found
+
+    monkeypatch.setattr(rotation, "scan_directories", scan_then_rotate)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    _, lines, _ = run(path, saved)
+    assert calls["n"] == 2  # once more, never a third time
+    assert lines == ["live 1"]  # the live file the run opened, from 0; the archives are lost
+    warned = [r.getMessage() for r in caplog.records if "no rotated copy" in r.getMessage()]
+    assert len(warned) == 1
+    assert "likely causes: a second rotation during this run (a copy was renamed twice), " \
+        "rotate 0, " in warned[0]  # first, before the four old causes
+
+
+def test_the_holder_gone_at_the_content_stage_is_found_again_under_its_new_name(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review's F1: with dateext (the RHEL default) a rotation reuses no name, so the
+    only signal is a listed copy GONE at its open -- gzipped into another name. That was
+    'could not be read; skipped' (no rescan, the tail lost); now it is a rescan. Real on
+    every platform: nothing open is renamed."""
+    path, saved = _two_rotations(tmp_path)
+    real_scan = rotation.scan_directories
+    calls = {"n": 0}
+
+    def scan_then_compress(directories: list[str], base: str) -> object:
+        found = real_scan(directories, base)
+        calls["n"] += 1
+        if calls["n"] == 1:  # the holder is compressed away before its open
+            compress_to(tmp_path / "router.log.2.gz", (tmp_path / "router.log.2").read_bytes())
+            (tmp_path / "router.log.2").unlink()
+        return found
+
+    monkeypatch.setattr(rotation, "scan_directories", scan_then_compress)
+    caplog.set_level(logging.INFO, logger="logalert")
+    _, lines, cursor = run(path, saved)
+    assert calls["n"] == 2
+    assert lines == ["since 1", "middle 1", "live 1"]  # the tail from the .gz, then the rest
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_a_member_gone_when_the_content_stage_opens_it_first_stays_in_the_chain(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S13: a quiet log, so the holder is older than the last run and the newer member
+    is opened first by the content stage -- and is gone (compressed away). Filed as
+    unreadable it was dropped from the chain for good; as renamed it stays, the stream
+    stops at it, and the next run reads its .gz."""
+    path, saved = _two_rotations(tmp_path)
+    long_ago = time.time() - 60
+    os.utime(tmp_path / "router.log.2", (long_ago, long_ago))  # written before the last run
+    real_scan = rotation.scan_directories
+    calls = {"n": 0}
+
+    def scan_then_compress(directories: list[str], base: str) -> object:
+        found = real_scan(directories, base)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+            (tmp_path / "router.log.1").unlink()
+        return found
+
+    monkeypatch.setattr(rotation, "scan_directories", scan_then_compress)
+    caplog.set_level(logging.WARNING, logger="logalert")
+    _, lines, stopped = run(path, saved)
+    assert calls["n"] == 1  # the holder was found: no rescan
+    assert lines == ["since 1"]  # the stop at the member
+    assert stopped is not None and stopped.ino == (tmp_path / "router.log.2").stat().st_ino
+    assert any("router.log.1 was renamed or removed under us" in r.getMessage()
+               for r in caplog.records)
+    assert not any("could not be read" in r.getMessage() for r in caplog.records)
+    monkeypatch.undo()
+    _, rest, cursor = run(path, stopped)
+    assert rest == ["middle 1", "live 1"]
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+
+
+def test_a_rotation_inside_the_listing_is_caught_by_the_second_listing(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review's F2: the shift lands between the directory listing and the per-entry
+    stat, so every listed name carries its new inode (no rename signal at any open) and
+    the holder's new name was never listed. The plan lists again when nothing matched and
+    searches again because the listing changed."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _two_rotations(tmp_path)
+    real_scandir = os.scandir
+    listings = {"n": 0}
+
+    def list_then_rotate(directory: str) -> list[os.DirEntry[str]]:
+        entries = list(real_scandir(directory))
+        listings["n"] += 1
+        if listings["n"] == 1:
+            _third_rotation(tmp_path)  # after the names were read, before their stats
+        return entries
+
+    monkeypatch.setattr(os, "scandir", list_then_rotate)  # the module rotation reads it from
+    caplog.set_level(logging.INFO, logger="logalert")
+    _, lines, cursor = run(path, saved)
+    assert listings["n"] == 2
+    assert lines == ["since 1", "middle 1", "live 1"]  # 'live 2' is the next run's
+    assert cursor is not None and cursor.ino == (tmp_path / "router.log.1").stat().st_ino
+    assert any("scanning again" in r.getMessage() for r in caplog.records)
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_one_rename_then_the_copy_gone_names_no_second_rotation(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rename signal is cleared before the second pass: a shift that also dropped the
+    holder (rotate 2) reaches the warning with 'the archive aged out', not a second
+    rotation that never happened."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _two_rotations(tmp_path)
+    real_scan = rotation.scan_directories
+    calls = {"n": 0}
+
+    def scan_then_rotate_and_drop(directories: list[str], base: str) -> object:
+        found = real_scan(directories, base)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _third_rotation(tmp_path)
+            (tmp_path / "router.log.3").unlink()  # rotate 2: the holder is dropped
+        return found
+
+    monkeypatch.setattr(rotation, "scan_directories", scan_then_rotate_and_drop)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    _, lines, _ = run(path, saved)
+    assert calls["n"] == 2
+    assert lines == ["live 1"]  # the live file the run opened, from 0
+    warned = [r.getMessage() for r in caplog.records if "no rotated copy" in r.getMessage()]
+    assert len(warned) == 1 and "the archive aged out" in warned[0]
+    assert "a second rotation" not in warned[0]
+
+
+def test_an_unreadable_chain_member_is_skipped_not_a_stop(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A member the run cannot open (a mode, not a move) is skipped as before, with its
+    warning, and the live file is read: stopping there would park every later run before
+    the same member until it aged out, the live file never read."""
+    if sys.platform == "win32":
+        pytest.skip("mode bits are fabricated on Windows; runs in the sandbox and on CI")
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 0000 file; expected in the root sandbox; CI runs it")
+    path, saved = _two_rotations(tmp_path)
+    (tmp_path / "router.log.1").chmod(0o000)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    try:
+        _, lines, cursor = run(path, saved)
+    finally:
+        (tmp_path / "router.log.1").chmod(0o644)
+    assert lines == ["since 1", "live 1"]
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+    assert any("could not be read" in r.getMessage() for r in caplog.records)
+    assert not any("renamed or removed" in r.getMessage() for r in caplog.records)
+
+
+def test_the_stop_parks_before_an_empty_copy_that_has_no_first_line(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """An empty rotated copy has no first line to be found by once it is compressed; the
+    cursor parks on the last copy that has one, and the empty copy is read again next
+    run -- it has nothing to repeat."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.3")
+    (tmp_path / "router.log.2").write_bytes(b"")  # a rotation of an empty interval
+    (tmp_path / "router.log.1").write_bytes(b"middle 1" + NLB)
+    path.write_bytes(b"live 1" + NLB)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    (tmp_path / "router.log.1").unlink()
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    with source:
+        got = texts(list(source.lines()))
+        stopped = source.cursor()
+    assert got == ["since 1"]
+    assert stopped.ino == (tmp_path / "router.log.3").stat().st_ino  # not the empty .2
+    assert stopped.fingerprint == saved.fingerprint
+    assert any("resumes after router.log.3" in r.getMessage() for r in caplog.records)
+    _, rest, cursor = run(path, stopped)
+    assert rest == ["middle 1", "live 1"]
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+
+
+def test_a_parked_cursor_carries_the_logs_real_path_not_the_archives(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A listed link: the archive's path in the cursor made the next plan say the link
+    now points elsewhere when it never moved."""
+    real = tmp_path / "real"
+    real.mkdir()
+    target = real / "router.log"
+    link = tmp_path / "current.log"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("creating a symlink needs a privilege here; runs in the sandbox and on CI")
+    saved = seen(link, OLD)
+    append(link, b"since 1" + NLB)
+    rotate(target, real / "router.log.2")
+    (real / "router.log.1").write_bytes(b"middle 1" + NLB)
+    target.write_bytes(b"live 1" + NLB)
+    source = open_source(SECTION, str(link), saved)
+    assert isinstance(source, CatchUpSource)
+    (real / "router.log.1").unlink()  # the member gone: the stop
+    with source:
+        assert texts(list(source.lines())) == ["since 1"]
+        stopped = source.cursor()
+    assert stopped.realpath == os.path.realpath(target)
+    caplog.set_level(logging.INFO, logger="logalert.rotation")
+    _, rest, _ = run(link, stopped)
+    assert rest == ["live 1"]
+    assert not any("the link now points at" in r.getMessage() for r in caplog.records)

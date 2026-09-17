@@ -44,6 +44,7 @@ from os import path as ospath
 from typing import Literal, cast
 
 from logalert.globs import Expansion, expand, is_glob
+from logalert.rotation import classify
 
 if sys.platform != "win32":
     import pwd
@@ -363,6 +364,7 @@ def _load_watch(name: str, section: configparser.SectionProxy, warnings: list[st
     files = tuple(_list(where, section, "files", required=True))
     for file in files:
         _check_path(where, "files", file, glob=True)
+    warnings.extend(_rotated_copies(where, files))
 
     section_priority = _enum(where, section, "priority", PRIORITIES, None)
     patterns: list[Pattern] = []
@@ -399,6 +401,30 @@ def _load_watch(name: str, section: configparser.SectionProxy, warnings: list[st
         archive_dir=archive_dir,
         include_archives=_bool(where, section, "include_archives", False),
     )
+
+
+def _rotated_copies(where: str, files: tuple[str, ...]) -> list[str]:
+    """A listed entry that is, by name, a rotated copy of another listed entry of the same
+    section in the same directory (issue #44): read as a live log it is mailed whole after
+    every rotation, and the catch-up reads the copies itself. A --check-config warning:
+    a static archive listed on purpose is legitimate."""
+    listed = list(dict.fromkeys(f for f in files if not is_glob(f)))  # an entry twice: once
+    found: list[str] = []
+    for copy in listed:
+        for live in listed:
+            if copy == live or os.path.dirname(copy) != os.path.dirname(live):
+                continue
+            if os.path.basename(live)[-1:].isdigit():
+                continue  # 192.0.2.1 beside 192.0.2 is a host's file (archive_suffix's rule)
+            shape = classify(os.path.basename(copy), os.path.basename(live))
+            # a rotation suffix, or the bare compression extension a gzip of the live file
+            # leaves (messages.gz beside messages); a .bak is a hand copy, never chained
+            if shape is not None and (shape[0] != "other" or (shape[2] == "" and shape[3])):
+                found.append(f"{where} files: {copy} is a rotated copy of {live}; the "
+                             f"catch-up reads the copies itself, and a listed copy is "
+                             f"mailed whole after every rotation -- list the live file only")
+                break
+    return found
 
 
 def _patterns(

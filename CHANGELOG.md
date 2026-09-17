@@ -65,6 +65,29 @@ its notes.
   its position kept. Enforced on POSIX; Windows reports the key and cannot
   enforce it.
 
+- `[contract]` **A listed compressed file is decompressed once at first sight
+  and not at all while unchanged** (#44). The cursor records the archive's size
+  and mtime; the example's second watch no longer lists a rotated copy beside
+  its log, and `--check-config` warns when a listed entry is one (it was read
+  as a live log and mailed whole after every rotation).
+
+- `[contract]` **A glob's file with nothing new is a DEBUG record, and each glob
+  gets one INFO summary per run** (#50). A daily directory or a host tree wrote
+  a `0 line(s) read` line per file per run -- thousands of identical records
+  burying the ones the section exists for. A listed file, and a glob's file
+  with new lines, keep their own record.
+
+- `[internal]` **The rotation catch-up decompresses the matched archive once,
+  not three times** (#46). The handle the content stage verified travels to
+  the read, and the context window before the saved position is kept from the
+  confirming seek. Measured: 2.9 passes over the archive down to 1.
+
+- `[contract]` **A rotation that lands during the catch-up stops the run at the
+  copy it moved, and the next run carries on from the last copy read** (#32).
+  The old answer skipped the moved copy and went on to the live file, and its
+  lines were never mailed. A copy renamed or gone between the directory listing
+  and its open makes the plan list the directory again, once.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

@@ -159,7 +159,7 @@ The file's rules:
 | --- | --- | --- |
 | `subject` | required | The Subject of the alert, verbatim (plus the suffix above). |
 | `to` | required | The recipients, one per line or comma-separated. |
-| `files` | required | The log files to read, absolute, one per line; an entry with `*`, `?` or `[` is a glob, expanded at every run ([Globs](#globs)). Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly. A file the list names more than once, or a glob matches after it was named, is read once. A listed symbolic link is followed only when its owner is root, the running user or the file's owner ([Globs](#globs)). |
+| `files` | required | The log files to read, absolute, one per line; an entry with `*`, `?` or `[` is a glob, expanded at every run ([Globs](#globs)). Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly and are read as a live log -- right for a one-off `start = beginning` read of a static archive, never for a rotated copy of a log the section already lists: the catch-up reads the copies itself, and a listed copy is mailed whole after every rotation (`--check-config` warns). An archive that has not changed since it was last read (same inode, size and mtime) is not decompressed again. A file the list names more than once, or a glob matches after it was named, is read once. A listed symbolic link is followed only when its owner is root, the running user or the file's owner ([Globs](#globs)). |
 | `patterns` | | Literal text, matched case-SENSITIVELY against the whole line. A line matches when any pattern of any of the four shapes is found in it. |
 | `ipatterns` | | Literal text, case-insensitive. |
 | `regex` | | Python regular expressions (`re.search`), case-sensitive. `re` has no backtracking limit: a nested or ambiguous quantifier (`(x+)+`, `(x*)*`, `(\w+\s?)+`) can run for hours on one long line of ordinary words, holding the lock -- `--check-config` warns about that shape, and `scan_timeout` bounds the damage. An anchor or a delimiter class (`[^ ]+`) usually stops it. |
@@ -342,14 +342,15 @@ patterns =
 #include_archives = no
 
 # ---------------------------------------------------------------------------
-# A second watch, on a compressed log, with case-insensitive matching.
+# A second watch, with case-insensitive matching. The rotated copies
+# (firewall.log.0.gz, ...) are read by the catch-up when the file rotates;
+# listing one beside the live file would mail it whole after every rotation.
 
 #[firewall-denies]
 #subject = Firewall denies
 #to = noc@example.net, security@example.net
 #files =
 #    /var/log/firewall.log
-#    /var/log/firewall.log.0.gz
 #ipatterns =
 #    deny
 #exclude_regex =
@@ -403,6 +404,23 @@ however many rotations happened in between. It recognises, beside the log or in
 Symbolic links are never candidates. A `.gz` still being written yields what it
 has, with a warning, and the run continues.
 
+**A rotation during the run.** When a rename rotation (logrotate's default;
+not `copytruncate`) lands while the copies are being read, a copy the run was
+about to open is no longer the file it planned to read (renamed on, compressed
+away, removed). The run stops there and says so:
+
+```
+[router-disk] /var/log/router.log: router.log.1 was renamed or removed under us (a rotation during the run); stopping here, the next run resumes after router.log.2 (the names are from before the rotation)
+```
+
+Its position stays at the end of the last copy it read, and the next run carries
+on from there under the new names, so nothing is mailed twice or lost --
+provided that copy is still there at the next run: keep one rotation more than
+the interval between runs needs. A rotation landing between the directory
+listing and the copies' opens makes the run list the directory again, once; a
+second rotation inside one run reaches the warning below, whose first cause is
+then `a second rotation during this run (a copy was renamed twice)`.
+
 **The "no rotated copy" warning.** When no copy holds the saved position the log
 says so:
 
@@ -418,7 +436,9 @@ and xz), `the archive aged out` (rotation ran more times than there are archives
 kept: raise `rotate`, or run logalert more often than the rotation), and, only
 when the file had no complete first line at the last run, `the file had no
 complete first line at the last run` (nothing to match a copy by but its inode,
-which compression replaces). A file replaced by one that is not a continuation
+which compression replaces). After a rotation during the run (above) the first
+cause named is `a second rotation during this run (a copy was renamed twice)`.
+A file replaced by one that is not a continuation
 of it -- a different first line, or a new inode with no archive behind it --
 says the same thing. The run does not fail on it; the live file is read from the
 beginning, so anything in it is mailed once.
@@ -652,7 +672,10 @@ becomes a space.
 Every run records its activity: the start (config path, section count), per file
 the lines read and matched and how the position was resolved when there is
 something to say (first sight, rotated, truncated; a plain continue is a DEBUG
-record, seen under `--debug`), per section the message sent with its recipients,
+record, seen under `--debug`) -- a file a glob matched with nothing new is a
+DEBUG record too, and each glob gets one INFO summary per run (`<glob>: N
+file(s), M with new lines, K matched`), so a daily directory does not write a
+line per file per run -- per section the message sent with its recipients,
 size and `Message-ID` -- or the failure with the transport's answer -- every
 failed item at ERROR, every expired position, and the exit code at the end. The
 lines are one line each, the level shown as a word for `warning:`, `error:` and
