@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 
 from logalert import rotation
-from logalert.cursor import BinaryStream, Line, LogFile, open_log
+from logalert.cursor import NUL, BinaryStream, Line, LogFile, open_log
 from logalert.rotation import (
     Archive,
     CatchUpSource,
@@ -2738,3 +2738,294 @@ def test_a_copy_stamped_to_the_whole_second_still_absorbs_the_handle(
     source, lines, _ = run(path, saved)
     assert isinstance(source, CatchUpSource) and source.absorbed
     assert lines == ["since 1", "middle 1"]
+
+
+# -- a copytruncate under the open handle (issue #66) --------------------------------------------
+
+
+def _copytruncate(tmp_path: Path, fresh: bytes = b"") -> None:
+    """logrotate's copytruncate: .N shift up, the live file copied to .1 (a new inode) and
+    truncated in place (its inode kept), ``fresh`` appended after."""
+    for n in (3, 2, 1):
+        source = tmp_path / f"router.log.{n}"
+        if source.exists():
+            source.replace(tmp_path / f"router.log.{n + 1}")
+    path = tmp_path / "router.log"
+    (tmp_path / "router.log.1").write_bytes(path.read_bytes())
+    with open(path, "r+b") as handle:
+        handle.truncate(0)
+    if fresh:
+        append(path, fresh)
+
+
+def test_a_truncation_under_the_handle_drops_the_chunk_and_keeps_a_pre_truncation_cursor(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The live reader is several chunks in when the file is truncated and refilled under
+    it: nothing of the new content is yielded as old lines, the cursor pairs the old first
+    line with an offset from before, and the next run finds the copy by content there."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    body = b"".join(b"line %05d" % n + NLB for n in range(8000))  # ~80 KiB: two chunks
+    append(path, body)
+    caplog.set_level(logging.WARNING, logger="logalert.cursor")
+    with LogFile(SECTION, str(path), saved) as live:
+        assert live.verdict == "continue"
+        stream = live.lines()
+        first = [next(stream).text for _ in range(100)]
+        refill = b"".join(b"new %05d" % n + NLB for n in range(8000))  # past the position
+        _copytruncate(tmp_path, refill)  # under the handle
+        rest = texts(list(stream))
+        assert live.reader.truncated
+        cursor = live.cursor()
+    assert first == [f"line {n:05d}" for n in range(100)]
+    assert all(line.startswith("line ") for line in rest)  # nothing of the new content
+    assert cursor.fingerprint == saved.fingerprint
+    assert cursor.offset == len(OLD) + (len(first) + len(rest)) * len(b"line 00000" + NLB)
+    assert cursor.offset < len(OLD) + len(body)  # the first chunk's lines at most
+    assert [r.getMessage() for r in caplog.records] == [
+        f"[{SECTION}] {path}: truncated under us during the read (a copytruncate during "
+        f"the run?); stopping at offset {cursor.offset}"]
+    # the next run: the copy holds the rest, then the live file from 0
+    source, lines, _ = run(path, cursor)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.1")
+    assert lines == [f"line {n:05d}" for n in range(len(first) + len(rest), 8000)] + [
+        f"new {n:05d}" for n in range(8000)]
+
+
+def test_a_truncation_the_reader_meets_as_eof_is_reported_too(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The ordinary continue read: the file is truncated after the reader passed the point
+    and refilled with less than its position; the read ends at EOF, the check runs there
+    too (review: a quiet writer's truncation met as EOF must stop a catch-up before the
+    live file), the cursor stays a pre-truncation pair, and the next run resolves the
+    copy."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    caplog.set_level(logging.WARNING, logger="logalert.cursor")
+    with LogFile(SECTION, str(path), saved) as live:
+        stream = live.lines()
+        assert next(stream).text == "since 1"
+        _copytruncate(tmp_path, b"n" + NLB)  # shorter than the reader's position
+        assert texts(list(stream)) == ["since 2"]  # buffered before the truncation
+        assert live.reader.truncated
+        cursor = live.cursor()
+    assert len(caplog.records) == 1
+    assert cursor.offset == len(OLD + SINCE)
+    _, lines, _ = run(path, cursor)
+    assert lines == ["n"]
+
+
+def _s2_layout(tmp_path: Path) -> tuple[Path, Cursor]:
+    """S2 (the #32 review): seen at OLD, 'since 1' appended, one copytruncate between runs
+    (.1 = OLD + since 1, the live file emptied), 'middle 1' written to the live file."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1" + NLB)
+    _copytruncate(tmp_path, b"middle 1" + NLB)
+    return path, saved
+
+
+def _three_runs(path: Path, saved: Cursor, second: Cursor | None = None) -> list[list[str]]:
+    """Runs from ``second`` (the cursor after the staged run) and once more: their lines."""
+    out: list[list[str]] = []
+    cursor = second
+    for _ in range(2):
+        _, lines, cursor = run(path, cursor)
+        out.append(lines)
+    return out
+
+
+def test_a_copytruncate_after_the_plan_stops_before_the_live_file_and_nothing_is_lost(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """S2 measured with real logrotate: 'middle 1' lost, then the fragment '1' and 'live 1'
+    twice. Now the live read yields nothing, the cursor parks on the copy read, and the next
+    run chains the copy the truncation made."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _s2_layout(tmp_path)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    caplog.set_level(logging.WARNING, logger="logalert")
+    _copytruncate(tmp_path, b"live 1" + NLB)  # after the plan, before the reads
+    with source:
+        second = texts(list(source.lines()))
+        parked = source.cursor()
+    assert second == ["since 1"]
+    assert source.stopped and parked.ino == (tmp_path / "router.log.2").stat().st_ino
+    assert parked.offset == len(OLD) + len(b"since 1" + NLB)
+    third, fourth = _three_runs(path, saved, parked)
+    assert third == ["middle 1", "live 1"] and fourth == []
+    assert second + third == ["since 1", "middle 1", "live 1"]  # every line once, no fragment
+
+
+def test_a_copytruncate_between_the_listing_and_the_content_stage_reads_the_copy_once(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """S2b: the second listing sees the copy and chains it; the live read then yields nothing
+    and the cursor parks on that copy -- a live cursor (first line, 0) would match it again.
+    Real on Windows too: no handle is open on .1 when the copy is renamed on."""
+    path, saved = _s2_layout(tmp_path)
+    _hooked_scan(monkeypatch, "after", lambda: _copytruncate(tmp_path, b"live 1" + NLB))
+    source, second, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.stopped
+    assert second == ["since 1", "middle 1"]
+    assert parked is not None and parked.ino == (tmp_path / "router.log.1").stat().st_ino
+    third, fourth = _three_runs(path, saved, parked)
+    assert third == ["live 1"] and fourth == []
+    assert second + third == ["since 1", "middle 1", "live 1"]
+
+
+def test_a_copytruncate_during_the_live_read_keeps_the_live_cursor(
+        tmp_path: Path) -> None:
+    """The live read yielded lines before the truncation (the refill runs past the reader's
+    position, so the check fires on the next chunk; a shorter refill is the EOF shape): the
+    copy did not exist at the plan, so the live pair (first line, offset) is what the next
+    run resolves against it -- parking on the previous copy would mail the new copy whole
+    again (review: the shipped test never entered this branch). Real on Windows too."""
+    path, saved = _s2_layout(tmp_path)
+    body = b"".join(b"middle %05d" % n + NLB for n in range(8000))
+    append(path, body)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource) and source.live is not None
+    refill = b"".join(b"live %05d" % n + NLB for n in range(8000))
+    with source:
+        stream = source.lines()
+        second = [next(stream).text for _ in range(50)]  # into the live file's first chunk
+        _copytruncate(tmp_path, refill)
+        second += texts(list(stream))
+        assert source.live.reader.truncated
+        cursor = source.cursor()
+    assert not source.stopped and cursor.ino == path.stat().st_ino
+    assert cursor.fingerprint is not None and cursor.fingerprint != saved.fingerprint
+    third, fourth = _three_runs(path, saved, cursor)
+    assert fourth == []
+    written = (["since 1", "middle 1"] + [f"middle {n:05d}" for n in range(8000)]
+               + [f"live {n:05d}" for n in range(8000)])
+    assert second + third == written
+
+
+def test_a_file_shorter_than_the_position_at_the_check_is_a_truncation(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The size half of the check: a truncation landing between a chunk's read and the check
+    leaves the file shorter than the reader's position while the first line may still be
+    the one from the open (a banner refill); the chunk is dropped unread."""
+    path = tmp_path / "router.log"
+    saved = seen(path, BANNER + OLD)
+    append(path, b"".join(b"line %05d" % n + NLB for n in range(8000)))
+    real_fstat = os.fstat
+    armed = {"on": False, "shrunk": False}
+
+    def fstat_after_a_truncation(fd: int) -> os.stat_result:
+        st = real_fstat(fd)
+        if armed["on"] and not armed["shrunk"]:  # the first check: shorter than the position
+            armed["shrunk"] = True
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid,
+                                   st.st_gid, 5, st.st_atime, st.st_mtime, st.st_ctime))
+        return st
+
+    monkeypatch.setattr("logalert.cursor.os.fstat", fstat_after_a_truncation)
+    with LogFile(SECTION, str(path), saved) as live:
+        assert live.verdict == "continue"
+        armed["on"] = True  # the open's own fstat calls are behind us
+        lines = texts(list(live.lines()))
+        assert armed["shrunk"] and live.reader.truncated and lines == []  # nothing yielded
+        cursor = live.cursor()
+    assert cursor.offset == saved.offset and cursor.fingerprint == saved.fingerprint
+
+
+def test_a_file_empty_at_the_open_that_gained_lines_is_read(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """No first line at the open means nothing to compare: the lines a writer added before
+    the read are read, with no truncation claimed (review: the mutant dropped them with a
+    spurious warning)."""
+    path = tmp_path / "router.log"
+    path.write_bytes(b"")
+    caplog.set_level(logging.WARNING, logger="logalert.cursor")
+    with LogFile(SECTION, str(path), None, from_start=True) as live:
+        assert live.fingerprint is None
+        append(path, b"first" + NLB + b"second" + NLB)
+        assert texts(list(live.lines())) == ["first", "second"]
+        assert not live.reader.truncated
+    assert caplog.records == []
+
+
+def test_a_truncation_between_the_check_and_the_next_read_yields_nothing_new(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The order the design rests on: the check runs AFTER each read, so a truncation landing
+    right after a check is seen by the next chunk's check and that chunk is dropped; a check
+    before the read would pass and the chunk would be the new content at the old offsets --
+    the chimera (review)."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"".join(b"line %05d" % n + NLB for n in range(8000)))
+    real_check = LogFile._still_the_file
+    fired = {"n": 0}
+
+    def check_then_truncate(self: LogFile) -> bool:
+        answer = real_check(self)
+        fired["n"] += 1
+        if fired["n"] == 1:  # the window after the first check
+            _copytruncate(tmp_path, b"".join(b"new %05d" % n + NLB for n in range(8000)))
+        return answer
+
+    monkeypatch.setattr(LogFile, "_still_the_file", check_then_truncate)
+    with LogFile(SECTION, str(path), saved) as live:
+        lines = texts(list(live.lines()))
+        assert live.reader.truncated and fired["n"] == 2
+    assert lines and all(line.startswith("line ") for line in lines)
+
+
+def test_a_copytruncate_with_a_quiet_writer_stops_before_the_live_file(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #66: with nothing written after the truncation the live read met EOF, no
+    check ran, and the live cursor (first line, 0) matched the truncation's copy again next
+    run -- 'middle 1' twice when the second listing had chained it. The check runs at EOF."""
+    path, saved = _s2_layout(tmp_path)
+    _hooked_scan(monkeypatch, "after", lambda: _copytruncate(tmp_path))  # no refill
+    source, second, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.stopped
+    assert second == ["since 1", "middle 1"]
+    assert parked is not None and parked.ino == (tmp_path / "router.log.1").stat().st_ino
+    append(path, b"live 1" + NLB)
+    third, fourth = _three_runs(path, saved, parked)
+    assert third == ["live 1"] and fourth == []
+
+
+def test_the_check_reads_past_a_nul_hole_once(tmp_path: Path) -> None:
+    """A copytruncate under a writer without O_APPEND leaves a NUL hole before the first
+    line; the check reads where the line begins (recorded at the open) instead of skipping
+    the hole again on every chunk (review, measured: seconds per chunk on a large hole).
+    The same file passes; a truncation under it is still caught."""
+    path = tmp_path / "router.log"
+    hole = NUL * 8192
+    path.write_bytes(hole + OLD)
+    with LogFile(SECTION, str(path), None, from_start=True) as live:
+        assert live.line_at == len(hole) and live.fingerprint is not None
+        assert texts(list(live.lines())) == ["old 1", "old 2"]
+        assert not live.reader.truncated
+        saved = live.cursor()
+    append(path, b"".join(b"line %05d" % n + NLB for n in range(8000)))
+    with LogFile(SECTION, str(path), saved) as live:
+        assert live.verdict == "continue" and live.line_at == len(hole)
+        stream = live.lines()
+        first = [next(stream).text for _ in range(10)]
+        _copytruncate(tmp_path, b"".join(b"new %05d" % n + NLB for n in range(8000)))
+        rest = texts(list(stream))
+        assert live.reader.truncated
+    assert first == [f"line {n:05d}" for n in range(10)]
+    assert all(line.startswith("line ") for line in rest)
+
+
+def test_context_before_after_a_truncation_under_the_handle_is_empty(tmp_path: Path) -> None:
+    """The context hook's second handle passes the identity test (copytruncate keeps the
+    inode) and would return the new content's lines; the same-file test applies there."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    with LogFile(SECTION, str(path), saved) as live:
+        assert live.context_before(2) == [Line("old 1", False, 1, str(path)),
+                                          Line("old 2", False, 2, str(path))]
+        _copytruncate(tmp_path, b"new A" + NLB + b"new B" + NLB + b"new C" + NLB)
+        assert live.context_before(2) == []

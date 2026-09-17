@@ -971,7 +971,7 @@ def test_handle_is_closed_when_identification_fails(
         raise RuntimeError("fingerprint failed")
 
     monkeypatch.setattr("logalert.cursor.open_log", spy)
-    monkeypatch.setattr("logalert.cursor.fingerprint", boom)
+    monkeypatch.setattr("logalert.cursor.first_line", boom)  # what the open calls (#66)
     with pytest.raises(RuntimeError):
         LogFile(SECTION, str(path), None)
     assert handles and handles[0].closed

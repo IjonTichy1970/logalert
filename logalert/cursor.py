@@ -53,6 +53,28 @@ so a link swapped between the check and the follow is the link that was checked 
 a target that is itself a link is refused. Windows has none of these flags: there a link
 opens as before.
 
+A ``copytruncate`` that lands UNDER the open handle (issue #66) is caught by the reader
+itself: after every read -- each chunk, and the empty read at the end -- a plain live
+file is asked whether it is still the file that was opened -- its size not below the
+reader's position, its first line the one from the open -- and a chunk read from a
+file that is not is dropped unread and the read ends (a truncation met as EOF, the
+writer quiet, is reported the same way: review -- the live cursor at 0 it left matched
+the truncation's copy again next run when the plan had chained it already).
+The check runs after the read, so a chunk that passes was read before any truncation
+the check can see, and a good chunk dropped by a truncation landing between its read
+and the check costs nothing: its lines stay unread and come from the copy next run.
+Every yielded line is therefore from the file as opened, and the cursor is a (first
+line, offset) pair from before the truncation -- what the next run resolves against
+the copy by content. Without it the cursor paired the old first line with an offset
+into the new content: lines lost, then a fragment and a duplicate (measured with real
+logrotate). A truncation refilled with the same first line past the position is
+invisible to it, as to the ``truncated`` verdict (issue #34). Archives never change and
+a seek in a compressed stream is a decompression, so neither is asked. The check reads
+where the first line BEGINS, recorded at the open: past a NUL hole (a ``copytruncate``
+under a writer without ``O_APPEND``), which ``fingerprint`` would otherwise skip again
+on every chunk (review, measured: a 48 MiB hole made an 8 MiB read take 49 s); the
+cost is one small read per 64 KiB.
+
 Lines are read in binary and decoded as UTF-8 with replacement. The cursor advances only to
 the end of the last COMPLETE line: an unterminated tail is re-read next run. A line longer
 than ``LINE_CAP`` bytes is cut there and the cut is reported; the cap is a hard boundary, so
@@ -74,7 +96,7 @@ import re
 import stat
 import sys
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -281,7 +303,14 @@ def special_kind(mode: int) -> str | None:
 
 
 def fingerprint(handle: BinaryStream) -> str | None:
-    """sha256 of the first complete line (at most FINGERPRINT_CAP bytes), read from 0.
+    """sha256 of the first complete line (at most FINGERPRINT_CAP bytes), read from 0; see
+    ``first_line``, which also says where that line begins."""
+    return first_line(handle)[0]
+
+
+def first_line(handle: BinaryStream) -> tuple[str | None, int]:
+    """The first line's hash (sha256 of the first complete line, at most FINGERPRINT_CAP
+    bytes) and the offset where that line begins, read from 0.
 
     A run of NULs at the start (a copytruncate hole) is not the first line and is skipped,
     as the reader skips it -- however long it is, up to HOLE_CAP: the hole is the old file's
@@ -299,10 +328,17 @@ def fingerprint(handle: BinaryStream) -> str | None:
         skipped += len(head)
         if skipped >= HOLE_CAP:
             handle.seek(0)
-            return None
+            return None, skipped
+    begins = skipped + len(head) - len(text)
     if text and len(text) < FINGERPRINT_CAP:
         text += _read_up_to(handle, FINGERPRINT_CAP - len(text))  # a cap of the line itself
     handle.seek(0)
+    return _hash_of(text), begins
+
+
+def _hash_of(text: bytes) -> str | None:
+    """``first_line``'s rule over the bytes at the line's start: the line up to its
+    newline, the whole cap when the line is longer than it, None when it is incomplete."""
     newline = text.find(b"\n")
     if newline >= 0:
         line = text[:newline]
@@ -373,12 +409,15 @@ class LineReader:
     ``offset``), so every Line carries the number the file would show in ``grep -n``."""
 
     def __init__(self, handle: BinaryStream, offset: int, cap: int = LINE_CAP,
-                 start_line: int = 0, path: str = "") -> None:
+                 start_line: int = 0, path: str = "",
+                 same_file: Callable[[], bool] | None = None) -> None:
         self.handle = handle
         self.offset = offset
         self.cap = cap
         self.line = start_line
         self.path = path
+        self.same_file = same_file  # asked after each chunk (issue #66); None: never
+        self.truncated = False  # a chunk came from another file: dropped, the read ended
         self.nul_bytes = 0  # NUL bytes skipped at line starts (a copytruncate hole)
         self.at_end = False  # the last read reached EOF with no unterminated tail behind it
         handle.seek(offset)
@@ -430,6 +469,13 @@ class LineReader:
             # read1, not read: on a cut archive read() raises before handing over the bytes
             # it did decompress, read1 hands them over first (measured for gz, bz2, xz)
             chunk = self.handle.read1(_CHUNK)
+            if self.same_file is not None and not self.same_file():
+                # the file was truncated under the handle (issue #66): the chunk may be
+                # the new content at the old position; dropped, the offset stays at
+                # the last complete line from before -- and an EOF met on a truncated
+                # file (a quiet writer) is the same event, not the stream's end
+                self.truncated = True
+                return
             if not chunk:
                 # the stream is exhausted: an unterminated tail may remain, and re-reading
                 # it from this offset yields nothing until the file changes (the boundaries
@@ -466,6 +512,7 @@ class LogFile:
             self.compressed = True
             self.size = None
             self.fingerprint = saved.fingerprint
+            self.line_at = 0
             self.verdict, self.note = "continue", None
             self.skipped = 0
             self.start, self.start_line = saved.offset, saved.line or 0
@@ -483,7 +530,7 @@ class LogFile:
             self.file_size, self.file_mtime = st.st_size, st.st_mtime
             self.compressed = compressed_suffix(path) is not None
             self.size = None if self.compressed else st.st_size
-            self.fingerprint = fingerprint(self.handle)
+            self.fingerprint, self.line_at = first_line(self.handle)  # where the line begins
             self.verdict, self.note = identify(saved, self.ino, self.dev, self.size,
                                                self.fingerprint)
             self.skipped = 0  # bytes passed over on first sight
@@ -491,7 +538,8 @@ class LogFile:
             self.start = self._start_offset(from_start)
             self.start_line = self._start_line()
             self.reader = LineReader(self.handle, self.start, start_line=self.start_line,
-                                     path=path)
+                                     path=path, same_file=None if self.compressed
+                                     else self._still_the_file)
         except STREAM_ERRORS as exc:
             self.handle.close()
             raise OSError(f"{path}: incomplete or corrupt compressed stream ({exc})") from exc
@@ -550,6 +598,9 @@ class LogFile:
                 st = os.fstat(handle.fileno())
                 if (st.st_ino, st.st_dev) != (self.ino, self.dev):
                     return []  # rotated under us since the open: not this file's lines
+                if st.st_size < self.start or (self.fingerprint is not None
+                                                and self._line_hash(handle) != self.fingerprint):
+                    return []  # truncated under us (issue #66): the new content's lines
                 return lines_before(handle, self.start, n, self.start_line, self.path)
         except _HOOK_ERRORS as exc:
             log.warning("[%s] %s: context before the saved position could not be read (%s)",
@@ -572,12 +623,37 @@ class LogFile:
         else:
             log.debug("%s: continuing at offset %d", where, self.start)
 
+    def _still_the_file(self) -> bool:
+        """Whether the handle still reads the file that was opened (issue #66): its size not
+        below the reader's position, and its first line the one from the open, re-read
+        through the handle with the position put back. A plain file only."""
+        st = os.fstat(self.handle.fileno())
+        if st.st_size < self.reader.offset:
+            return False
+        if self.fingerprint is None:  # nothing to compare: an empty file gained lines
+            return True
+        position = self.handle.tell()
+        current = self._line_hash(self.handle)
+        self.handle.seek(position)
+        return current == self.fingerprint
+
+    def _line_hash(self, handle: BinaryStream) -> str | None:
+        """The hash of what is at the first line's recorded start now: the same line for
+        the same file; NULs (a longer hole), another line (a refill) or nothing
+        otherwise. One read of the cap, wherever the hole ended."""
+        handle.seek(self.line_at)
+        return _hash_of(_read_up_to(handle, FINGERPRINT_CAP))
+
     def lines(self) -> Iterator[Line]:
         """The complete lines from the start offset; ``OSError`` for a stream that ends early."""
         try:
             yield from self.reader
         except STREAM_ERRORS as exc:
             raise OSError(f"{self.path}: incomplete or corrupt compressed stream ({exc})") from exc
+        if self.reader.truncated:
+            log.warning("[%s] %s: truncated under us during the read (a copytruncate during "
+                        "the run?); stopping at offset %d", self.section, self.path,
+                        self.reader.offset)
         if self.reader.nul_bytes:
             log.info("[%s] %s: skipped %d NUL bytes (copytruncate under a writer without "
                      "O_APPEND?)", self.section, self.path, self.reader.nul_bytes)

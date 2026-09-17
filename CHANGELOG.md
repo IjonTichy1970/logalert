@@ -176,6 +176,13 @@ its notes.
   its first line, its modification time and at least its length; any of the
   three failing keeps the read.
 
+- `[contract]` **A `copytruncate` that lands under the open handle is caught
+  by the reader, chunk by chunk: what it read from the truncated file is
+  dropped and the position kept is from before** (#66). The old cursor paired
+  the old first line with an offset into the new content: lines lost, then a
+  fragment and a duplicate (measured with real logrotate). One WARNING line;
+  the next run finds the copy by content.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

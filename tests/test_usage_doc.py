@@ -181,3 +181,16 @@ def test_the_causes_paragraph_quotes_every_cause_in_the_logs_own_words() -> None
                   "entries of /var/log/old while looking for rotated copies (Permission denied); "
                   "is the directory searchable?"):
         assert shape in paragraph, shape
+
+
+def test_the_rotation_during_the_run_paragraph_quotes_the_two_stop_lines() -> None:
+    """Issues #32, #66 and #67: the three lines a run writes when a rotation lands under it
+    are quoted in the paragraph, in the code's words."""
+    text = _text().replace(NL, " ")
+    for shape in ("was renamed or removed under us (a rotation during the run); stopping "
+                  "here, the next run resumes after",
+                  "truncated under us during the read (a copytruncate during the run?); "
+                  "stopping at offset",
+                  "the live file was rotated and compressed during the run (router.log.1.gz); "
+                  "its lines were read from there"):
+        assert shape in text, shape

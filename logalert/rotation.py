@@ -122,7 +122,15 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     at least its length, the copy is that file: the handle is skipped and the cursor
     parks on the copy. The absence alone is not the signal -- ``olddir`` without
     ``archive_dir`` moves the file out of every listed directory -- and any of the three
-    failing keeps the read: a duplicate at worst, never a loss.
+    failing keeps the read: a duplicate at worst, never a loss. A ``copytruncate`` landing
+    under the live handle (issue #66) is the reader's business (``logalert.cursor``): it
+    drops the chunk read from the truncated file and ends the read; a live read that
+    ends so having yielded NOTHING is the stop above -- the file's lines are the copy
+    the truncation made, which the next run chains after the parked copy, and a live
+    cursor (first line, 0) would match that copy AGAIN when the second listing had
+    chained it already (the S2b layout of the #32 review, pinned) -- while one that yielded
+    lines keeps its own cursor: the copy did not exist at the plan, and the next run
+    finds it by content at that offset.
 """
 
 import errno
@@ -1030,7 +1038,14 @@ class CatchUpSource:
                          "(%s); its lines were read from there", self.section, self.path,
                          os.path.basename(copy.path))
                 return
-            yield from self.live.lines()
+            yielded = False
+            for line in self.live.lines():
+                yielded = True
+                yield line
+            if self.live.reader.truncated and not yielded:
+                # a copytruncate landed before the live read (issue #66): the copy it
+                # made holds the lines and may be in the chain already; park as a stop
+                self.stopped = True
 
     def _compressed_under_us(self) -> Segment | None:
         """The copy that IS the live handle's file, compressed during the plan (issue #67):

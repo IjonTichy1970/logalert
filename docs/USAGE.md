@@ -430,10 +430,10 @@ however many rotations happened in between. It recognises, beside the log or in
 Symbolic links are never candidates. A `.gz` still being written yields what it
 has, with a warning, and the run continues.
 
-**A rotation during the run.** When a rename rotation (logrotate's default;
-not `copytruncate`) lands while the copies are being read, a copy the run was
-about to open is no longer the file it planned to read (renamed on, compressed
-away, removed). The run stops there and says so:
+**A rotation during the run.** When a rename rotation (logrotate's default)
+lands while the copies are being read, a copy the run was about to open is no
+longer the file it planned to read (renamed on, compressed away, removed). The
+run stops there and says so:
 
 ```
 [router-disk] /var/log/router.log: router.log.1 was renamed or removed under us (a rotation during the run); stopping here, the next run resumes after router.log.2 (the names are from before the rotation)
@@ -447,7 +447,25 @@ read (the warning below), and only what that copy held after the position is
 lost. A rotation landing between the directory
 listing and the copies' opens makes the run list the directory again, once; a
 second rotation inside one run reaches the warning below, whose first cause is
-then `a second rotation during this run (a copy was renamed twice)`.
+then `a second rotation during this run (a copy was renamed twice)`. A live
+file rotated and compressed inside that window is read once, from the copy
+(`the live file was rotated and compressed during the run (router.log.1.gz);
+its lines were read from there`).
+
+A `copytruncate` that lands while the live file is being read truncates it
+under the run's open handle. The reader asks after every read (a chunk of 64
+KiB at most, and the empty read at the end) whether the file is still the one
+it opened (its size not below the position, its first line unchanged) and
+drops what it read from a truncated file, so nothing of
+the new content is mailed as old lines and the position it keeps is one from
+before the truncation, which the next run finds in the copy by content:
+
+```
+[router-disk] /var/log/router.log: truncated under us during the read (a copytruncate during the run?); stopping at offset 48211
+```
+
+A truncation refilled with the same first line past the position is invisible
+to that check, as it is to the next run's truncation rule.
 
 **The "no rotated copy" warning.** When no copy holds the saved position the log
 says so:

@@ -346,3 +346,26 @@ def test_compress_finishing_inside_the_plan_mails_the_rotated_file_once(
                for r in caplog.records)
     _, rest, _ = run(path, parked)
     assert rest == ["live 1"]
+
+
+def test_copytruncate_landing_after_the_plan_loses_nothing(tmp_path: Path) -> None:
+    """Issue #66, with real logrotate (the #32 review's S2): the truncation under the live
+    handle left a cursor pairing the old first line with a post-truncation offset -- 'middle
+    1' lost, then a fragment and 'live 1' twice. The live read stops before the truncated
+    file's content and the next run chains the copy."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1\n")
+    logrotate(tmp_path, path, "    copytruncate\n")
+    append(path, b"middle 1\n")
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    logrotate(tmp_path, path, "    copytruncate\n")  # after the plan, before the reads
+    append(path, b"live 1\n")
+    with source:
+        second = texts(list(source.lines()))
+        parked = source.cursor()
+    assert second == ["since 1"] and source.stopped
+    _, third, cursor = run(path, parked)
+    _, fourth, _ = run(path, cursor)
+    assert third == ["middle 1", "live 1"] and fourth == []
