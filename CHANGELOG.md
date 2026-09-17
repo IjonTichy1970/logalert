@@ -20,6 +20,11 @@ its notes.
   every host, and a test pins the floor, the classifiers, the CI matrix and
   the documents together.
 
+- `[internal]` **`tools/check_changelog_refs.py` matches refs on digit
+  boundaries rather than by bare substring** (#47). A presence test of
+  `f"#{n}" not in text` accepted `#1` on the strength of a cited `#10`.
+  A regex boundary `(?<!\d)#N(?!\d)` prevents false negatives.
+
 - `[internal]` **A test pins STARTTLS to a verifying SSL context** (#40).
   `starttls()` without the context passed the whole suite, and the stdlib's
   default there verifies nothing.

@@ -187,9 +187,14 @@ def main() -> int:
         return EXIT_COULD_NOT_CHECK
 
     text = CHANGELOG.read_text(encoding="utf-8")
-    # Substring, not a parse. An entry may cite its issue anywhere in its prose, and several do --
-    # requiring the ref in the first line would fail on entries that are correct.
-    missing = {n: s for n, s in found.items() if f"#{n}" not in text}
+    # Digit-boundary match, not a bare substring (#47): `f"#{n}" not in text` accepted `#1` on
+    # the strength of a `#10` citation. An entry may cite its issue anywhere in its prose, and
+    # several do -- requiring the ref in the first line would fail on entries that are correct.
+    missing = {
+        n: s
+        for n, s in found.items()
+        if not re.search(rf"(?<!\d)#{n}(?!\d)", text)
+    }
 
     if missing:
         print(
