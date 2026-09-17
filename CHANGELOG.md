@@ -128,6 +128,12 @@ its notes.
   construction was lost. The probe's stream `connect` is bounded the same way,
   and Python 3.14's `SysLogHandler(timeout=)` covers INET sockets only.
 
+- `[contract]` **A full disk or quota is refused before any mail: the run
+  saves the state once, as loaded, before its first section** (#30). The
+  writable-directory probe is a 0-byte file that needs no block, so a full
+  filesystem passed it and the alert was mailed again on every run until space
+  was freed. A first lock on a full disk names the errno, not the ownership.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

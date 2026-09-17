@@ -22,7 +22,7 @@ from logalert.config import (
 from logalert.globs import expand, is_glob
 from logalert.lock import LockBusy, RunLock
 from logalert.mail import clean_header, compose_test
-from logalert.run import Options, Terminated, run, terminating
+from logalert.run import Options, Terminated, ownership_hint, run, terminating
 from logalert.state import (
     RESET_HINT,
     State,
@@ -280,9 +280,9 @@ def reset_state(config: Config, target: str, path: str) -> int:
         print(f"logalert: {exc}", file=sys.stderr)
         return EXIT_ATTENTION
     except OSError as exc:
-        print(f"logalert: cannot take the run lock {lock.path} ({exc.strerror}) -- it must "
-              f"belong to the user logalert runs as (a root run leaves it root-owned)",
-              file=sys.stderr)
+        hint = ownership_hint(exc, "it")  # a permission; a full disk gets the errno alone (#30)
+        print(f"logalert: cannot take the run lock {lock.path} ({exc.strerror})"
+              + (hint + " (a root run leaves it root-owned)" if hint else ""), file=sys.stderr)
         return EXIT_ATTENTION
     try:
         return _reset(config, path, target)

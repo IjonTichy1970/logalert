@@ -126,3 +126,21 @@ def test_the_logging_section_names_the_send_timeout_and_the_table_has_the_row() 
     table = text[text.index("## Troubleshooting"):]
     row = next(r for r in table.splitlines() if "TimeoutError: timed out" in r)
     assert f"waited {SYSLOG_SEND_TIMEOUT:g} s twice" in row and "systemd-journald" in row
+
+
+def test_the_position_section_and_the_table_carry_the_full_disk_refusal() -> None:
+    """Issue #30: the opening save and its refusal are documented in the program's own words;
+    a dropped sentence or row reddens here."""
+    text = _text()
+    section = text[text.index("## Position tracking"):text.index("## Globs")]
+    assert "saved once at the start of every run but a" + NL + "dry run" in section
+    table = text[text.index("## Troubleshooting"):]
+    row = next(r for r in table.splitlines() if "No space left on device" in r)
+    assert "nothing was sent" in row and "Free space" in row and "Disk quota exceeded" in row
+    twice = next(r for r in table.splitlines() if r.startswith("| The same lines arrive twice"))
+    assert "refused before any mail" in twice and "until space is freed" in twice
+    package = DOC.parents[1] / "logalert"
+    source = (package / "run.py").read_text(encoding="utf-8")
+    assert "nothing was sent, because a run that " in source  # the line breaks there
+    assert "cannot save its position would send everything again next time" in source
+    assert "cannot write (" in (package / "state.py").read_text(encoding="utf-8")

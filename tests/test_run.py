@@ -313,7 +313,8 @@ def test_state_not_saved_after_a_delivery_is_named_loudly(
     site.prime()
     site.append(site.router, "disk failure now")
     real_save = State.save
-    failures = iter([StateError("disk full")])  # the first save fails, later ones work
+    # the opening save (issue #30) passes; the section's, the second, fails; later ones work
+    failures = iter([None, StateError("disk full")])
 
     def flaky(self: State) -> None:
         problem = next(failures, None)
@@ -614,7 +615,23 @@ def test_a_save_failure_says_whether_a_mail_went_out(
     caplog.set_level(logging.ERROR, logger="logalert.run")
     site.prime()
     site.append(site.router, "quiet again")  # nothing matched: no mail
-    monkeypatch.setattr(State, "save", lambda self: (_ for _ in ()).throw(StateError("full")))
+    real_save = State.save
+    opening: set[int] = set()  # the states whose first save, the opening one, is due
+
+    def load(path: str) -> State:
+        state = load_state(path)
+        opening.add(id(state))
+        return state
+
+    def save(self: State) -> None:
+        if id(self) in opening:  # the opening save (issue #30) passes; the section's fails
+            opening.discard(id(self))
+            real_save(self)
+            return
+        raise StateError("full")
+
+    monkeypatch.setattr("logalert.run.load_state", load)
+    monkeypatch.setattr(State, "save", save)
     assert site.run() == 1
     assert not any("the mail went out" in m for m in caplog.messages)
     caplog.clear()
@@ -1153,15 +1170,15 @@ def _sigterm_self(*args: Any, **kwargs: Any) -> Any:
     raise AssertionError("the SIGTERM handler did not fire")
 
 
-def _sigterm_once(real: Any) -> Any:
-    """A stand-in that sends SIGTERM the FIRST time and is the real thing after (the WARNING
-    main logs on the way out must not fire it again)."""
-    fired: list[bool] = []
+def _sigterm_once(real: Any, at: int = 1) -> Any:
+    """A stand-in that sends SIGTERM on the ``at``-th call and is the real thing otherwise
+    (the WARNING main logs on the way out must not fire it again)."""
+    calls: list[bool] = []
 
     def stand_in(*args: Any, **kwargs: Any) -> Any:
-        if fired:
+        calls.append(True)
+        if len(calls) != at:
             return real(*args, **kwargs)
-        fired.append(True)
         return _sigterm_self()
 
     return stand_in
@@ -1197,7 +1214,8 @@ def test_a_sigterm_inside_the_save_unlinks_the_temp_file(
     site.prime()
     before = site.state_file.read_bytes()
     site.append(site.router, "disk failure now")
-    monkeypatch.setattr(os, "fsync", _sigterm_self)  # what write_atomically calls
+    # the second fsync: the section's save (the first is the run's opening save, issue #30)
+    monkeypatch.setattr(os, "fsync", _sigterm_once(os.fsync, at=2))
     assert site.run() == 143
     assert capsys.readouterr().err == "logalert: terminated" + NL
     assert sorted(p.name for p in site.state_dir.iterdir()) == ["lock", "state.json"]
@@ -1364,3 +1382,93 @@ def test_a_sigterm_inside_the_handlers_own_install_or_restore_leaves_the_previou
     assert site.run() == 143
     assert capsys.readouterr().err == "logalert: terminated" + NL
     assert signal.getsignal(signal.SIGTERM) == previous, window
+
+
+# -- a full filesystem (issue #30) --------------------------------------------------------------
+
+
+def test_a_full_filesystem_is_refused_before_any_mail(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Measured in the sandbox before the fix (a full tmpfs): the 0-byte probe passed, three
+    runs mailed three times and the offset never moved. The opening save is the real write;
+    here the replace is what the full disk refuses, as the ENOSPC atomic-write test does."""
+    site.prime()
+    site.append(site.router, "disk failure now")
+    before = site.state_file.read_bytes()
+    real_replace = os.replace
+
+    def full(src: str, dst: str) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", full)
+    assert site.run() == 1
+    out = capsys.readouterr()
+    assert out.err == (f"logalert: failed: state file: state file {site.state_file.as_posix()}: "
+                       f"cannot write (No space left on device) -- nothing was sent, because a "
+                       f"run that cannot save its position would send everything again next "
+                       f"time; see the log" + NL)
+    assert site.calls() == []  # the whole point
+    assert site.state_file.read_bytes() == before
+    assert sorted(p.name for p in site.state_dir.iterdir()) == ["lock", "state.json"]
+    # the next run, with space back, sends once and moves on
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert site.run() == 0
+    assert len(site.calls()) == 1
+    assert site.offset("router-disk", site.router) == site.router.stat().st_size
+
+
+def test_the_opening_save_is_skipped_by_a_dry_run(site: Site, monkeypatch: pytest.MonkeyPatch,
+                                                  capsys: pytest.CaptureFixture[str]) -> None:
+    site.prime()
+    site.append(site.router, "disk failure now")
+    monkeypatch.setattr(State, "save", lambda self: (_ for _ in ()).throw(StateError("full")))
+    assert site.run("-n") == 0  # never saves, so never refused
+    assert "disk failure now" in capsys.readouterr().out
+
+
+def test_a_lock_the_disk_refuses_names_the_errno_without_the_ownership_hint(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Measured on a full tmpfs: a lock file created for the first time fails its holder
+    write with ENOSPC, and the run blamed the file's ownership."""
+    site.prime()
+    site.append(site.router, "disk failure now")
+
+    def full(self: RunLock, now: float | None = None) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(RunLock, "acquire", full)
+    assert site.run() == 1
+    err = capsys.readouterr().err
+    assert err == (f"logalert: failed: state directory: No space left on device "
+                   f"({lock_path(site.state_file.as_posix())}); see the log" + NL)
+    assert site.calls() == []
+    assert site.run("--reset-state") == 1
+    err = capsys.readouterr().err
+    assert err.startswith("logalert: cannot take the run lock ") and "(No space left" in err
+    assert "must belong" not in err
+
+
+def test_the_opening_save_writes_the_state_as_loaded_before_the_first_section(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #30: a save of an EMPTY state at the opening (the --reset-state escape hatch's
+    own call) passed the refusal test -- the in-memory state survived and the section's save
+    rewrote the file -- while a run killed before its first section lost every position."""
+    site.prime()
+    primed = site.state_file.read_bytes()
+    stamp = site.state_file.stat()
+    site.append(site.router, "disk failure now")
+    seen: list[tuple[bytes, os.stat_result]] = []
+    real_section = logalert.run._section
+
+    def peek(*args: Any, **kwargs: Any) -> None:
+        if not seen:  # the first section: what the opening left on disk
+            seen.append((site.state_file.read_bytes(), site.state_file.stat()))
+        real_section(*args, **kwargs)
+
+    monkeypatch.setattr(logalert.run, "_section", peek)
+    time.sleep(0.05)  # a moved mtime must be measurable on a coarse clock
+    assert site.run() == 0
+    (written, stat), = seen
+    assert json.loads(written) == json.loads(primed)  # the state as loaded, entries and all
+    # rewritten, not left alone: a fresh file replaced the old one
+    assert stat.st_mtime_ns != stamp.st_mtime_ns or stat.st_ino != stamp.st_ino

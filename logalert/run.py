@@ -10,9 +10,17 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     ownership (BEFORE the lock: a root run refused for another user's state must not leave a
     root-owned lock behind, which would break the very remedy it names; and BEFORE any mail:
     a run that can send but cannot persist would double-send next time); then the lock, the
-    state file (a corrupt one is a hard error naming ``--reset-state``), and expiry of the
-    entries unseen for ``state_ttl`` days. ``--dry-run`` takes no lock and needs no writable
-    directory: it reads the state if there is one and never writes.
+    state file (a corrupt one is a hard error naming ``--reset-state``), expiry of the
+    entries unseen for ``state_ttl`` days -- and then ONE SAVE of the state as loaded, before
+    the first section (issue #30): the directory's 0-byte probe passes on a full filesystem
+    (ENOSPC, an exhausted quota), where only the real write fails, and a run that sent and
+    then could not save re-sent the same lines on every run until space was freed
+    (measured: three runs, three mails, the offset never moved). The opening save is the
+    exact operation, so what fails there is what would have failed after the mail for a
+    state that does not grow; it is exit 1 naming the error, nothing sent (the residual
+    window, a disk with room for the state but not for its growth, is in ``state.py``'s
+    rule). ``--dry-run`` takes no lock and needs no writable directory: it reads the state
+    if there is one and never writes.
   * Per section, in file order, each glob expanded in its place (``logalert.globs``: sorted,
     regular files only, rotated copies left out unless ``include_archives``; a directory
     that cannot be listed is a failed item, a glob matching nothing is nothing to do), each
@@ -77,6 +85,7 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     up; a signal before that is the default disposition, with nothing held yet.
 """
 
+import errno
 import logging
 import os
 import signal
@@ -265,8 +274,8 @@ def run(config: Config, options: Options) -> int:
             log.info("%s; this run exits quietly", busy.describe())
             return _finish(outcome)
         except OSError as exc:
-            outcome.fail(f"state directory: {exc.strerror or exc} ({lock_path(state_file)}) -- "
-                         f"the lock file must belong to the user logalert runs as")
+            outcome.fail(f"state directory: {exc.strerror or exc} ({lock_path(state_file)})"
+                         + ownership_hint(exc))
             return _finish(outcome)
     try:
         try:
@@ -284,6 +293,15 @@ def run(config: Config, options: Options) -> int:
                       section,
                       "would be forgotten" if options.dry_run else "forgotten",
                       config.settings.state_ttl_days)
+        if not options.dry_run:
+            # the second half of the proof (issue #30): the exact write a section's save
+            # performs, before any mail -- see the module docstring
+            try:
+                state.save()
+            except (StateError, OSError) as exc:
+                outcome.fail(f"state file: {exc} -- nothing was sent, because a run that "
+                             f"cannot save its position would send everything again next time")
+                return _finish(outcome)
         for watch in config.watches:
             _section(watch, config, options, sender, state, outcome, started)
     finally:
@@ -442,6 +460,18 @@ def _new_file(section: str, globs: tuple[str, ...], path: str, state: State) -> 
         if at is not None and mtime >= parse_timestamp(at).timestamp():
             return glob
     return None
+
+
+LOCK_OWNER_HINT = " -- the lock file must belong to the user logalert runs as"
+
+
+def ownership_hint(exc: OSError, subject: str = "the lock file") -> str:
+    """The lock's remedy when the errno is a permission (``--reset-state`` uses it too, with
+    its own subject): a full disk (ENOSPC, issue #30) or an I/O error is not an ownership
+    problem, and the hint would send the operator the wrong way."""
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return LOCK_OWNER_HINT.replace("the lock file", subject)
+    return ""
 
 
 def _reason(exc: OSError, path: str) -> str:

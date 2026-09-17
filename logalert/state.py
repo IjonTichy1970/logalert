@@ -10,7 +10,16 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
     ``fsync``, then ``os.replace``. A crash leaves either the old file or the new one.
   * It is written after EACH section's mail is accepted, never once at the end. A run that can
     send but cannot persist would double-send next time, so ``check_state_dir`` runs BEFORE any
-    mail goes out.
+    mail goes out -- and, since issue #30, the run SAVES the state once as loaded before its
+    first section: the 0-byte probe passes on a full filesystem (ENOSPC, an exhausted quota),
+    where only a real write fails (measured before the fix, on a full tmpfs: three runs,
+    three mails, the offset never moved), and the opening save is that write, so a run
+    that cannot save sends nothing. The residual window is a disk with room for the state
+    as loaded but not for
+    the state plus what the run adds -- a filesystem block wide for an ordinary run, more
+    for one that adds many cursors -- where a run still sends and cannot save, on every run,
+    until space is freed (review: reproduced on a tmpfs with exactly one free page); a disk
+    that keeps filling is refused at the next opening.
   * A missing file is the first run. A file that cannot be parsed is a hard error naming the
     file and ``--reset-state``; logalert never silently starts over.
   * An entry unseen for ``state_ttl`` days expires; ``touch`` records a sighting even when the
@@ -317,7 +326,8 @@ def _cursor(fields: dict[str, Any], corrupt: Any, where: str) -> Cursor:
 
 
 def check_state_dir(state_file: str) -> None:
-    """Prove the state can be persisted BEFORE anything irreversible happens.
+    """Prove the state can be persisted BEFORE anything irreversible happens -- the first half:
+    the directory, before the lock (the run's opening save is the second, issue #30).
 
     Creates and removes a temporary file the way ``save`` will; raises StateError with what
     to do. Never creates the directory: a root run would leave it owned by root and lock the
