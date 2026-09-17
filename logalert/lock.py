@@ -12,6 +12,18 @@ design is that a blocked run logs the holder's PID and age and exits 0 quietly -
 overlap is normal -- while a holder older than ``lock_stale`` seconds is a stuck run, which
 must not silence the watcher forever: one stderr line and exit 1.
 
+The line carries two more words after a delivered section whose state could not be
+saved (issue #70): ``<pid> <moment> unsaved <bytes>``, the size of the state that did
+not fit. The next holder reads it before writing its own line, carries it forward, and
+the run refuses to send until a save proves the room (``logalert.run``); the stale check
+reads the first two words as before. The lock's block is the one place a full disk
+lets a run write -- a marker file would be refused there -- so EVERY write of the
+line is in place, the file cut to the line afterwards, never a truncation first: a
+page given up on a full disk went to a competing writer 216 times in 300 (review,
+measured on a tmpfs with no free page; 0 in 300 written in place), and the marker
+with it. A kill between the write and the cut leaves the old tail after the new
+line, so the readers parse the first line only.
+
 The lock file is ``0600`` (issue #27): ``flock`` needs no write access, so a lock any local
 user could open read-only was a lock any local user could hold, silently, for ``lock_stale``
 and then with a stale-lock line blaming the last real run's PID. A lock left at ``0644`` by
@@ -40,6 +52,8 @@ log = logging.getLogger("logalert.lock")
 _LOCK_BYTE = 4096  # beyond any holder info; Windows lets a byte past EOF be locked
 _INFO_CAP = 200  # bytes of holder info a blocked run reads; below _LOCK_BYTE, see above
 _RECHECK_AFTER = 0.2  # seconds; a stale verdict is confirmed with a second read
+_MARKER_CAP = 2**31  # a marker past this is no state file's size: a hand-edited line
+NL = chr(10)
 
 if sys.platform == "win32":
     import msvcrt
@@ -78,6 +92,9 @@ class RunLock:
         self.path = path
         self.stale_after = stale_after
         self.fd: int | None = None
+        self.unsaved: int | None = None  # the marker (issue #70): the bytes of the state
+        #   the last run could not save after its mail went out; None when clear
+        self._info = b""  # this holder's `<pid> <moment>`
 
     def acquire(self, now: float | None = None) -> None:
         """Take the lock or raise ``LockBusy`` describing the holder. Never blocks."""
@@ -108,11 +125,35 @@ class RunLock:
         self.fd = fd
         try:
             moment = time.time() if now is None else now
-            _write_holder(fd, f"{os.getpid()} {moment:.0f}\n".encode("ascii"))
+            self.unsaved = _read_unsaved(fd)  # the last holder's marker, carried forward
+            self._info = f"{os.getpid()} {moment:.0f}".encode("ascii")
+            _write_holder(fd, self._line())
             log.debug("lock %s taken (PID %d)", self.path, os.getpid())
         except BaseException:  # an OSError, or a signal landing here (issue #33)
             self.release()  # the lock was taken; do not keep it with no info behind it
             raise
+
+    def _line(self) -> bytes:
+        marker = b"" if self.unsaved is None else b" unsaved %d" % self.unsaved
+        return self._info + marker + b"\n"
+
+    def mark_unsaved(self, size: int) -> None:
+        """A delivered section's state, ``size`` bytes, could not be saved (issue #70):
+        the marker, written in place over the holder line and the file cut to it --
+        no new block, so a full disk takes it (measured); the next run reads it before
+        it sends anything."""
+        if self.fd is None:
+            return
+        self.unsaved = size
+        _write_holder(self.fd, self._line())
+        os.fsync(self.fd)  # a power loss would otherwise cost the one duplicate twice
+
+    def clear_unsaved(self) -> None:
+        """A save proved the room (or the operator reset the state): the plain line."""
+        if self.fd is None or self.unsaved is None:
+            return
+        self.unsaved = None
+        _write_holder(self.fd, self._line())
 
     def release(self) -> None:
         if self.fd is None:
@@ -165,16 +206,38 @@ def _tighten(fd: int) -> None:
 
 
 def _write_holder(fd: int, info: bytes) -> None:
-    os.ftruncate(fd, 0)
+    """The line, written in place and the file cut to it -- in that order, so the
+    file's block is never given up (see the module docstring)."""
     os.lseek(fd, 0, os.SEEK_SET)
     os.write(fd, info)
+    os.ftruncate(fd, len(info))
+
+
+def _read_unsaved(fd: int) -> int | None:
+    """The marker's byte count when the line carries ``unsaved <bytes>`` after the two
+    holder words (issue #70), else None; other words there, or a size no state file
+    could have (a hand-edited line), mean nothing."""
+    try:
+        parts = _first_line(fd).split()
+        if len(parts) < 4 or parts[2] != "unsaved":
+            return None
+        size = int(parts[3])
+    except (OSError, ValueError):
+        return None
+    return size if 0 <= size <= _MARKER_CAP else None
+
+
+def _first_line(fd: int) -> str:
+    """The file's first line (at most ``_INFO_CAP`` bytes): what the readers parse, so a
+    tail left by a kill between a write and its cut means nothing."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    return os.read(fd, _INFO_CAP).decode("ascii", errors="replace").partition(NL)[0]
 
 
 def _read_holder(fd: int) -> tuple[int | None, float | None]:
     """The PID and start time the holder wrote, if the file says anything usable."""
     try:
-        os.lseek(fd, 0, os.SEEK_SET)
-        parts = os.read(fd, _INFO_CAP).decode("ascii", errors="replace").split()
+        parts = _first_line(fd).split()
         pid, started = int(parts[0]), float(parts[1])
     except (OSError, ValueError, IndexError):
         return None, None

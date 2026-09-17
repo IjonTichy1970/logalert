@@ -285,7 +285,7 @@ def reset_state(config: Config, target: str, path: str) -> int:
               + (hint + " (a root run leaves it root-owned)" if hint else ""), file=sys.stderr)
         return EXIT_ATTENTION
     try:
-        return _reset(config, path, target)
+        return _reset(config, path, target, lock)
     except StateError as exc:
         print(f"logalert: {exc}", file=sys.stderr)
         return EXIT_ATTENTION
@@ -300,7 +300,7 @@ def _names(watch: Watch, target: str) -> bool:
                if is_glob(entry) else entry == target for entry in watch.files)
 
 
-def _reset(config: Config, path: str, target: str) -> int:
+def _reset(config: Config, path: str, target: str, lock: RunLock) -> int:
     try:
         state = load_state(path)
     except StateError as exc:
@@ -311,6 +311,7 @@ def _reset(config: Config, path: str, target: str) -> int:
             return EXIT_ATTENTION
         # The escape hatch: a state file nothing can read is replaced, not repaired.
         State(path).save()
+        lock.clear_unsaved()  # every position gone: the room is not in question (#70)
         log.warning("%s; replaced it with an empty state (--reset-state)", problem)
         print(f"{problem}; replaced it with an empty state")
         return EXIT_OK
@@ -334,6 +335,8 @@ def _reset(config: Config, path: str, target: str) -> int:
                   file=sys.stderr)
             return EXIT_ATTENTION
     state.save()
+    if target == RESET_ALL:  # one file forgotten leaves the band where it was (issue #70)
+        lock.clear_unsaved()
     what = "every file" if target == RESET_ALL else target
     log.info("forgot %d cursor(s) for %s (--reset-state)", count, what)
     print(f"forgot {count} cursor(s) for {what}; the next run starts at the current end "

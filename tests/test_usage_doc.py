@@ -132,18 +132,23 @@ def test_the_position_section_and_the_table_carry_the_full_disk_refusal() -> Non
     """Issue #30: the opening save and its refusal are documented in the program's own words;
     a dropped sentence or row reddens here."""
     text = _text()
-    section = text[text.index("## Position tracking"):text.index("## Globs")]
-    assert "saved once at the" + NL + "start of every run but a dry run" in section
+    section = text[text.index("## Position tracking"):text.index("## Globs")].replace(NL, " ")
+    assert "saved once at the start of every run but a dry run" in section
+    assert "marks the `lock` file beside the state with `unsaved <bytes>`" in section  # #70
     table = text[text.index("## Troubleshooting"):]
-    row = next(r for r in table.splitlines() if "No space left on device" in r)
-    assert "nothing was sent" in row and "Free space" in row and "Disk quota exceeded" in row
+    rows = [r for r in table.splitlines() if "No space left on device" in r]
+    assert len(rows) == 2  # the full disk (issue #30) and the band's marker (issue #70)
+    assert "nothing was sent" in rows[0] and "Free space" in rows[0]
+    assert "Disk quota exceeded" in rows[0]
+    assert "the last run sent mail it could not record" in rows[1] and "once" in rows[1]
     twice = next(r for r in table.splitlines() if r.startswith("| The same lines arrive twice"))
-    assert "refused before any mail" in twice and "until space is freed" in twice
+    assert "refused before any mail" in twice and "marks the `lock` file" in twice
     package = DOC.parents[1] / "logalert"
     source = (package / "run.py").read_text(encoding="utf-8")
     assert "nothing was sent, because a run that " in source  # the line breaks there
     assert "cannot save its position would send everything again next time" in source
     assert "cannot write (" in (package / "state.py").read_text(encoding="utf-8")
+    assert "the last run sent mail it could not " in source  # the #70 refusal, breaks there
 
 
 def test_the_position_section_says_a_first_sight_keeps_its_place_on_a_failed_delivery() -> None:

@@ -183,6 +183,13 @@ its notes.
   fragment and a duplicate (measured with real logrotate). One WARNING line;
   the next run finds the copy by content.
 
+- `[contract]` **A run whose mail went out and whose state then could not be
+  saved marks the lock file, and the next run sends nothing until a save that
+  reaches that size plus a block proves the room** (#70). The #30 refusal left
+  a band -- room for the positions as they were, none for what a run adds --
+  where the same lines went out on every run; now they go out once more, when
+  the room is back. `cat` of the lock shows `unsaved <bytes>`.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

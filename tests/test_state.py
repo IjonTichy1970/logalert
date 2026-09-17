@@ -546,3 +546,90 @@ def test_a_bad_run_record_is_a_hard_error_naming_the_remedy(
     with pytest.raises(StateError, match="start over with --reset-state") as exc:
         load_state(str(path))
     assert fragment in str(exc.value)
+
+
+# -- a save that must reach a size (issue #70) --------------------------------------------------
+
+
+def test_a_write_with_a_reach_proves_the_room_and_lands_the_text_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The padding is there at the first fsync and gone at the second, before the replace."""
+    path = tmp_path / "state.json"
+    sizes: list[int] = []
+    real_fsync = os.fsync
+
+    def fsync(fd: int) -> None:
+        sizes.append(os.fstat(fd).st_size)
+        real_fsync(fd)
+
+    monkeypatch.setattr("logalert.state.os.fsync", fsync)
+    text = '{"version": 1}' + chr(10)
+    write_atomically(str(path), text, reach=len(text) + 5000)
+    assert path.read_text(encoding="utf-8") == text
+    assert sizes == [len(text) + 5000, len(text)]
+    assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
+    write_atomically(str(path), text, reach=3)  # a reach the text already covers: no padding
+    assert sizes[2:] == [len(text)] and path.read_text(encoding="utf-8") == text
+
+
+def test_a_reach_the_disk_cannot_hold_is_the_usual_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.json"
+    path.write_text("old", encoding="utf-8")
+    real_write = os.write
+
+    def no_room(fd: int, data: bytes, /) -> int:  # the padding is what fails
+        if len(data) > 64 and data != b"new":
+            raise OSError(28, "No space left on device")
+        return real_write(fd, data)
+
+    monkeypatch.setattr("logalert.state.os.write", no_room)
+    with pytest.raises(StateError, match=r"cannot write \(No space left on device\)"):
+        write_atomically(str(path), "new", reach=8192)
+    assert path.read_text(encoding="utf-8") == "old"
+    assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
+
+
+def test_state_save_passes_the_reach_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[int | None] = []
+    real = write_atomically
+
+    def spy(path: str, text: str, reach: int | None = None) -> None:
+        seen.append(reach)
+        real(path, text, reach=reach)
+
+    monkeypatch.setattr("logalert.state.write_atomically", spy)
+    state = State(str(tmp_path / "state.json"))
+    state.save()
+    state.save(reach=9000)
+    assert seen == [None, 9000] and state.render() == (tmp_path / "state.json").read_text(
+        encoding="utf-8")
+
+
+def test_a_short_write_is_completed_not_taken_for_the_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """os.write may write less than asked (measured on a tmpfs near its limit) and says
+    nothing; the writer loops until every byte is out, the padding included."""
+    path = tmp_path / "state.json"
+    real_write = os.write
+    sizes: list[int] = []
+    real_fsync = os.fsync
+
+    def short(fd: int, data: bytes, /) -> int:
+        return real_write(fd, data[:7])
+
+    def fsync(fd: int) -> None:
+        sizes.append(os.fstat(fd).st_size)
+        real_fsync(fd)
+
+    monkeypatch.setattr("logalert.state.os.write", short)
+    monkeypatch.setattr("logalert.state.os.fsync", fsync)
+    text = '{"version": 1, "entries": {}, "runs": {}}' + chr(10)
+    write_atomically(str(path), text, reach=len(text) + 100)
+    assert path.read_text(encoding="utf-8") == text
+    assert sizes == [len(text) + 100, len(text)]

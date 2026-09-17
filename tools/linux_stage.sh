@@ -798,7 +798,7 @@ EOF
     ok "state file 600, lock 600, directory 750, all owned by $SVC"
   fi
 
-  echo "-- full disk: a state directory with no room refuses before any mail (issue #30)"
+  echo "-- full disk: a state directory with no room refuses before any mail (issue #30); the band's marker (issue #70)"
   # A 1 MiB tmpfs holding the service user's state directory: with a saved position and a
   # matching line pending, the run on the full disk must send nothing (measured before the
   # fix: a mail on every run), and a lock file created on the full disk is named by the
@@ -826,9 +826,80 @@ EOF
     else
       ok "a full disk: exit 1, the refusal on stderr, no mail"
     fi
+    # the band (issue #70): room for the positions as loaded, none for what the run adds.
+    # A section over a glob first-sights an empty directory with the disk free; 20 new
+    # files then grow its state past a page while the filler leaves exactly one page
+    # free (tmpfs gives a truncated page back at once; measured). Run b2 sends and
+    # cannot save and marks the lock; b3 refuses before any mail; with the room back,
+    # b4 sends once and clears the mark.
+    rm -f "$T/full/filler"
+    mkdir -p "$T/band"
+    chmod 755 "$T/band"
+    cat > "$T/band.conf" <<EOF
+[logalert]
+sendmail_path = $T/bin/sendmail
+state_file = $T/full/state/band.json
+from = alerts@example.net
+[band]
+subject = Band
+to = noc@example.net
+files = $T/band/*.log
+patterns =
+    disk failure
+EOF
+    chmod 644 "$T/band.conf"
+    as_svc b1 -f "$T/band.conf"; rc=$?  # first sight of the glob: its record saved
+    if [ "$rc" -eq 124 ]; then
+      skip "the band's first run did not finish within ${BOUND_CMD}s"
+    elif [ "$rc" -ne 0 ]; then
+      fail "the band's first run exited $rc: $(first_err b1)" "band-first"
+    else
+      for n in $(seq 1 20); do printf 'disk failure %s\n' "$n" > "$T/band/host$n.log"; done
+      chmod 644 "$T/band"/*.log
+      bounded "$BOUND_CMD" dd if=/dev/zero of="$T/full/filler" bs=4096 > /dev/null 2>&1
+      bounded "$BOUND_CMD" truncate -s -"$(getconf PAGESIZE)" "$T/full/filler"
+      before="$(fake_calls)"
+      as_svc b2 -f "$T/band.conf"; rc=$?
+      if [ "$rc" -eq 124 ]; then
+        skip "the band run did not finish within ${BOUND_CMD}s"
+      elif [ "$rc" -ne 1 ] || ! grep -q 'band] state not saved: state file .*cannot write (No space left on device)' "$T/b2.err"; then
+        fail "the band run exited $rc: $(first_err b2)" "band-send"
+      elif [ "$(( $(fake_calls) - before ))" -ne 1 ]; then
+        fail "the band run mailed $(( $(fake_calls) - before )) time(s); once is the band" "band-send"
+      elif ! grep -q ' unsaved [0-9]' "$T/full/state/lock"; then
+        fail "the lock carries no unsaved marker after the band run: $(cat "$T/full/state/lock")" "band-mark"
+      else
+        ok "the band: one mail, the save refused, the lock marked ($(cut -d' ' -f3- "$T/full/state/lock"))"
+      fi
+      before="$(fake_calls)"
+      as_svc b3 -f "$T/band.conf"; rc=$?
+      if [ "$rc" -eq 124 ]; then
+        skip "the marked run did not finish within ${BOUND_CMD}s"
+      elif [ "$rc" -ne 1 ] || ! grep -q 'the last run sent mail it could not record; nothing is sent until the state can be saved' "$T/b3.err"; then
+        fail "the marked run exited $rc: $(first_err b3)" "band-refuse"
+      elif [ "$(fake_calls)" -ne "$before" ]; then
+        fail "the marked run mailed; nothing must leave the box until the room is proven" "band-refuse"
+      elif ! grep -q ' unsaved [0-9]' "$T/full/state/lock"; then
+        fail "the marker did not survive the refused run" "band-refuse"
+      else
+        ok "the marked run: exit 1, the refusal on stderr, no mail, the marker kept"
+      fi
+      rm -f "$T/full/filler"
+      as_svc b4 -f "$T/band.conf"; rc=$?
+      if [ "$rc" -eq 124 ]; then
+        skip "the run after the room came back did not finish within ${BOUND_CMD}s"
+      elif [ "$rc" -ne 0 ] || [ "$(( $(fake_calls) - before ))" -ne 1 ]; then
+        fail "the run with the room back exited $rc with $(( $(fake_calls) - before )) mail(s): $(first_err b4)" "band-clear"
+      elif grep -q 'unsaved' "$T/full/state/lock" || [ "$(grep -c '"offset"' "$T/full/state/band.json")" -lt 20 ]; then
+        fail "after the proof: lock=$(cat "$T/full/state/lock"), $(grep -c '"offset"' "$T/full/state/band.json") positions saved" "band-clear"
+      else
+        ok "the room proven: one mail (the marked run's lines, once more), 20 positions saved, the marker cleared"
+      fi
+    fi
     # the lock created for the first time on the full disk: the freed block goes to the
     # filler first, so the holder line has nowhere to go
     rm -f "$T/full/state/lock"
+    before="$(fake_calls)"  # the band above mailed twice by design
     bounded "$BOUND_CMD" dd if=/dev/zero of="$T/full/filler" bs=4096 oflag=append conv=notrunc > /dev/null 2>&1
     as_svc f3 -f "$T/full.conf"; rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -836,7 +907,7 @@ EOF
     elif [ "$rc" -ne 1 ] || ! grep -q 'state directory: No space left on device (' "$T/f3.err" || grep -q 'must belong' "$T/f3.err"; then
       fail "a fresh lock on the full disk: exit $rc, $(first_err f3)" "full-disk-lock"
     elif [ "$(fake_calls)" -ne "$before" ]; then
-      fail "the run with a fresh lock on the full disk mailed" "full-disk-lock"
+      fail "the run with a fresh lock on the full disk mailed: $(first_err f3)" "full-disk-lock"
     else
       ok "a fresh lock on the full disk: exit 1, the errno without the ownership hint, no mail"
     fi

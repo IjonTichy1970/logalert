@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,13 +30,22 @@ from fake_sendmail import install
 import logalert.__main__
 import logalert.cursor
 import logalert.run
+import logalert.state
 from logalert.__main__ import main
 from logalert.cursor import LogFile
 from logalert.lock import RunLock
 from logalert.match import scan
 from logalert.rotation import open_source
 from logalert.run import Outcome
-from logalert.state import Cursor, State, StateError, load_state, lock_path, timestamp
+from logalert.state import (
+    STATE_HEADROOM,
+    Cursor,
+    State,
+    StateError,
+    load_state,
+    lock_path,
+    timestamp,
+)
 
 NL = chr(10)
 SENDER = "alerts@example.net"
@@ -625,7 +635,7 @@ def test_a_save_failure_says_whether_a_mail_went_out(
         opening.add(id(state))
         return state
 
-    def save(self: State) -> None:
+    def save(self: State, reach: int | None = None) -> None:
         if id(self) in opening:  # the opening save (issue #30) passes; the section's fails
             opening.discard(id(self))
             real_save(self)
@@ -1706,3 +1716,158 @@ def test_a_refused_delivery_keeps_a_young_entrys_sighting(
     capsys.readouterr()
     after = site.state()["firewall"][site.firewall.as_posix()]
     assert after["offset"] == primed["offset"] and after["last_seen"] == primed["last_seen"]
+
+
+# -- the unsaved marker: a delivered section whose save failed (issue #70) ----------------------
+
+
+def _lock_line(site: Site) -> str:
+    return (site.state_dir / "lock").read_text(encoding="ascii")
+
+
+class _Saves:
+    """write_atomically with a failure schedule: ``failing(n)`` says whether the n-th call
+    (1-based, across runs) fails; every call's text length and reach are recorded.
+    ``room`` set is a disk with room for that many bytes and no more: a write reaching
+    past it fails, as the padded proof does."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, failing: Callable[[int], bool]) -> None:
+        self.calls = 0
+        self.sizes: list[int] = []
+        self.reaches: list[int | None] = []
+        self.failing = failing
+        self.room: int | None = None
+        real = logalert.state.write_atomically
+
+        def write(path: str, text: str, reach: int | None = None) -> None:
+            self.calls += 1
+            self.sizes.append(len(text))
+            self.reaches.append(reach)
+            if self.failing(self.calls) or (self.room is not None
+                                            and max(len(text), reach or 0) > self.room):
+                raise StateError("disk full")
+            real(path, text, reach=reach)
+
+        monkeypatch.setattr("logalert.state.write_atomically", write)
+
+
+def test_a_delivered_section_whose_save_failed_marks_the_lock_and_the_next_run_refuses(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The band (issue #30's residual): room for the state as loaded, none for its growth.
+    Run 1 sends and cannot save; run 2 must refuse before any mail (without the marker it
+    would send again: the opening save fits, the section's does not -- the storm); run
+    3, with the room back, proves it, sends once and clears the marker."""
+    site.prime()
+    site.append(site.router, "disk failure now" + " x" * 50)  # the offset gains a digit
+    saves = _Saves(monkeypatch, lambda n: False)
+    saves.room = len(site.state_file.read_text(encoding="utf-8"))  # as loaded: fits
+    assert site.run() == 1
+    assert saves.sizes[1] > saves.room  # the band's precondition: the section's save grew
+    err = capsys.readouterr().err
+    assert err.startswith("logalert: 1 of 1 section sent; failed: [router-disk] state not saved: "
+                          "disk full; [firewall] state not saved: disk full; see the log")
+    assert len(site.calls()) == 1  # the mail went out
+    marked = _lock_line(site)
+    assert marked.endswith(f" unsaved {saves.sizes[1]}\n")  # the size the router section needed
+    # run 2: the proving save is refused; nothing is sent, the marker stands
+    assert site.run() == 1
+    assert capsys.readouterr().err == (
+        "logalert: failed: state file: disk full -- the last run sent mail it could not record; "
+        "nothing is sent until the state can be saved; see the log" + NL)
+    assert len(site.calls()) == 1
+    assert saves.reaches[-1] == saves.sizes[1] + STATE_HEADROOM  # what did not fit, plus a block
+    assert _lock_line(site).endswith(f" unsaved {saves.sizes[1]}\n")
+    assert saves.calls == 4  # nothing was read: the run stopped at the opening
+    # run 3: the room is back; the proof passes, the lines go out once more, the marker goes
+    saves.room = None
+    assert site.run() == 0
+    assert len(site.calls()) == 2
+    assert body_of(site.calls()[1][1]).count("disk failure now") == 1
+    assert " unsaved" not in _lock_line(site)
+    assert site.offset("router-disk", site.router) == site.router.stat().st_size
+    assert any("the last run sent mail it could not record; the room is there now" in line
+               for line in site.activity())
+
+
+def test_a_later_save_in_the_marked_run_clears_the_marker(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The whole state is one file: the firewall section's save records the router's moved
+    position too, so the next run neither refuses nor re-sends."""
+    site.prime()
+    site.append(site.router, "disk failure now")
+    _Saves(monkeypatch, lambda n: n == 2)  # the router section's save alone fails
+    assert site.run() == 1
+    assert "state not saved" in capsys.readouterr().err
+    assert " unsaved" not in _lock_line(site)
+    assert site.offset("router-disk", site.router) == site.router.stat().st_size
+    assert site.run() == 0 and len(site.calls()) == 1
+
+
+def test_a_failed_save_after_no_delivery_leaves_no_marker(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    site.prime()
+    site.append(site.router, "quiet line")  # nothing matches: no mail, the cursors move
+    _Saves(monkeypatch, lambda n: n >= 2)
+    assert site.run() == 1
+    assert "state not saved" in capsys.readouterr().err and site.calls() == []
+    assert " unsaved" not in _lock_line(site)
+
+
+def test_reset_state_clears_the_marker(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    site.prime()
+    site.append(site.router, "disk failure now")
+    saves = _Saves(monkeypatch, lambda n: n >= 2)
+    assert site.run() == 1
+    assert " unsaved" in _lock_line(site)
+    saves.failing = lambda n: False
+    assert site.run("--reset-state", site.router.as_posix()) == 0
+    capsys.readouterr()
+    assert " unsaved" in _lock_line(site)  # one file forgotten: the band is where it was
+    assert site.run("--reset-state") == 0
+    capsys.readouterr()
+    assert " unsaved" not in _lock_line(site)
+    # the escape hatch (a state file nothing can read, replaced) clears it too
+    assert site.run() == 0  # the first sight after the reset
+    site.append(site.router, "disk failure again")
+    base = saves.calls
+    saves.failing = lambda n: n >= base + 2  # the opening save passes, the rest fail
+    assert site.run() == 1 and " unsaved" in _lock_line(site)
+    saves.failing = lambda n: False
+    site.state_file.write_text("{", encoding="utf-8")
+    assert site.run("--reset-state") == 0
+    assert capsys.readouterr().out.rstrip().endswith("; replaced it with an empty state")
+    assert " unsaved" not in _lock_line(site)
+
+
+def test_a_dry_run_neither_reads_nor_touches_the_marker(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    site.prime()
+    site.append(site.router, "disk failure now")
+    saves = _Saves(monkeypatch, lambda n: n >= 2)
+    assert site.run() == 1
+    marked = _lock_line(site)
+    saves.failing = lambda n: False
+    assert site.run("--dry-run") == 0  # previews, sends nothing, writes nothing
+    assert "disk failure now" in capsys.readouterr().out
+    assert _lock_line(site) == marked and len(site.calls()) == 1
+
+
+def test_a_marking_that_fails_is_one_log_line_not_a_traceback(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The marker's write can fail too (an I/O error); the run keeps its one stderr line and
+    says the next run re-sends (review: unpinned)."""
+    site.prime()
+    site.append(site.router, "disk failure now")
+    _Saves(monkeypatch, lambda n: n >= 2)
+
+    def refused(self: RunLock, size: int) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(RunLock, "mark_unsaved", refused)
+    assert site.run() == 1
+    assert capsys.readouterr().err.startswith(
+        "logalert: 1 of 1 section sent; failed: [router-disk] state not saved: disk full; ")
+    assert len(site.calls()) == 1 and " unsaved" not in _lock_line(site)
+    assert any("[router-disk] the lock could not be marked either (No space left on device); "
+               "the next run re-sends" in line for line in site.activity())

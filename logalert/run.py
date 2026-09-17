@@ -17,10 +17,15 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     then could not save re-sent the same lines on every run until space was freed
     (measured: three runs, three mails, the offset never moved). The opening save is the
     exact operation, so what fails there is what would have failed after the mail for a
-    state that does not grow; it is exit 1 naming the error, nothing sent (the residual
-    window, a disk with room for the state but not for its growth, is in ``state.py``'s
-    rule). ``--dry-run`` takes no lock and needs no writable directory: it reads the state
-    if there is one and never writes.
+    state that does not grow; it is exit 1 naming the error, nothing sent. The residual
+    window -- a disk with room for the state but not for its growth -- is bounded to one
+    run (issue #70): a delivered section whose save failed MARKS the lock's holder line
+    with the size that did not fit, and the next run's opening save must reach that size
+    plus a block (``State.save(reach=...)``) or the run is exit 1 with ``the last run
+    sent mail it could not record; nothing is sent until the state can be saved``; a
+    passed proof clears the marker, as does a later save that succeeds in the marked run
+    (the whole state is one file) and ``--reset-state``. ``--dry-run`` takes no lock and
+    needs no writable directory: it reads the state if there is one and never writes.
   * Per section, in file order, each glob expanded in its place (``logalert.globs``: sorted,
     regular files only, rotated copies left out unless ``include_archives``; a directory
     that cannot be listed is a failed item, a glob matching nothing is nothing to do), each
@@ -121,6 +126,7 @@ from logalert.mail import Mail, clean_header, compose
 from logalert.match import FileReport, progress, scan
 from logalert.rotation import CatchUpSource, open_source
 from logalert.state import (
+    STATE_HEADROOM,
     Cursor,
     State,
     StateError,
@@ -313,15 +319,29 @@ def run(config: Config, options: Options) -> int:
                       config.settings.state_ttl_days)
         if not options.dry_run:
             # the second half of the proof (issue #30): the exact write a section's save
-            # performs, before any mail -- see the module docstring
+            # performs, before any mail -- see the module docstring; after a marked run
+            # (issue #70) the write must reach the size that did not fit, plus a block
+            marked = lock is not None and lock.unsaved is not None
             try:
-                state.save()
+                if lock is not None and lock.unsaved is not None:  # marked: the proof
+                    state.save(reach=lock.unsaved + STATE_HEADROOM)
+                else:
+                    state.save()
             except (StateError, OSError) as exc:
-                outcome.fail(f"state file: {exc} -- nothing was sent, because a run that "
-                             f"cannot save its position would send everything again next time")
+                if marked:
+                    outcome.fail(f"state file: {exc} -- the last run sent mail it could not "
+                                 f"record; nothing is sent until the state can be saved")
+                else:
+                    outcome.fail(
+                        f"state file: {exc} -- nothing was sent, because a run that "
+                        f"cannot save its position would send everything again next time")
                 return _finish(outcome)
+            if marked and lock is not None:
+                log.warning("the last run sent mail it could not record; the room is there "
+                            "now, and its lines go out again with this run")
+                _clear_marker(lock)
         for watch in config.watches:
-            _section(watch, config, options, sender, state, outcome, started)
+            _section(watch, config, options, sender, state, outcome, started, lock)
     finally:
         if lock is not None:
             lock.release()
@@ -337,7 +357,7 @@ def _finish(outcome: Outcome) -> int:
 
 
 def _section(watch: Watch, config: Config, options: Options, sender: str, state: State,
-             outcome: Outcome, started: datetime) -> None:
+             outcome: Outcome, started: datetime, lock: RunLock | None = None) -> None:
     """One section: read its files, mail once when anything matched, move its state."""
     context = options.context if watch.context is None else watch.context
     reports: list[FileReport] = []
@@ -401,7 +421,8 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
                  files, busy, matched)
 
     if not any(report.matched for report in reports):
-        _advance(watch, state, cursors, options, outcome, started, seen, delivered=False)
+        _advance(watch, state, cursors, options, outcome, started, seen, delivered=False,
+                 lock=lock)
         return
     outcome.due += 1
     mail = compose(watch, reports, sender=sender, settings=config.settings,
@@ -427,12 +448,13 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
                 state.set(watch.name, path, starts[path])
             elif _halfway_to_expiry(state.get(watch.name, path), config.settings.state_ttl_days):
                 state.touch(watch.name, path)  # its last_seen bounds a gap's read (#64)
-        _save(state, watch.name, outcome, delivered=False)
+        _save(state, watch.name, outcome, delivered=False, lock=lock)
         return
     outcome.sent += 1
     for recipient, answer in delivery.refused:
         outcome.fail(f"[{watch.name}] refused: {recipient} -- {answer}")
-    _advance(watch, state, cursors, options, outcome, started, seen, delivered=True)
+    _advance(watch, state, cursors, options, outcome, started, seen, delivered=True,
+             lock=lock)
 
 
 def _halfway_to_expiry(cursor: Cursor | None, ttl_days: int) -> bool:
@@ -532,16 +554,17 @@ def _reason(exc: OSError, path: str) -> str:
 
 def _advance(watch: Watch, state: State, cursors: dict[str, Cursor], options: Options,
              outcome: Outcome, started: datetime, seen: set[str], *,
-             delivered: bool) -> None:
+             delivered: bool, lock: RunLock | None = None) -> None:
     if options.dry_run:
         return
     for path, cursor in cursors.items():
         state.set(watch.name, path, cursor)
     state.record_run(watch.name, watch.files, seen, started)
-    _save(state, watch.name, outcome, delivered=delivered)
+    _save(state, watch.name, outcome, delivered=delivered, lock=lock)
 
 
-def _save(state: State, section: str, outcome: Outcome, *, delivered: bool) -> None:
+def _save(state: State, section: str, outcome: Outcome, *, delivered: bool,
+          lock: RunLock | None = None) -> None:
     try:
         state.save()
     except (StateError, OSError) as exc:
@@ -549,6 +572,27 @@ def _save(state: State, section: str, outcome: Outcome, *, delivered: bool) -> N
         if delivered:
             log.error("[%s] the mail went out; unless a later save in this run succeeds, "
                       "the next run re-sends it", section)
+        if lock is not None and (delivered or lock.unsaved is not None):
+            # the marker (issue #70): the next run refuses to send; a later failed save
+            # in a marked run keeps the larger size (the state grew since)
+            try:
+                lock.mark_unsaved(max(len(state.render()), lock.unsaved or 0))
+            except OSError as marking:
+                log.error("[%s] the lock could not be marked either (%s); the next "
+                          "run re-sends", section, marking.strerror or marking)
+        return
+    if lock is not None:  # the whole state is one file: this save recorded the mark too
+        _clear_marker(lock)
+
+
+def _clear_marker(lock: RunLock) -> None:
+    """The marker cleared, an error there logged: a refused write must not end the run
+    (review); the marker then stands one run longer, one proof more."""
+    try:
+        lock.clear_unsaved()
+    except OSError as exc:
+        log.error("the lock's marker could not be cleared (%s); the next run proves the "
+                  "room again", exc.strerror or exc)
 
 
 def _preview(mail: Mail) -> None:
