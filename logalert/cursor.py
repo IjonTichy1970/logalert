@@ -22,8 +22,11 @@ A listed COMPRESSED file whose inode, device, size and mtime are what the cursor
 is not opened at all (issue #44): nothing new can be in an archive that has not changed,
 and the confirming seek to the saved offset was a full decompression on every run. The
 cursor records the two only when its offset IS the end of the stream (a read that reached
-EOF with no unterminated tail), so a cursor that carries them never has unread bytes
-behind it. Its first sight is one pass: the stream's end, the last line boundary and the
+EOF with no unterminated tail), so a cursor of a LISTED file that carries them never has
+unread bytes behind it (a cursor parked on a rotated copy carries them as that copy's
+identity, issue #65, and lives under the log's own key, which is never a compressed
+path with that inode). Its first sight is one pass: the stream's end, the last line
+boundary and the
 line count come from a single forward read. A plain file changes size and mtime with
 every append and is never short-circuited; nor is a symbolic link, which goes through the
 owner rule below on every run.

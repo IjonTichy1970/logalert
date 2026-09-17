@@ -155,6 +155,13 @@ its notes.
   a numbered live sibling is never chained as a copy; the epoch suffix no
   longer goes through `fromtimestamp`, which overflows on a 32-bit `time_t`.
 
+- `[contract]` **A position parked on a rotated copy records that copy's
+  modification time, and the next run takes the copy with that time and first
+  line before any guess by content** (#65). A banner log's newer copy fit the
+  content check and the run resumed inside the wrong file, silently; a reused
+  inode with the same first line was taken too. The state gains two optional
+  fields on such an entry.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

@@ -34,8 +34,18 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
   * A copy of our file has our first line and is at least as long as our position in it;
     read through the decompressor, that is what the CONTENT check asks. The archives of this
     log written AFTER the last run are ours or newer, and the oldest of them that fits is ours:
-    that is tried first. Only then is the saved INODE looked for, among ALL regular files in
-    those directories whatever their name (a plain rename, the ``delaycompress`` window,
+    that is tried first -- unless the cursor is PARKED on a rotated copy (a stop, a consumer
+    that stopped mid-chain, an absent live file): such a cursor carries the copy's mtime
+    (issue #65), and the archive of this log with that mtime -- to the second: bzip2 by
+    hand keeps no more, logrotate restores it exactly with any compressor, gzip and xz keep
+    the nanoseconds (measured) -- that has the saved first line and is long enough is taken
+    before any guess: the copy's own inode first, then an exact stamp, then a named style
+    before a hand-made one (two files can share the second; review). A parked copy is
+    older than the run that parked on it, and in a
+    banner log every newer copy fits the content check: the run resumed inside the wrong
+    file, silently (measured). Only then is the saved INODE looked for, among ALL regular
+    files in those directories whatever their name (a plain rename, the ``delaycompress``
+    window,
     ``olddir``) -- with the saved first line, because a same-inode file with a different
     first line, or with none, is a different file (the cursor's own rule). The inode comes
     second because ext4 hands a freed number straight back (measured): after a rotation
@@ -75,7 +85,8 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     usually permanent. A corrupt or unsupported copy stays a warning.
   * The live file may be ABSENT after a rotation (``nocreate``). With a cursor on record the search
     runs anyway; the cursor then describes the last archive read, so the next run -- when the live
-    file is back under a new inode -- resolves that archive by inode or first line and reads
+    file is back under a new inode -- resolves that archive by its mtime (issue #65), inode or
+    first line and reads
     nothing from it twice. A consumer that stops reading part-way through the chain gets a cursor
     on the archive it stopped in, for the same reason: the next run resumes there.
   * A ROTATION DURING THE RUN (issue #32) is the same rule made literal. A chain member found
@@ -493,7 +504,7 @@ class Plan:
 
     match: Archive | None = None
     chain: list[Archive] = field(default_factory=list)
-    stage: str = ""  # "inode" | "content" | "" (nothing matched)
+    stage: str = ""  # "mtime" | "inode" | "content" | "" (nothing matched)
     searched: list[str] = field(default_factory=list)
     verified: "Verified | None" = None  # the match's open handle, positioned at the offset
     denied: str = ""  # the failed item when a permission kept the copies out of reach and
@@ -587,12 +598,34 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
         return {(a.path, a.ino, a.dev) for a in everything}
 
     def stages() -> None:
-        """The three stages over the last listing; sets ``plan.match``."""
+        """The stages over the last listing: the parked copy by its mtime (issue #65), then
+        the three of #8; sets ``plan.match`` (and ``plan.stage`` for the first)."""
         since = parse_timestamp(saved.last_seen).timestamp() - _SLACK
         recent = _oldest_first([a for a in archives if a.mtime >= since],
                                prefer=(saved.ino, saved.dev))
         older = list(reversed(_oldest_first([a for a in archives if a.mtime < since])))
-        if saved.fingerprint is not None:
+        if saved.mtime is not None:  # parked on a copy (issue #65): that copy, by its mtime
+            same = _oldest_first([a for a in archives if int(a.mtime) == int(saved.mtime)])
+            # the copy itself first (its inode, a rename keeps it), then an exact stamp (a
+            # compressor kept the nanoseconds), then a named style before a hand-made one:
+            # a same-second older neighbour has a different key, and a cp -p twin under
+            # router.log.2.bak ties to the nanosecond (review: both took the wrong file)
+            same.sort(key=lambda a: ((a.ino, a.dev) != (saved.ino, saved.dev),
+                                     a.mtime != saved.mtime, a.style == "other"))
+            for archive in same:
+                if saved.fingerprint is None and (archive.ino, archive.dev) != (saved.ino,
+                                                                                  saved.dev):
+                    continue  # nothing to confirm a copy by but its inode and name
+                # the saved first line, when there is one, must not be contradicted (the
+                # inode stage's rule; a cursor with none is confirmed by its inode above)
+                if fits(archive, by_content=False):
+                    plan.match, plan.stage = archive, "mtime"
+                    break
+            if plan.match is None and renamed:
+                return  # the parked name moved on (a rotation inside the plan): the
+                #         caller lists again; the other stages over this listing would
+                #         guess (review: the banner rival, mid-line)
+        if plan.match is None and saved.fingerprint is not None:
             plan.match = next((a for a in recent if fits(a, by_content=True)), None)
         if plan.match is None and verdict != "truncated":  # a truncated file kept its inode
             for archive in everything:
@@ -628,8 +661,10 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
                 plan.denied = (f"a permission kept the rotated copies out of reach "
                                f"({', '.join(refused)}); the lines before the rotation are lost")
             return plan
-        plan.stage = "inode" if (plan.match.ino, plan.match.dev) == (saved.ino, saved.dev) \
-            else "content"
+        if not plan.stage:
+            plan.stage = "inode" if (plan.match.ino, plan.match.dev) == (saved.ino,
+                                                                          saved.dev) \
+                else "content"
         match = plan.match
         later = [a for a in archives
                  if a.path != match.path and (a.path, a.ino, a.dev) not in unreadable
@@ -747,6 +782,9 @@ class Segment:
         self.offset = start
         self.ino = 0
         self.dev = 0
+        # the copy's st_size and st_mtime at its open: a parked cursor names it by them (#65)
+        self.size = 0
+        self.mtime: float | None = None
         self.fingerprint: str | None = None
         self.started = False
         self.finished = False
@@ -775,6 +813,7 @@ class Segment:
                     self.finished = True
                     return
                 self.ino, self.dev = st.st_ino, st.st_dev
+                self.size, self.mtime = st.st_size, st.st_mtime
                 self.fingerprint = (self.verified.fingerprint if self.verified
                                     else fingerprint(handle))
                 if self.start_line is None:
@@ -809,9 +848,13 @@ class Segment:
         return open_log(self.path)
 
     def cursor(self, now: datetime | None = None) -> Cursor:
+        # size and mtime: a rotated copy is immutable, so they identify it at the next
+        # run (issue #65); a compressor makes a new inode and keeps the mtime, to the
+        # second at least
         return Cursor(offset=self.offset, ino=self.ino, dev=self.dev, fingerprint=self.fingerprint,
                       realpath=os.path.realpath(self.path), last_seen=timestamp(now),
-                      line=self.line)
+                      line=self.line, size=self.size if self.mtime is not None else None,
+                      mtime=self.mtime)
 
     def context_before(self, n: int) -> list[Line]:
         """The lines before ``start`` in this archive, numbered; see ``LogFile``. Answered
@@ -848,7 +891,8 @@ class CatchUpSource:
     The same surface as ``LogFile``: ``lines()``, ``cursor()``, ``close()``, a context manager.
     ``cursor()`` after ``lines()`` is exhausted is the live file's; after a consumer stopped
     part-way it is the archive being read at that point, at the last complete line -- the next
-    run resolves that archive by inode or first line and continues the chain from there. Before
+    run resolves that archive by its mtime (issue #65), inode or first line and continues the
+    chain from there. Before
     anything was read it is the saved cursor, unchanged.
     """
 

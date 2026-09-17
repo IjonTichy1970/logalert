@@ -179,7 +179,7 @@ def test_nocreate(tmp_path: Path) -> None:
     assert lines == ["since 1", "since 2"]
     path.write_bytes(LIVE)  # the writer recreates it
     source, lines, _ = run(path, cursor)
-    assert isinstance(source, CatchUpSource) and source.plan.stage == "inode"
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"  # issue #65
     assert lines == ["live 1"]
 
 

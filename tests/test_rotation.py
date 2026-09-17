@@ -16,7 +16,7 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +33,7 @@ from logalert.rotation import (
     plan_catch_up,
     scan_directories,
 )
-from logalert.state import Cursor
+from logalert.state import Cursor, State, load_state, timestamp
 
 SECTION = "router-disk"
 NLB = chr(10).encode()  # a newline as bytes, for fixtures built in a comprehension
@@ -572,22 +572,26 @@ def test_nocreate_absent_live_file_reads_the_archive_now(tmp_path: Path) -> None
     assert cursor is not None
     assert cursor.ino == (tmp_path / "router.log.1").stat().st_ino
     assert cursor.offset == len(OLD + SINCE)
-    # the writer comes back; the next run resolves the archive by inode and reads it no further
+    # the writer comes back; the next run resolves the archive by its mtime (issue #65;
+    # by inode before) and reads it no further
     path.write_bytes(LIVE)
     source, lines, cursor2 = run(path, cursor)
     assert isinstance(source, CatchUpSource) and lines == ["live 1"]
-    assert source.plan.stage == "inode"  # the parked cursor resolves; no false warning
+    assert source.plan.stage == "mtime"  # the parked cursor resolves; no false warning
     assert cursor2 is not None and cursor2.ino == path.stat().st_ino
-    # and when the archive was compressed in between: resolved by content, nothing twice
+    # and when the archive was compressed in between: a new inode, the mtime kept as gzip
+    # keeps it -- resolved by mtime (by content before #65), nothing twice
     saved = seen(path, OLD)
     append(path, SINCE)
     rotate(path, tmp_path / "router.log.1")
     _, lines, parked = run(path, saved)
     assert lines == ["since 1", "since 2"] and parked is not None
     rotate(tmp_path / "router.log.1", tmp_path / "router.log.1.gz", compress=True)
+    assert parked.mtime is not None
+    os.utime(tmp_path / "router.log.1.gz", (parked.mtime, parked.mtime))
     path.write_bytes(LIVE)
     source, lines, _ = run(path, parked)
-    assert isinstance(source, CatchUpSource) and source.plan.stage == "content"
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
     assert lines == ["live 1"]
 
 
@@ -1928,3 +1932,302 @@ def test_a_chain_member_a_permission_refuses_is_the_item_too(
     assert source.failed_item() == ("a permission kept a rotated copy out of reach "
                                     "(router.log.1); its lines are lost")
     assert cursor is not None and cursor.ino == path.stat().st_ino  # moved on
+
+
+# -- a parked cursor's identity: the copy's mtime (issue #65) -----------------------------------
+
+
+BANNER = b"=== router boot log ===" + NLB
+
+
+def _banner_stop(tmp_path: Path) -> tuple[Path, Cursor]:
+    """S8 (the #32 review): a banner log. .2 = BANNER + OLD + 'since 1' (the holder), .1 =
+    BANNER + middle 1..3 (longer than the saved offset), live = BANNER + live 1. The run stops
+    at .1 (compressed away between the plan and its open, real on every platform) and parks
+    on .2 after 'since 1'; the cursor carries .2's mtime."""
+    path = tmp_path / "router.log"
+    saved = seen(path, BANNER + OLD)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(BANNER + b"middle 1" + NLB + b"middle 2" + NLB + b"middle 3" + NLB)
+    (tmp_path / "router.log.1").replace(tmp_path / "router.log.2")
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(BANNER + b"live 1" + NLB)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    (tmp_path / "router.log.1").unlink()
+    with source:
+        assert texts(list(source.lines())) == ["since 1"]
+        parked = source.cursor()
+    assert parked.ino == (tmp_path / "router.log.2").stat().st_ino
+    assert parked.mtime == (tmp_path / "router.log.2").stat().st_mtime
+    assert parked.size == (tmp_path / "router.log.2").stat().st_size
+    return path, parked
+
+
+def _a_minute_later(cursor: Cursor) -> Cursor:
+    """The next run, a minute on: the copies rotated meanwhile carry later mtimes (set by the
+    caller), the parked copy is older than last_seen - 2 s."""
+    return replace(cursor, last_seen=timestamp(datetime.now(UTC) + timedelta(seconds=60)))
+
+
+def _later(*paths: Path) -> None:
+    """Written after the stop: two minutes on, so they are `recent` at the next run."""
+    stamp = time.time() + 120
+    for path in paths:
+        os.utime(path, (stamp, stamp))
+
+
+def _shift_after_the_stop(tmp_path: Path, fresh: bytes) -> None:
+    """logrotate's shift over the stop's layout (.2 plain, .1 compressed away):
+    .2 -> .3, .1.gz -> .2.gz, the live file -> .1, a fresh live file."""
+    (tmp_path / "router.log.2").replace(tmp_path / "router.log.3")
+    (tmp_path / "router.log.1.gz").replace(tmp_path / "router.log.2.gz")
+    (tmp_path / "router.log").replace(tmp_path / "router.log.1")
+    (tmp_path / "router.log").write_bytes(fresh + NLB)
+
+
+def test_a_parked_cursor_is_found_by_its_mtime_before_a_banner_guess(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Measured (the #32 review, S8): the content stage took the oldest recent copy that was
+    long enough -- the newer banner copy -- and the run resumed inside the wrong file, at
+    INFO. The parked copy's mtime names it, and it is taken first."""
+    path, parked = _banner_stop(tmp_path)
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")  # .3 is the parked copy
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    caplog.set_level(logging.INFO, logger="logalert.rotation")
+    source, rest, cursor = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.3")
+    assert rest == ["=== router boot log ===", "middle 1", "middle 2", "middle 3",
+                    "=== router boot log ===", "live 1", "=== router boot log ===", "live 2"]
+    assert any("found the saved position by mtime; reading router.log.3 from" in r.getMessage()
+               for r in caplog.records)
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+    assert cursor.mtime is None and cursor.size is None  # the live file's cursor carries none
+
+
+def test_the_mtime_stage_beats_a_reused_inode_with_the_same_first_line(tmp_path: Path) -> None:
+    """Measured natively (the #32 review, S3): the parked copy compressed away, a same-first-line
+    impostor got its freed inode number and the inode stage took it; its chain then mailed
+    the parked copy whole again. The reuse is fabricated here by pointing the parked cursor
+    at the impostor's inode; the copy's mtime, kept by the compressor, wins."""
+    path, saved = _two_rotations(tmp_path)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    (tmp_path / "router.log.1").unlink()
+    with source:
+        assert texts(list(source.lines())) == ["since 1"]
+        parked = source.cursor()  # on .2, at its end
+    _shift_after_the_stop(tmp_path, b"live 2")
+    kept = (tmp_path / "router.log.3").stat().st_mtime
+    rotate(tmp_path / "router.log.3", tmp_path / "router.log.3.gz", compress=True)
+    os.utime(tmp_path / "router.log.3.gz", (kept, kept))  # gzip keeps the mtime (measured)
+    compress_to(tmp_path / "router.log.4.gz", OLD + b"ancient" + NLB)  # the same first line
+    ancient = kept - 600
+    os.utime(tmp_path / "router.log.4.gz", (ancient, ancient))
+    impostor = (tmp_path / "router.log.4.gz").stat()
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    reused = replace(_a_minute_later(parked), ino=impostor.st_ino, dev=impostor.st_dev)
+    again, rest, _ = run(path, reused)
+    assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
+    assert again.plan.match is not None and again.plan.match.path.endswith("router.log.3.gz")
+    assert rest == ["middle 1", "live 1", "live 2"]  # nothing of the parked copy again
+
+
+def test_a_compressor_that_kept_whole_seconds_still_names_the_parked_copy(
+        tmp_path: Path) -> None:
+    """bzip2 by hand TRUNCATES the mtime to the second (measured: .9 -> .0; gzip and xz keep
+    it); the stage compares whole seconds, so a fraction above .5 must still hit."""
+    path, parked = _banner_stop(tmp_path)
+    whole = float(int(parked.mtime or 0))
+    parked = replace(parked, mtime=whole + 0.75)  # as the copy would have been stamped
+    os.utime(tmp_path / "router.log.2", (whole + 0.75, whole + 0.75))
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")
+    rotate(tmp_path / "router.log.3", tmp_path / "router.log.3.bz2", compress=True)
+    os.utime(tmp_path / "router.log.3.bz2", (whole, whole))
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    source, rest, _ = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert rest[:4] == ["=== router boot log ===", "middle 1", "middle 2", "middle 3"]
+
+
+def test_a_parked_cursor_round_trips_its_copys_size_and_mtime_through_the_state(
+        tmp_path: Path) -> None:
+    path, parked = _banner_stop(tmp_path)
+    state = State(str(tmp_path / "state.json"))
+    state.set(SECTION, str(path), parked)
+    state.save()
+    loaded = load_state(str(tmp_path / "state.json")).get(SECTION, str(path))
+    assert loaded == parked and loaded.mtime == parked.mtime and loaded.size == parked.size
+
+
+def test_a_parked_cursor_with_no_first_line_is_confirmed_by_its_inode(tmp_path: Path) -> None:
+    """A copy with no complete first line cannot be confirmed by content; with the saved inode
+    under the recorded mtime it is the copy, else the stage passes."""
+    path = tmp_path / "router.log"
+    saved = seen(path, b"")
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(b"middle 1" + NLB)
+    (tmp_path / "router.log.1").replace(tmp_path / "router.log.2")
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(b"live 1" + NLB)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    (tmp_path / "router.log.1").unlink()
+    with source:
+        assert texts(list(source.lines())) == ["since 1"]
+        parked = source.cursor()
+    assert parked.fingerprint is not None and parked.mtime is not None
+    # a FABRICATED shape (a stop never parks on a copy without a first line; a listed
+    # compressed file's settled cursor is the one with a mtime and no hash): the
+    # inode confirms it
+    empty = replace(parked, fingerprint=None, offset=0, line=0)
+    _shift_after_the_stop(tmp_path, b"live 2")
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    again, rest, _ = run(path, _a_minute_later(empty))
+    assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
+    assert rest == ["since 1", "middle 1", "live 1", "live 2"]
+    # another inode under that mtime is not it: the stage passes
+    elsewhere = replace(empty, ino=NOWHERE)
+    third, _, _ = run(path, _a_minute_later(elsewhere))
+    assert isinstance(third, CatchUpSource) and third.plan.stage != "mtime"
+
+
+def test_the_recorded_mtime_is_the_opened_copys_not_the_names(tmp_path: Path) -> None:
+    """The stop's own shape: by the time the cursor is taken, the name the segment opened can
+    hold a different file (a shift landed); the fstat at the open is what is recorded, and a
+    stat of the name would record the shifted file's -- and take it by mtime next run."""
+    path, saved = _two_rotations(tmp_path)
+    original = (tmp_path / "router.log.2").stat()
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    (tmp_path / "router.log.1").unlink()
+    with source:
+        assert texts(list(source.lines())) == ["since 1"]
+        # the parked copy's handle is closed now: a shift lands before the cursor is taken
+        (tmp_path / "router.log.2").replace(tmp_path / "router.log.3")
+        (tmp_path / "router.log.1.gz").replace(tmp_path / "router.log.2.gz")
+        later = tmp_path / "router.log.2"
+        later.write_bytes(b"another" + NLB)
+        os.utime(later, (original.st_mtime + 120, original.st_mtime + 120))
+        parked = source.cursor()
+    assert parked.mtime == original.st_mtime and parked.size == original.st_size
+
+
+def test_the_mtime_stage_takes_named_archives_only(tmp_path: Path) -> None:
+    """A same-content copy under a hand-made name (cp -p) with the copy's mtime is not the
+    copy: it would bring other-style files into the chain."""
+    path, parked = _banner_stop(tmp_path)
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")
+    stray = tmp_path / "aaa-keep.log"  # listed before router.log.3 on every filesystem
+    stray.write_bytes((tmp_path / "router.log.3").read_bytes())
+    assert parked.mtime is not None
+    os.utime(stray, (parked.mtime, parked.mtime))
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    source, _, _ = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.3")
+
+
+def test_the_saved_identity_wins_a_same_second_tie_in_the_mtime_stage(tmp_path: Path) -> None:
+    """A numbered live sibling in the extension form (router.3.log, issue #51) with the banner
+    and the same second: the key tie goes to the saved identity, and the first hit ends the
+    search (NTFS lists the sibling first; ext4 either way)."""
+    path, parked = _banner_stop(tmp_path)
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")
+    sibling = tmp_path / "router.3.log"
+    sibling.write_bytes(BANNER + b"sibling 1" + NLB + b"sibling 2" + NLB + b"sibling 3" + NLB)
+    assert parked.mtime is not None
+    os.utime(sibling, (parked.mtime, parked.mtime))
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    source, rest, _ = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.3")
+    assert "sibling 1" not in rest
+
+
+def test_a_same_second_older_neighbour_does_not_beat_the_parked_copys_inode(
+        tmp_path: Path) -> None:
+    """Review of #65: numeric keys differ, so the order's tie-break never saw the inode, and
+    .3 -- an older generation with the banner, stamped in the same second, long enough --
+    was taken by mtime with the parked .2 read whole behind it (every line mailed again).
+    The copy's own inode comes first."""
+    path, parked = _banner_stop(tmp_path)  # parked on .2, its inode intact
+    assert parked.mtime is not None
+    older = tmp_path / "router.log.3"
+    older.write_bytes(BANNER + b"".join(b"ancient %d" % n + NLB for n in range(1, 5)))
+    os.utime(older, (parked.mtime, parked.mtime))
+    _later(tmp_path / "router.log.1.gz", path)
+    source, rest, _ = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.2")
+    assert rest == ["=== router boot log ===", "middle 1", "middle 2", "middle 3",
+                    "=== router boot log ===", "live 1"]
+
+
+def test_a_cp_p_twin_under_a_hand_made_name_does_not_beat_the_parked_copy(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Review of #65: router.log-2.bak is an `other`-style archive OF THIS LOG, so it is a
+    candidate, and cp -p keeps the nanoseconds; taken, it let a hand-copied file into the
+    chain as log lines. A named style comes before a hand-made one."""
+    path, parked = _banner_stop(tmp_path)
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")
+    twin = tmp_path / "router.log-2.bak"
+    twin.write_bytes((tmp_path / "router.log.3").read_bytes())
+    junk = tmp_path / "router.log.old"
+    junk.write_bytes(b"hand-copied junk" + NLB)
+    assert parked.mtime is not None
+    # the parked copy compressed since (a new inode: its identity cannot decide), the stamp
+    # kept to the nanosecond by gzip and by cp -p alike
+    stamp = os.stat(tmp_path / "router.log.3").st_mtime_ns
+    rotate(tmp_path / "router.log.3", tmp_path / "router.log.3.gz", compress=True)
+    os.utime(tmp_path / "router.log.3.gz", ns=(stamp, stamp))
+    os.utime(twin, ns=(stamp, stamp))
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1", junk)
+    caplog.set_level(logging.INFO, logger="logalert.rotation")
+    source, rest, _ = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.3.gz")
+    assert "hand-copied junk" not in rest
+    assert [os.path.basename(a.path) for a in source.plan.chain] == ["router.log.2.gz",
+                                                                     "router.log.1"]
+
+
+def test_the_parked_name_moved_inside_the_plan_makes_the_run_list_again(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #65: the parked copy compressed away between the listing and the stage's
+    open answered RENAMED, and the content stage then guessed over the stale listing (the
+    banner rival, mid-line). The stage returns instead, and the second listing finds the
+    copy under its new name by mtime."""
+    path, parked = _banner_stop(tmp_path)
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    assert parked.mtime is not None
+    stamp = parked.mtime
+
+    def compress_the_parked_copy() -> None:
+        rotate(tmp_path / "router.log.3", tmp_path / "router.log.3.gz", compress=True)
+        os.utime(tmp_path / "router.log.3.gz", (stamp, stamp))
+
+    real_scan = rotation.scan_directories
+    calls = {"n": 0}
+
+    def scan_then_compress(directories: list[str], base: str) -> Any:
+        found = real_scan(directories, base)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            compress_the_parked_copy()
+        return found
+
+    monkeypatch.setattr(rotation, "scan_directories", scan_then_compress)
+    source, rest, _ = run(path, _a_minute_later(parked))
+    assert calls["n"] == 2 and isinstance(source, CatchUpSource)
+    assert source.plan.stage == "mtime" and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.3.gz")
+    assert rest[:4] == ["=== router boot log ===", "middle 1", "middle 2", "middle 3"]

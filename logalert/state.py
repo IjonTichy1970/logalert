@@ -26,7 +26,9 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
     section's mail failed, so a file that is present never expires.
   * ``version`` is the schema version. A file from a newer logalert is refused, not guessed at.
     A cursor's ``size`` and ``mtime`` (issue #44: what a compressed file looked like when it
-    was last read, so an unchanged archive is not decompressed again) are optional too;
+    was last read, so an unchanged archive is not decompressed again; issue #65: what the
+    rotated copy a cursor is parked on looked like, so the next run finds that copy by
+    its mtime before guessing by content) are optional too;
     0.1.0's reader drops them on save and the schema version stays 1.
     A cursor's ``line`` (the complete lines before ``offset``, so a report can number lines
     as the file does) is optional: a file without it is read, counted once, and updated.

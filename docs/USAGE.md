@@ -376,7 +376,12 @@ from the beginning instead.
 **The state file** (`state_file`, JSON) holds one entry per section and file:
 the byte offset just after the last complete line read, the file's identity
 (inode and device, plus a hash of its first line as a fingerprint), and when it
-was last seen. Two sections watching the same file have two entries, so the
+was last seen. An entry parked on a rotated copy (a rotation during the run, an
+absent live file) also records that copy's size and modification time, and the
+next run takes the copy with that modification time and first line before any
+guess by content -- a rotated copy is not written to again, and logrotate's
+compression keeps the time. Two sections watching the same file have two
+entries, so the
 section whose mail failed keeps its place while the other advances. The state is
 saved after each section, atomically; a section whose delivery failed keeps the
 positions of the files that contributed to the message (the next run re-sends
