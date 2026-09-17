@@ -47,7 +47,14 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
   * An archive that fails part-way through (a ``.gz`` still being written, a bogus file with an
     archive's name) yields what it had, a WARNING, and the chain continues. Nothing matching is
     one WARNING naming the file, the saved identity, the directories searched and the likely
-    causes; the live file is then read from 0 and the exit code is untouched.
+    causes; the live file is then read from 0 and the exit code is untouched. A copy the
+    running user cannot read, a directory it cannot list, and a directory it can list but
+    not search (``0644``: the entries cannot be examined) are each ONE warning, in the
+    errno's words (issue #38: the read failure was warned about twice, once per search
+    stage, and the stat-time failure was dropped without a word), and the no-copy warning
+    then names the permission as its first cause instead of four causes the run itself has
+    ruled out. The exit code stays untouched -- #8's rule; whether the permission should be
+    a failed item instead is the owner's call, recorded on the issue.
   * The live file may be ABSENT after a rotation (``nocreate``). With a cursor on record the search
     runs anyway; the cursor then describes the last archive read, so the next run -- when the live
     file is back under a new inode -- resolves that archive by inode or first line and reads
@@ -70,6 +77,7 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     interval needs.
 """
 
+import errno
 import logging
 import os
 import re
@@ -239,27 +247,50 @@ def _rank(archive: Archive) -> int:
     return 1 if archive.style == "other" else 2
 
 
-def scan_directories(directories: list[str], base: str) -> tuple[list[Archive], list[Archive]]:
-    """Every regular file in the directories (for the inode stage) and the archives of ``base``
-    among them (for the content stage and the chain), compression-in-progress pairs collapsed to
-    the uncompressed member. Symbolic links are skipped; hard links to one file keep the
-    better-named entry."""
+def scan_directories(directories: list[str], base: str
+                     ) -> tuple[list[Archive], list[Archive], list[tuple[str, int | None]]]:
+    """Every regular file in the directories (for the inode stage), the archives of ``base``
+    among them (for the content stage and the chain), compression-in-progress pairs collapsed
+    to the uncompressed member -- and the problems met on the way, one message each with its
+    errno, for the caller to log once (issue #38): a directory that could not be listed, a
+    directory whose entries could not be examined (listable but not searchable). Symbolic
+    links are skipped;
+    hard links to one file keep the better-named entry."""
     by_identity: dict[tuple[int, int], Archive] = {}
+    problems: list[tuple[str, int | None]] = []
     for directory in directories:
         try:
             entries = list(os.scandir(directory))
         except OSError as exc:
-            log.warning("cannot list %s while looking for rotated copies (%s)",
-                        directory, exc.strerror)
+            problems.append((f"cannot list {directory} while looking for rotated copies "
+                             f"({_said(exc)})", exc.errno))
             continue
+        examined = denied = 0
+        reason = ""
+        code: int | None = None
         for entry in entries:
             try:
+                # the listing's d_type where the filesystem fills it; an lstat otherwise
+                # (DT_UNKNOWN), which an unsearchable directory refuses like the stat below
                 if entry.is_symlink():
                     continue
+            except FileNotFoundError:
+                continue
+            except OSError as exc:  # (review)
+                examined += 1
+                denied += 1
+                reason, code = reason or _said(exc), code or exc.errno
+                continue
+            examined += 1
+            try:
                 # os.stat, not entry.stat(): on Windows the DirEntry version leaves st_ino and
                 # st_dev at 0, and the inode stage would then match nothing
                 st = os.stat(entry.path)
-            except OSError:
+            except FileNotFoundError:
+                continue  # gone since the listing: a rotation in progress (issue #32 lists again)
+            except OSError as exc:
+                denied += 1
+                reason, code = reason or _said(exc), code or exc.errno
                 continue
             if not stat.S_ISREG(st.st_mode):
                 continue
@@ -274,6 +305,10 @@ def scan_directories(directories: list[str], base: str) -> tuple[list[Archive], 
             identity = (st.st_ino, st.st_dev)
             if identity not in by_identity or _rank(archive) > _rank(by_identity[identity]):
                 by_identity[identity] = archive
+        if denied:
+            problems.append((f"cannot examine {denied} of the {examined} entries of {directory} "
+                             f"while looking for rotated copies ({reason}); is the directory "
+                             f"searchable?", code))
     everything = list(by_identity.values())
     twins: dict[tuple[str, str], list[Archive]] = {}
     for archive in everything:
@@ -286,7 +321,15 @@ def scan_directories(directories: list[str], base: str) -> tuple[list[Archive], 
             archives += plain  # <x> beside <x>.<ext>: the compression is in progress
         else:
             archives += pair
-    return everything, archives
+    return everything, archives, problems
+
+
+def _said(exc: BaseException) -> str:
+    """An error's words without the path our own message names: the errno's text for an
+    ``OSError``, the exception's for a decompressor's."""
+    if isinstance(exc, OSError) and exc.strerror:
+        return exc.strerror
+    return str(exc)
 
 
 class Renamed:
@@ -296,10 +339,20 @@ class Renamed:
 RENAMED = Renamed()
 
 
+class Denied:
+    """What ``_content_matches`` answers for a candidate a permission refused (issue #38): the
+    one unreadable copy whose cause is the operator's to fix, unlike a corrupt or an
+    unsupported archive, which answers None."""
+
+
+DENIED = Denied()
+
+
 def _content_matches(section: str, path: str, archive: Archive, saved: Cursor, *,
-                     by_content: bool) -> "Verified | Renamed | Literal[False] | None":
+                     by_content: bool) -> "Verified | Renamed | Denied | Literal[False] | None":
     """The archive's open handle at the saved offset when its first line and length fit the
-    saved cursor (``Verified``); False when it does not fit; None if unreadable.
+    saved cursor (``Verified``); False when it does not fit; ``DENIED`` when a permission
+    refused it, None if unreadable otherwise.
 
     ``by_content`` (stage 2) demands the first lines be EQUAL: a file with no complete first
     line identifies nothing. The inode stage only asks that the archive not contradict the
@@ -313,8 +366,8 @@ def _content_matches(section: str, path: str, archive: Archive, saved: Cursor, *
         return RENAMED
     except _READ_ERRORS as exc:
         log.warning("[%s] %s: rotated copy %s could not be read (%s); skipped",
-                    section, path, archive.path, exc)
-        return None
+                    section, path, archive.path, _said(exc))
+        return DENIED if isinstance(exc, PermissionError) else None
     try:
         st = os.fstat(handle.fileno())
         if (st.st_ino, st.st_dev) != (archive.ino, archive.dev):
@@ -345,8 +398,8 @@ def _content_matches(section: str, path: str, archive: Archive, saved: Cursor, *
     except _READ_ERRORS as exc:
         handle.close()
         log.warning("[%s] %s: rotated copy %s could not be read (%s); skipped",
-                    section, path, archive.path, exc)
-        return None
+                    section, path, archive.path, _said(exc))
+        return DENIED if isinstance(exc, PermissionError) else None
     except BaseException:
         handle.close()
         raise
@@ -434,16 +487,25 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
         if extra and os.path.realpath(extra) not in (os.path.realpath(d) for d in directories):
             directories.append(extra)
     plan = Plan(searched=directories)
-    unreadable: set[str] = set()
+    unreadable: set[tuple[str, int, int]] = set()  # by name AND identity, kept across the
+    #   listings (issue #38, review): a copy is tried again only under a new name or a new
+    #   inode, never because an unrelated file appeared in the directory
     renamed: set[str] = set()
+    denied = False  # a permission refused a copy in some listing (issue #38)
+    warned: set[str] = set()  # the directory problems, logged once across the listings
+    unsearchable = False  # one of them was a permission
     kept: dict[str, Verified] = {}
     everything: list[Archive] = []
     archives: list[Archive] = []
 
     def fits(archive: Archive, *, by_content: bool) -> bool:
+        nonlocal denied
+        if (archive.path, archive.ino, archive.dev) in unreadable:
+            return False  # warned about once already (issue #38)
         answer = _content_matches(section, path, archive, saved, by_content=by_content)
-        if answer is None:
-            unreadable.add(archive.path)
+        if answer is None or isinstance(answer, Denied):
+            unreadable.add((archive.path, archive.ino, archive.dev))
+            denied = denied or isinstance(answer, Denied)  # a permission, not a corrupt file
             return False
         if isinstance(answer, Renamed):
             renamed.add(archive.path)
@@ -455,8 +517,14 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
 
     def scan() -> set[tuple[str, int, int]]:
         """One listing of the directories; what it saw, by name and identity."""
-        nonlocal everything, archives
-        everything, archives = scan_directories(directories, os.path.basename(real))
+        nonlocal everything, archives, unsearchable
+        everything, archives, problems = scan_directories(directories, os.path.basename(real))
+        for problem, code in problems:
+            if problem not in warned:  # the comparison listing meets the same ones
+                warned.add(problem)
+                log.warning("[%s] %s: %s", section, path, problem)
+            if code in (errno.EACCES, errno.EPERM):  # a missing archive_dir is not one
+                unsearchable = True
         if exclude is not None:
             everything = [a for a in everything if (a.ino, a.dev) != exclude]
             archives = [a for a in archives if (a.ino, a.dev) != exclude]
@@ -489,7 +557,6 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
             # a rotation may have landed between the listing and a candidate's open, or
             # inside the listing itself (issue #32): the names moved on; look again, once
             moved = bool(renamed)
-            unreadable.clear()
             renamed.clear()
             if scan() != listing or moved:
                 log.info("[%s] %s: the rotated copies moved while the plan was made (a "
@@ -498,13 +565,15 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
         if plan.match is None:
             for leftover in kept.values():
                 leftover.close()
-            _nothing_matched(section, path, saved, verdict, directories, renamed=bool(renamed))
+            _nothing_matched(section, path, saved, verdict, directories, renamed=bool(renamed),
+                             unreadable=denied, unsearchable=unsearchable)
             return plan
         plan.stage = "inode" if (plan.match.ino, plan.match.dev) == (saved.ino, saved.dev) \
             else "content"
         match = plan.match
         later = [a for a in archives
-                 if a.path != match.path and a.path not in unreadable and newer(a, match)
+                 if a.path != match.path and (a.path, a.ino, a.dev) not in unreadable
+                 and newer(a, match)
                  and (a.style != "other" or (match.style == "other" and match.of_log))]
         plan.chain = _oldest_first(later)
         styles = {a.style for a in [match, *plan.chain]}
@@ -551,16 +620,30 @@ def _same_first_line(archive: Archive, saved: Cursor) -> bool:
         return False
 
 
+# the likely causes, in the words docs/USAGE.md quotes (pinned by tests/test_usage_doc.py)
+CAUSES: tuple[str, ...] = ("rotate 0", "an olddir or -a elsewhere (set archive_dir)",
+                           "unsupported compression", "the archive aged out")
+CAUSE_SECOND_ROTATION = "a second rotation during this run (a copy was renamed twice)"
+CAUSE_UNREADABLE = "a rotated copy this user cannot read (named above)"
+CAUSE_UNSEARCHABLE = "a directory this user cannot list or search (named above)"
+CAUSE_NO_FIRST_LINE = "the file had no complete first line at the last run"
+
+
 def _nothing_matched(section: str, path: str, saved: Cursor, verdict: Verdict | None,
-                     directories: list[str], *, renamed: bool = False) -> None:
+                     directories: list[str], *, renamed: bool = False,
+                     unreadable: bool = False, unsearchable: bool = False) -> None:
     identity = (f"inode {saved.ino}, offset {saved.offset}, first-line hash "
                 f"{(saved.fingerprint or 'none')[:12]}")
-    causes = ["rotate 0", "an olddir or -a elsewhere (set archive_dir)",
-              "unsupported compression", "the archive aged out"]
+    causes = list(CAUSES)
+    # what the run itself met comes first, the guesses after
     if renamed:
-        causes.insert(0, "a second rotation during this run (a copy was renamed twice)")
+        causes.insert(0, CAUSE_SECOND_ROTATION)
+    if unsearchable:
+        causes.insert(0, CAUSE_UNSEARCHABLE)
+    if unreadable:
+        causes.insert(0, CAUSE_UNREADABLE)
     if saved.fingerprint is None:
-        causes.append("the file had no complete first line at the last run")
+        causes.append(CAUSE_NO_FIRST_LINE)
     where = ", ".join(directories)
     if verdict is None:
         log.info("[%s] %s: absent this run, and no rotated copy holds the saved position (%s) "
@@ -637,7 +720,7 @@ class Segment:
             self.finished = True  # nothing more will come of it this run
             log.warning("[%s] %s: rotated copy could not be read past offset %d (%s); "
                         "continuing with the next file", self.section, self.path,
-                        self.offset, exc)
+                        self.offset, _said(exc))
         finally:
             self.handle = None
 
@@ -677,7 +760,7 @@ class Segment:
                 return lines_before(handle, self.start, n, self.start_line or 0, self.path)
         except _READ_ERRORS as exc:
             log.warning("[%s] %s: context before the saved position could not be read (%s)",
-                        self.section, self.path, exc)
+                        self.section, self.path, _said(exc))
             return []
 
 

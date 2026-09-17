@@ -449,10 +449,20 @@ when the file had no complete first line at the last run, `the file had no
 complete first line at the last run` (nothing to match a copy by but its inode,
 which compression replaces). After a rotation during the run (above) the first
 cause named is `a second rotation during this run (a copy was renamed twice)`.
-A file replaced by one that is not a continuation
-of it -- a different first line, or a new inode with no archive behind it --
-says the same thing. The run does not fail on it; the live file is read from the
-beginning, so anything in it is mailed once.
+When the run itself could not read a copy or look into a directory, the first
+cause is `a rotated copy this user cannot read (named above)` or `a directory
+this user cannot list or search (named above)`, and a warning above it says
+which, once each: `rotated copy /var/log/router.log.1 could not be read
+(Permission denied); skipped`, `cannot list /var/log/old while looking for
+rotated copies (Permission denied)`, or `cannot examine 12 of the 12 entries of
+/var/log/old while looking for rotated copies (Permission denied); is the
+directory searchable?` (a directory the user can list but not enter). A copy
+less readable than its log takes a hand `chmod`, a foreign tool or an `olddir`
+the running user cannot enter: logrotate's `compress` keeps the log's mode and
+group. A file replaced by one that is not a continuation of it -- a different
+first line, or a new inode with no archive behind it -- says the same thing. The
+run does not fail on it; the live file is read from the beginning, so anything
+in it is mailed once.
 
 **Forgetting a position.** `logalert --reset-state /var/log/router.log` forgets
 every section's position in that file; `logalert --reset-state` forgets them
@@ -786,7 +796,7 @@ configured destination still gets INFO and above.
 | `scanning exceeded scan_timeout (300 s) at line N while trying regex '...'` (exit 1), or `stale lock` every run with PID N alive at 100 % CPU | A regex with a nested quantifier on a long line (`(x+)+`, `(\w+\s?)+`): `re` backtracks without bound; on Windows nothing bounds it | Simplify the regex (an anchor, a delimiter class instead of `\w+\s?`); the file is re-read next run, so `--reset-state <file>` skips the line if the log must keep it; `--check-config` names the shape |
 | A pattern or exclude with an umlaut (any non-ASCII text) never matches, or a `^` regex misses the first line, or a file is `N line(s) read, 0 matched` under an ASCII pattern, with `skipped M NUL bytes` in the log once it has more than one line | Lines are decoded as UTF-8 and nothing else: a latin-1 log, a UTF-8 BOM before line 1 (U+FEFF, which stands between `^` and the text), a UTF-16 export (every other byte is a NUL). Nothing warns at run time; a missed exclude lets the line through with U+FFFD where the byte was | Write the log as UTF-8 (`iconv -f latin1 -t utf-8`, or the exporter's encoding setting); an unanchored literal for a file with a BOM; `--check-config` names a non-ASCII pattern or exclude |
 | A pattern starting with `#` or `;` never matches | The parser drops such a continuation line as a comment | A regex with the escape: `\#`, `\;` |
-| `no rotated copy holds the saved position ...` in the log after every rotation | The archives are elsewhere, or fewer are kept than rotations happen between runs | Set `archive_dir`, or run logalert more often than the rotation |
+| `no rotated copy holds the saved position ...` in the log after every rotation | The archives are elsewhere, or fewer are kept than rotations happen between runs -- or the running user cannot read the copy or search its directory, and the causes say so | Set `archive_dir`, or run logalert more often than the rotation; grant read on the copies (a group; `olddir`'s mode) |
 | `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config (or as `--check-config` lists a glob's match), or the file was never seen; given the glob itself it says `is a glob` | Use the exact path; `--reset-state` with no path forgets everything |
 | A glob mails nothing, or a file it should read is missing from `--check-config` | The glob matches nothing where it looks (`matches nothing`), or the file is left out as a rotated copy (`left out:` -- a name ending in `.N` or a date such as `app.2024`, a `.bak` or `.gz` twin), or it is not a regular file or is a symbolic link (`passed over:`) | `logalert --check-config` names every match and everything left out; list a wanted file by name, or set `include_archives = yes` for a directory of dated live files |
 | `[section] /var/log/app/current: is a symbolic link owned by app to a file owned by root; not followed (...)` (exit 1) | A listed path is a link whose owner is neither root, nor the running user, nor the owner of the file it points to -- in a directory another user owns, what the name resolves to is that user's choice | List the file itself, or make the link root's (`chown -h root <link>`); a link another user planted is the reason the rule exists |

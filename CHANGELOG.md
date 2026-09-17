@@ -141,6 +141,13 @@ its notes.
   `--from-start` file got no entry, was first-sighted at its end next run,
   and its lines were never sent.
 
+- `[contract]` **A rotated copy the user cannot read, and a directory it
+  cannot list or search, are one warning each, and the no-copy line names the
+  permission as its first cause** (#38). The read failure was warned about
+  twice, the unsearchable directory dropped without a word, and the causes
+  line named four causes the run had just ruled out. The exit code stays 0,
+  #8's rule; a failed item instead is the owner's call, on the issue.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

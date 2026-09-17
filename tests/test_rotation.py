@@ -7,6 +7,7 @@ sandbox, CI).
 """
 
 import bz2
+import errno
 import gzip
 import logging
 import lzma
@@ -16,11 +17,12 @@ import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from logalert import rotation
-from logalert.cursor import Line, LogFile
+from logalert.cursor import BinaryStream, Line, LogFile, open_log
 from logalert.rotation import (
     Archive,
     CatchUpSource,
@@ -534,6 +536,9 @@ def test_nothing_matches_warns_once_and_reads_the_live_file_from_zero(
     assert len(warned) == 1
     assert f"inode {saved.ino}, offset {saved.offset}" in warned[0]
     assert "rotate 0" in warned[0] and str(tmp_path) in warned[0]
+    # the four guesses in their order, and nothing the run did not meet before them
+    assert ("likely causes: rotate 0, an olddir or -a elsewhere (set archive_dir), "
+            "unsupported compression, the archive aged out;") in warned[0]
     assert "first-line hash " + str(saved.fingerprint)[:12] in warned[0]
     assert "(set archive_dir)" in warned[0]
     assert warned[0].endswith("reading the live file from the beginning, and lines written "
@@ -614,11 +619,13 @@ def test_scan_ignores_directories_devices_and_unreadable_dirs(
 ) -> None:
     (tmp_path / "router.log.1").mkdir()  # a directory with an archive's name
     (tmp_path / "router.log.2").write_bytes(b"x\n")
-    caplog.set_level(logging.WARNING, logger="logalert")
-    everything, archives = scan_directories([str(tmp_path), str(tmp_path / "nope")], "router.log")
+    everything, archives, problems = scan_directories([str(tmp_path), str(tmp_path / "nope")],
+                                                    "router.log")
     assert [os.path.basename(a.path) for a in everything] == ["router.log.2"]
     assert [a.suffix for a in archives] == [".2"]
-    assert any("cannot list" in r.getMessage() for r in caplog.records)
+    assert len(problems) == 1 and problems[0][0].startswith("cannot list ")  # logged by the plan
+    assert problems[0][1] == errno.ENOENT  # the cause names a permission only
+    assert not caplog.records  # once, by the caller (issue #38), not here
 
 
 def test_plan_excludes_the_live_file_itself(tmp_path: Path) -> None:
@@ -922,7 +929,7 @@ def test_a_consumer_that_stops_mid_chain_gets_a_resumable_cursor(tmp_path: Path)
 
 def test_non_stem_gz_carries_its_compressed_flag(tmp_path: Path) -> None:
     (tmp_path / "keep.gz").write_bytes(gzip.compress(b"x\n"))
-    everything, _ = scan_directories([str(tmp_path)], "router.log")
+    everything, _, _ = scan_directories([str(tmp_path)], "router.log")
     assert [a.compressed for a in everything if a.path.endswith("keep.gz")] == [True]
 
 
@@ -1433,3 +1440,220 @@ def test_a_parked_cursor_carries_the_logs_real_path_not_the_archives(
     _, rest, _ = run(link, stopped)
     assert rest == ["live 1"]
     assert not any("the link now points at" in r.getMessage() for r in caplog.records)
+
+
+# -- a permission failure on a rotated copy (issue #38) ------------------------------------------
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_an_unreadable_copy_is_warned_about_once_in_the_errnos_words_and_named_as_the_cause(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Measured before the fix (sandbox, as a service user, a 0600 root copy): the warning
+    printed twice -- the content stage, then the inode stage -- with the path repeated in the
+    exception's text, and the causes line naming rotate 0, olddir, compression and ageing.
+    The refusal is staged through open_log here, so the shape is real on both platforms;
+    the mode-bit twin below runs where modes are."""
+    path, saved = _two_rotations(tmp_path)
+    holder = str(tmp_path / "router.log.2")
+    real_open = open_log
+
+    def refuse(target: str, *, follow_links: bool = False) -> BinaryStream:
+        if target == holder:
+            raise PermissionError(13, "Permission denied", target)
+        return real_open(target, follow_links=follow_links)
+
+    monkeypatch.setattr("logalert.rotation.open_log", refuse)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    _, lines, cursor = run(path, saved)
+    assert lines == ["live 1"]
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+    warned = _warnings(caplog)
+    assert warned == [
+        f"[{SECTION}] {path}: rotated copy {holder} could not be read (Permission denied); "
+        f"skipped",
+        warned[-1],
+    ]
+    assert ("likely causes: a rotated copy this user cannot read (named above), rotate 0"
+            in warned[-1])
+
+
+def test_a_copy_the_mode_refuses_is_one_warning_and_the_cause(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    if sys.platform == "win32":
+        pytest.skip("mode bits are fabricated on Windows; runs in the sandbox and on CI")
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 0000 file; expected in the root sandbox; CI runs it")
+    path, saved = _two_rotations(tmp_path)
+    (tmp_path / "router.log.2").chmod(0o000)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    try:
+        _, lines, _ = run(path, saved)
+    finally:
+        (tmp_path / "router.log.2").chmod(0o644)
+    assert lines == ["live 1"]
+    warned = _warnings(caplog)
+    assert len(warned) == 2 and warned[0].endswith("could not be read (Permission denied); skipped")
+    assert "(named above), rotate 0" in warned[1]
+
+
+def test_an_archive_directory_that_cannot_be_searched_is_one_warning_and_the_cause(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Measured before the fix: a 0644 olddir -- listable, its entries not stat-able -- was
+    dropped without a word, and the causes line was wrong."""
+    if sys.platform == "win32":
+        pytest.skip("mode bits are fabricated on Windows; runs in the sandbox and on CI")
+    if os.geteuid() == 0:
+        pytest.skip("root searches a 0644 directory; expected in the root sandbox; CI runs it")
+    path = tmp_path / "router.log"
+    old = tmp_path / "old"
+    old.mkdir()
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    rotate(path, old / "router.log.1.gz", compress=True)
+    (old / "router.log.2.gz").write_bytes(gzip.compress(b"older" + NLB))
+    path.write_bytes(LIVE)
+    old.chmod(0o644)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    try:
+        _, lines, _ = run(path, saved, archive_dir=old)
+    finally:
+        old.chmod(0o755)
+    assert lines == ["live 1"]
+    warned = _warnings(caplog)
+    assert warned[0] == (f"[{SECTION}] {path}: cannot examine 2 of the 2 entries of {old} while "
+                         f"looking for rotated copies (Permission denied); is the directory "
+                         f"searchable?")
+    assert len(warned) == 2  # once, although the plan lists the directories twice
+    assert ("likely causes: a directory this user cannot list or search (named above), "
+            "rotate 0" in warned[1])
+
+
+def test_an_archive_directory_that_cannot_be_listed_is_one_warning_not_two(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The comparison listing of issue #32 met the same failure and logged it again."""
+    if sys.platform == "win32":
+        pytest.skip("mode bits are fabricated on Windows; runs in the sandbox and on CI")
+    if os.geteuid() == 0:
+        pytest.skip("root lists a 0111 directory; expected in the root sandbox; CI runs it")
+    path = tmp_path / "router.log"
+    old = tmp_path / "old"
+    old.mkdir()
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    rotate(path, old / "router.log.1.gz", compress=True)
+    path.write_bytes(LIVE)
+    old.chmod(0o111)  # searchable, not listable -- for its owner too
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    try:
+        _, lines, _ = run(path, saved, archive_dir=old)
+    finally:
+        old.chmod(0o755)
+    assert lines == ["live 1"]
+    warned = _warnings(caplog)
+    assert warned[0] == (f"[{SECTION}] {path}: cannot list {old} while looking for rotated "
+                         f"copies (Permission denied)")
+    assert len(warned) == 2
+    assert "(named above), rotate 0" in warned[1]
+
+
+def test_a_corrupt_copy_is_not_named_as_a_permission(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Review of #38: a bogus .gz (or a .zst before 3.14) is unreadable too, and the first
+    version named it `a rotated copy this user cannot read` -- the wrong advice."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    path.unlink()
+    (tmp_path / "router.log.1.gz").write_bytes(b"not gzip at all" + NLB)
+    path.write_bytes(LIVE)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    _, lines, _ = run(path, saved)
+    assert lines == ["live 1"]
+    warned = _warnings(caplog)
+    assert len(warned) == 2 and "could not be read (Not a gzipped file" in warned[0]
+    assert "likely causes: rotate 0," in warned[1] and "cannot read" not in warned[1]
+
+
+def test_a_missing_archive_dir_is_one_warning_and_no_permission_cause(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Both platforms: the listing failure is logged once although the plan lists the
+    directories twice (issue #32's comparison), and a directory that is not there is not
+    `a directory this user cannot list or search`."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    path.unlink()
+    path.write_bytes(LIVE)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    _, lines, _ = run(path, saved, archive_dir=tmp_path / "nowhere")
+    assert lines == ["live 1"]
+    warned = _warnings(caplog)
+    assert len(warned) == 2
+    assert warned[0].startswith(f"[{SECTION}] {path}: cannot list {tmp_path / 'nowhere'} while "
+                                f"looking for rotated copies (")
+    assert "likely causes: rotate 0," in warned[1] and "cannot list or search" not in warned[1]
+
+
+def test_a_listing_a_permission_refuses_is_one_warning_and_the_cause_on_every_platform(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mode-bit twin runs where modes are; this one stages the refusal through
+    os.scandir so the directory path of the plan is pinned on Windows too."""
+    path = tmp_path / "router.log"
+    old = tmp_path / "old"
+    old.mkdir()
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    rotate(path, old / "router.log.1.gz", compress=True)
+    path.write_bytes(LIVE)
+    real_scandir = os.scandir
+
+    def refuse(target: Any = ".", *args: Any, **kwargs: Any) -> Any:
+        if os.path.normcase(str(target)) == os.path.normcase(str(old)):
+            raise PermissionError(13, "Permission denied", str(target))
+        return real_scandir(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", refuse)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    _, lines, _ = run(path, saved, archive_dir=old)
+    assert lines == ["live 1"]
+    warned = _warnings(caplog)
+    assert warned[0] == (f"[{SECTION}] {path}: cannot list {old} while looking for rotated "
+                         f"copies (Permission denied)")
+    assert len(warned) == 2
+    assert ("likely causes: a directory this user cannot list or search (named above), "
+            "rotate 0" in warned[1])
+
+
+def test_an_entry_whose_kind_needs_an_lstat_the_directory_refuses_counts_as_denied(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #38, reproduced on ext4 without the filetype feature: where readdir hands
+    back no d_type, DirEntry.is_symlink() lstats, an unsearchable directory refuses that
+    too, and the first version dropped the entry before counting it -- the issue's silent
+    case again. Staged through a scandir proxy so it runs on every platform."""
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "router.log.1.gz").write_bytes(gzip.compress(OLD))
+    (old / "router.log.2.gz").write_bytes(gzip.compress(OLD))
+    real_scandir = os.scandir
+
+    class Unknown:
+        """A directory entry from a listing without d_type, in an unsearchable directory."""
+
+        def __init__(self, entry: "os.DirEntry[str]") -> None:
+            self.name, self.path = entry.name, entry.path
+
+        def is_symlink(self) -> bool:
+            raise PermissionError(13, "Permission denied", self.path)
+
+    def listing(target: Any = ".", *args: Any, **kwargs: Any) -> Any:
+        entries = real_scandir(target, *args, **kwargs)
+        if os.path.normcase(str(target)) == os.path.normcase(str(old)):
+            return [Unknown(entry) for entry in entries]
+        return entries
+
+    monkeypatch.setattr(os, "scandir", listing)
+    everything, archives, problems = scan_directories([str(old)], "router.log")
+    assert everything == [] and archives == []
+    assert problems == [(f"cannot examine 2 of the 2 entries of {old} while looking for rotated "
+                         f"copies (Permission denied); is the directory searchable?", 13)]

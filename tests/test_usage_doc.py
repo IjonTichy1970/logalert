@@ -153,3 +153,26 @@ def test_the_position_section_says_a_first_sight_keeps_its_place_on_a_failed_del
     assert "file read for the first time that run is kept too" in section
     assert "position where that" + NL + "read began" in section
     assert "otherwise the end it started at" in section
+
+
+def test_the_causes_paragraph_quotes_every_cause_in_the_logs_own_words() -> None:
+    """Issue #38 (and #41 item 6): the phrases are documented "in the log's own words" and
+    were unpinned; every cause the code can name is quoted in the paragraph, wrapped or not."""
+    from logalert.rotation import (
+        CAUSE_NO_FIRST_LINE,
+        CAUSE_SECOND_ROTATION,
+        CAUSE_UNREADABLE,
+        CAUSE_UNSEARCHABLE,
+        CAUSES,
+    )
+    text = _text()
+    paragraph = text[text.index('**The "no rotated copy" warning.**'):
+                     text.index("**Forgetting a position.**")].replace(NL, " ")
+    for cause in (*CAUSES, CAUSE_SECOND_ROTATION, CAUSE_UNREADABLE, CAUSE_UNSEARCHABLE,
+                  CAUSE_NO_FIRST_LINE):
+        assert "`" + cause + "`" in paragraph, cause
+    for shape in ("could not be read (Permission denied); skipped",
+                  "cannot list /var/log/old while looking for rotated copies (Permission denied)",
+                  "entries of /var/log/old while looking for rotated copies (Permission denied); "
+                  "is the directory searchable?"):
+        assert shape in paragraph, shape
