@@ -291,5 +291,5 @@ def test_a_live_process_of_another_user_with_the_recorded_pid_is_not_the_holder(
     def eperm(pid: int, sig: int) -> None:
         raise PermissionError(1, "Operation not permitted")
 
-    monkeypatch.setattr(lock_module.os, "kill", eperm)
+    monkeypatch.setattr(os, "kill", eperm)  # the one os module, as lock.py sees it
     assert lock_module.holder_gone(4242) is True
