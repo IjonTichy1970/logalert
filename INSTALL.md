@@ -24,6 +24,61 @@ system Python, reproducible, and disposable: rebuilding it is remove + recreate
 Commands that touch `/opt` or `/usr/local` need root; they are shown with
 `sudo`.
 
+## Python on an older distribution
+
+The steps below assume a versioned `python3.11` or newer from the distribution.
+When `python3 --version` is older and the release has no such package (Debian
+11 ships 3.9 and Ubuntu 20.04 3.8; RHEL 8 and 9 carry `python3.11` and
+`python3.12` in AppStream), the first choice is still a distribution that ships
+one -- a 64-bit-capable machine on an end-of-life 32-bit install is better
+reinstalled (Debian 13 ships 3.13). This section is the bridge for a host that
+has to stay: CPython built from source into `/usr/local`, which is exactly the
+versioned binary at a fixed path that step 1 wants.
+
+**The build.** The toolchain and the four libraries logalert needs at import
+time (`libffi-dev` only takes `_ctypes` off `make`'s not-found list):
+
+```bash
+sudo apt install build-essential libssl-dev zlib1g-dev liblzma-dev libbz2-dev libffi-dev
+curl -LO https://www.python.org/ftp/python/3.12.14/Python-3.12.14.tar.xz
+tar xf Python-3.12.14.tar.xz && cd Python-3.12.14
+./configure && make -j"$(nproc)" && sudo make altinstall
+```
+
+`3.12.14` is an example: any 3.11-or-newer release. **Never `make install`** --
+it also installs an unversioned `python3` into `/usr/local/bin`, ahead of the
+distribution's on `PATH`; `altinstall` puts `python3.12` and `pip3.12` there
+and no `python3`. A source build carries `venv` and `ensurepip` itself (the
+`python3.X-venv` package of the Requirements is for a distribution
+interpreter). `--enable-optimizations` is optional and not for slow hardware:
+it builds the interpreter twice, and a cron job gains nothing from it. OpenSSL
+1.1.1 or newer is what every release from 3.11 to 3.14 requires (their
+`configure` scripts say so); Debian 10's 1.1.1n qualifies. On an end-of-life
+Debian the mirrors have moved to `archive.debian.org`: point `sources.list`
+there, then `apt -o Acquire::Check-Valid-Until=false update` (its release files
+have expired) before the `apt install`.
+
+**Why exactly those libraries.** `logalert/cursor.py` imports `bz2`, `gzip`,
+`lzma` and `zlib` at module level and `logalert/transport.py` imports `ssl`. An
+interpreter built without `bz2`, `lzma` or `ssl` does not fail at build time --
+`make` lists the module under "The necessary bits to build these optional
+modules were not found" and finishes, and even the wheel installs -- but the
+command fails at startup, before any option is read: `ModuleNotFoundError: No
+module named '_bz2'` (or `_lzma`, `_ssl`). Without `zlib` the build itself
+stops, at `make altinstall`'s pip bootstrap (`zlib not available`), and so
+would step 1's `venv`. `readline`, `ctypes` and `sqlite3` are not needed. The
+check that proves the build, before any venv:
+
+```bash
+/usr/local/bin/python3.12 -c "import bz2, gzip, lzma, ssl, zlib; print('ok')"
+```
+
+**Then the steps as written**, from step 1, with `python3.12` -- step 4's second
+line shows `/usr/local/bin/python3.12` for a build of your own. `apt` will not
+update that interpreter: for a 3.12.x security release, build it again and
+`make altinstall` over the old one (the venv keeps running: the minor version
+is the same).
+
 ## Install
 
 ### 1. Create the venv with a versioned interpreter
@@ -116,7 +171,7 @@ of `PATH`.
 
 ```bash
 readlink /opt/logalert-venv/bin/python     # → python3.12 — a versioned name; "python3" means the alias trap
-readlink /opt/logalert-venv/bin/python3.12 # → /usr/bin/python3.12 (FreeBSD: /usr/local/bin/python3.12)
+readlink /opt/logalert-venv/bin/python3.12 # → /usr/bin/python3.12 (FreeBSD, or a build of your own: /usr/local/bin/python3.12)
 grep ^command /opt/logalert-venv/pyvenv.cfg # → the venv command that made it — versioned here too
 head -1 /opt/logalert-venv/bin/logalert    # → starts with #!/opt/logalert-venv/bin/
 sudo which logalert                        # → /usr/local/bin/logalert
@@ -335,6 +390,19 @@ Two traps:
   bootstraps a fresh `lib/python3.Y/site-packages` for the new version (holding
   only pip) but leaves the old tree — and your packages — behind, so the venv
   stays broken behind a plausible-looking repair.
+
+## Moving to a new host
+
+Carry `/etc/logalert.conf` and the crontab line or the unit and timer, and
+create the service user again (step 5). Do **not** carry
+`/var/lib/logalert/state.json`: the state identifies a file by inode number and
+first line (a device id alone is never trusted -- a reboot can renumber them),
+so on a new filesystem the inode numbers are another filesystem's, nothing
+matches, no rotated copy holds the saved position, and every live file is read
+from the beginning -- one mail per watch with every old match counted in its
+subject and the first `max_lines` of them shown (the documented answer for a
+file whose copies are gone). An empty state directory starts at the end of
+each file instead, with one `first sight` line per file, by design.
 
 ## Uninstall
 

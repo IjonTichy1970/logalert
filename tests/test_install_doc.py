@@ -148,6 +148,33 @@ def test_the_service_users_files_are_documented_with_the_programs_own_words() ->
         assert "chown logalert:logalert" in lock and "every position kept" in lock, name
 
 
+def test_the_import_check_names_the_modules_the_package_imports_at_module_level() -> None:
+    """Issue #23: an interpreter built without one of these libraries runs `make` to the
+    end and fails at logalert's startup (measured: `No module named '_bz2'`). The
+    documented check lists exactly the stdlib compression and TLS modules the package
+    imports at module level, and the apt line names the -dev package each one needs."""
+    packages = {"bz2": "libbz2-dev", "gzip": "zlib1g-dev", "lzma": "liblzma-dev",
+                "zlib": "zlib1g-dev", "ssl": "libssl-dev",
+                "compression.zstd": "libzstd-dev"}  # lazy today; module-level one day
+    imported: set[str] = set()
+    for path in (REPO_ROOT / "logalert").glob("*.py"):
+        names = re.findall(r"^(?:import|from) ([\w.]+)", path.read_text(encoding="utf-8"), re.M)
+        imported |= {name for name in names if name in packages}
+    assert imported  # the package does import them; a lazy import would leave this empty
+    install = _text("INSTALL.md")
+    section = install[install.index("## Python on an older distribution"):
+                      install.index("## Install")]
+    check = re.search(r'-c "import ([a-z0-9, ]+); print', section)
+    assert check is not None, "the import check moved"
+    assert {m.strip() for m in check.group(1).split(",")} == imported
+    apt = next(line for line in section.splitlines() if line.startswith("sudo apt install"))
+    for module in imported:
+        assert packages[module] in apt, (module, packages[module])
+    assert "make altinstall" in section and "make install`" in section  # the never
+    moving = install[install.index("## Moving to a new host"):install.index("## Uninstall")]
+    assert "state.json" in moving and "first sight" in moving
+
+
 def test_the_classifiers_claim_linux_and_nothing_else() -> None:
     with open(REPO_ROOT / "pyproject.toml", "rb") as handle:
         classifiers = tomllib.load(handle)["project"]["classifiers"]

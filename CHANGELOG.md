@@ -107,6 +107,13 @@ its notes.
   user, not merely writable** (#37). Three troubleshooting rows quote the
   messages and give the remedies, including a root-owned lock.
 
+- `[contract]` **`INSTALL.md` gains "Python on an older distribution" -- a
+  versioned CPython built from source with `make altinstall` -- and "Moving to
+  a new host"** (#23). The four libraries the build needs at import time are
+  named with the check that proves them; a test pins that check to the
+  package's module-level imports. Rehearsed in the sandbox, both with and
+  without the libraries.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty
