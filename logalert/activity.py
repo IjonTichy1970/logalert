@@ -16,7 +16,23 @@ the records themselves are emitted by the other modules on the ``logalert.*`` lo
     is ``logalert[<pid>]: `` so journald records ``SYSLOG_IDENTIFIER=logalert`` and
     ``journalctl -t logalert`` finds the run (without it the journal shows ``_COMM=python`` and
     no identifier); the facility is user. On Windows there is no syslog at all
-    (``socket.AF_UNIX`` is absent; the constructor raises ``AttributeError``).
+    (``socket.AF_UNIX`` is absent; the constructor raises ``AttributeError``). The socket
+    carries a SEND TIMEOUT (issue #35): a socket nobody drains -- journald stopped or wedged
+    while systemd holds its socket open, the case between "socket present" and "connection
+    refused" -- blocked ``send`` for good after 278 records (the sender's buffer), inside the
+    first record and before the lock. The timeout lives in ``_connect_unixsocket``, the
+    stdlib's reconnect seam (3.11-3.14: ``emit`` closes the socket and reconnects through it
+    after a failed send): measured, a timeout set once after construction is lost at that
+    reconnect and the retry blocks. With it, the daemon's queue already full (the standing
+    fault), the retry times out too and the fallback below takes over: two timeouts, then
+    stderr. A run that fills the queue itself crawls first -- a timed send polls, and
+    Linux reports the socket writable only below a quarter of its send buffer, about 70
+    records, then a stall and a fresh socket (review) -- which a run of a dozen records
+    never reaches. The probe's stream ``connect`` carries the same timeout: a listener
+    that never accepts blocked it once its backlog was full (review), and the probe's
+    reason is the attempt of the socket's own type, never the other's ``EPROTOTYPE``.
+    Python 3.14's ``SysLogHandler(timeout=)`` applies to INET sockets only, not to
+    ``/dev/log``.
   * ``file:`` is opened at setup, never lazily: measured, ``FileHandler(delay=True)`` raises the
     open failure out of ``logger.info()`` into the caller, which would abort a run at its first
     record. It is opened by us, like the lock: ``O_NOFOLLOW`` (a symlink planted at the path by
@@ -70,6 +86,8 @@ if sys.platform != "win32":
 
 LOGGER = "logalert"
 SYSLOG_SOCKETS = ("/dev/log", "/var/run/log", "/var/run/syslog")
+SYSLOG_SEND_TIMEOUT = 2.0  # seconds per send on the Unix socket (issue #35); a healthy daemon
+#                            drains a local socket in microseconds
 IDENT = f"logalert[{os.getpid()}]: "
 
 _LEVEL_WORDS = {logging.DEBUG: "debug: ", logging.INFO: "", logging.WARNING: "warning: ",
@@ -145,7 +163,22 @@ class _Loud(logging.Handler):
 
 
 class _Syslog(_Loud, logging.handlers.SysLogHandler):
-    pass
+    def _connect_unixsocket(self, address: str) -> None:
+        """The stdlib's reconnect seam with the send timeout on the socket it makes (issue
+        #35; the module docstring). The socket type is the probe's (datagram when a caller
+        names none), so there is no datagram-to-stream fallback here; typeshed declares
+        neither this method nor the ``socket`` attribute, hence no ``super()`` call."""
+        if sys.platform == "win32":  # never reached: no syslog there; mypy's branch
+            raise OSError(errno.ENOTSUP, "no AF_UNIX on this platform")
+        else:
+            sock = socket.socket(socket.AF_UNIX, self.socktype or socket.SOCK_DGRAM)
+            sock.settimeout(SYSLOG_SEND_TIMEOUT)
+            self.socket = sock  # the stdlib's order: after a failed connect the closed socket
+            try:  # stays, and emit's send takes the reconnect path with the connect's error
+                sock.connect(address)
+            except OSError:
+                sock.close()
+                raise
 
 
 class _File(_Loud, logging.FileHandler):
@@ -210,16 +243,21 @@ def probe_syslog() -> SyslogProbe:
             except OSError as exc:
                 rejected.append(f"{path}: {(exc.strerror or str(exc)).lower()}")
                 continue
-            refused = ""
+            reasons: list[tuple[int | None, str]] = []
             for socktype in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
                 try:
                     with socket.socket(socket.AF_UNIX, socktype) as probe:
+                        # bounded (issue #35): a stream listener that never accepts
+                        # blocks a plain connect once its backlog is full
+                        probe.settimeout(SYSLOG_SEND_TIMEOUT)
                         probe.connect(path)
                 except OSError as exc:
-                    refused = refused or (exc.strerror or str(exc)).lower()
+                    reasons.append((exc.errno, (exc.strerror or str(exc)).lower()))
                     continue
                 return SyslogProbe((path, socktype), tuple(rejected))
-            rejected.append(f"{path}: {refused}")
+            # the attempt of the socket's own type says why; the other's is EPROTOTYPE
+            fitting = [why for code, why in reasons if code != errno.EPROTOTYPE]
+            rejected.append(f"{path}: {(fitting or [why for _, why in reasons])[0]}")
         return SyslogProbe(None, tuple(rejected))
 
 

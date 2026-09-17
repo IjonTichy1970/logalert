@@ -7,12 +7,15 @@ for /dev/log; skipped on Windows, run in the sandbox and on CI). The journal its
 """
 
 import errno
+import inspect
 import logging
 import logging.handlers
 import os
 import re
+import signal
 import socket
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -710,3 +713,168 @@ def test_reset_state_records_the_escape_hatch(
     last = site.activity()[-1]
     assert last.startswith(f"warning: state file {site.state_file.as_posix()}: not valid JSON")
     assert last.endswith("; replaced it with an empty state (--reset-state)")
+
+
+# -- a syslog socket nobody drains (issue #35) --------------------------------------------------
+
+
+class _Blocked(BaseException):
+    """The test's own bound: a run that blocks in a send is a failure, never a hung suite."""
+
+
+def _fill(path: Path) -> list[socket.socket]:
+    """Throwaway senders fill the daemon's queue until a fresh socket cannot send at all --
+    the state a reconnect's fresh socket meets (measured: 278 datagrams fill one sender's
+    buffer, 512 fill the queue on Ubuntu 24.04; the queued datagrams outlive their
+    senders, which are kept only to be closed at the end)."""
+    if sys.platform == "win32":
+        pytest.skip("no AF_UNIX on Windows; runs in the sandbox and on CI")  # mypy's narrowing
+    senders: list[socket.socket] = []
+    for _ in range(128):
+        sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sender.setblocking(False)
+        sender.connect(str(path))
+        senders.append(sender)
+        sent = 0
+        try:
+            while sent < 4096:
+                sender.send(b"<14>filler")
+                sent += 1
+        except BlockingIOError:
+            if sent == 0:
+                return senders
+    pytest.fail("could not fill the socket's queue: no per-socket limit on this kernel?")
+
+
+def test_a_syslog_socket_nobody_drains_costs_two_timeouts_then_the_fallback(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Measured before the fix (sandbox): a plain SysLogHandler blocked inside logger.info()
+    for good after 278 records, and a timeout set once after construction was lost at the
+    first reconnect (blocked after 0 records). Here the queue is full for a fresh socket
+    too, so the retry times out as well and the run must fall back; the mutation that puts
+    the timeout back on the constructed socket only reddens through the bound."""
+    if sys.platform == "win32":
+        pytest.skip("no AF_UNIX on Windows; runs in the sandbox and on CI")
+    else:
+        site.write_config(settings="scan_timeout = 0" + NL)  # its timer would cancel the bound
+        path = site.root / "log"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        server.bind(str(path))  # never read
+        senders = _fill(path)
+        monkeypatch.setattr(activity, "SYSLOG_SOCKETS", (str(path),))
+        monkeypatch.setattr(activity, "SYSLOG_SEND_TIMEOUT", 0.2)
+
+        def bail(signum: int, frame: object) -> None:
+            raise _Blocked()
+
+        previous = signal.signal(signal.SIGALRM, bail)
+        signal.setitimer(signal.ITIMER_REAL, 15)
+        try:
+            started = time.monotonic()
+            assert site.run("--log", "syslog") == 0
+            elapsed = time.monotonic() - started
+        except _Blocked:
+            pytest.fail(f"the run blocked inside a send for {time.monotonic() - started:.0f} s: "
+                        f"the timeout did not survive the reconnect")
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+            for sender in senders:
+                sender.close()
+            server.close()
+        lines = capsys.readouterr().err.splitlines()
+        assert lines[0] == (f"logalert: warning: the activity log at syslog ({path}) failed "
+                            f"(TimeoutError: timed out); logging to stderr from here on")
+        assert lines[1].startswith("logalert: start: ")  # the record that failed, forwarded
+        assert lines[-1] == "logalert: end: exit 0"
+        assert 0.4 <= elapsed < 3, elapsed  # two timeouts of 0.2 s: not a hang, not 2 s ones
+
+
+@pytest.mark.parametrize("kind", ["SOCK_DGRAM", "SOCK_STREAM"])
+def test_the_send_timeout_is_on_the_constructed_socket_and_on_the_reconnected_one(
+        tmp_path: Path, kind: str) -> None:
+    if sys.platform == "win32":
+        pytest.skip("no AF_UNIX on Windows; runs in the sandbox and on CI")
+    else:
+        path = tmp_path / "log"
+        socktype = getattr(socket, kind)
+        server = socket.socket(socket.AF_UNIX, socktype)
+        server.bind(str(path))
+        if socktype == socket.SOCK_STREAM:
+            server.listen(4)  # two connects, never accepted: they fit the backlog
+        try:
+            handler = activity._Syslog(address=str(path), socktype=socktype)
+            first = handler.socket
+            assert first.gettimeout() == activity.SYSLOG_SEND_TIMEOUT
+            first.close()
+            handler._connect_unixsocket(str(path))  # what emit does after a failed send
+            assert handler.socket is not first
+            assert handler.socket.gettimeout() == activity.SYSLOG_SEND_TIMEOUT
+            handler.close()
+        finally:
+            server.close()
+
+
+def test_the_stdlib_reconnects_through_the_seam_the_timeout_rides_on() -> None:
+    """A Python that changes SysLogHandler.emit's reconnect must redden here, not hang a
+    run; 3.11 through 3.14 reconnect through the private method the override replaces."""
+    assert hasattr(logging.handlers.SysLogHandler, "_connect_unixsocket")
+    source = inspect.getsource(logging.handlers.SysLogHandler.emit)
+    assert "self._connect_unixsocket(self.address)" in source
+    source = inspect.getsource(logging.handlers.SysLogHandler.createSocket)
+    assert "self._connect_unixsocket(address)" in source  # the construction path too
+
+
+def test_a_stream_listener_that_never_accepts_is_rejected_at_once_not_waited_for(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review of #35: the probe's stream connect had no timeout, and a listener whose
+    backlog is full (a wedged stream syslog daemon; every run's probe leaves a connection
+    in it) blocked the probe before the lock. Bounded, the rejection names the stream
+    attempt's reason, not the datagram attempt's EPROTOTYPE."""
+    if sys.platform == "win32":
+        pytest.skip("no AF_UNIX on Windows; runs in the sandbox and on CI")
+    else:
+        path = site.root / "slog"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(1)
+        pending: list[socket.socket] = []
+        for _ in range(16):  # connections never accepted, until the backlog refuses one
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.setblocking(False)
+            try:
+                client.connect(str(path))
+            except BlockingIOError:
+                client.close()
+                break
+            pending.append(client)
+        else:
+            pytest.fail("could not fill the listener's backlog")
+        site.write_config(settings="scan_timeout = 0" + NL)  # its timer would cancel the bound
+        monkeypatch.setattr(activity, "SYSLOG_SOCKETS", (str(path),))
+        monkeypatch.setattr(activity, "SYSLOG_SEND_TIMEOUT", 0.2)
+
+        def bail(signum: int, frame: object) -> None:
+            raise _Blocked()
+
+        previous = signal.signal(signal.SIGALRM, bail)
+        signal.setitimer(signal.ITIMER_REAL, 15)
+        try:
+            started = time.monotonic()
+            assert site.run("--log", "syslog") == 0
+            elapsed = time.monotonic() - started
+            lines = capsys.readouterr().err.splitlines()
+            assert lines[0] == (f"logalert: warning: no usable syslog socket ({path}: resource "
+                                f"temporarily unavailable); logging to stderr")
+            assert lines[-1] == "logalert: end: exit 0"
+            assert elapsed < 3, elapsed
+            assert site.run("--check-config", "--log", "syslog") == 0  # describe() probes too
+            assert "resource temporarily unavailable" in capsys.readouterr().out
+        except _Blocked:
+            pytest.fail("the probe blocked in the stream connect: the backlog was full")
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+            for client in pending:
+                client.close()
+            server.close()

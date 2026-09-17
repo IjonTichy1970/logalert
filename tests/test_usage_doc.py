@@ -112,3 +112,17 @@ def test_the_mail_section_says_smtp_auth_is_unsupported_and_names_the_way_throug
     assert "not delivered via smtp" in row  # __main__'s prefix for --test-mail
     assert "not delivered via " in (package / "__main__.py").read_text(encoding="utf-8")
     assert "SMTPSenderRefused" in row and hasattr(smtplib, "SMTPSenderRefused")
+
+
+def test_the_logging_section_names_the_send_timeout_and_the_table_has_the_row() -> None:
+    """Issue #35: the document promises the number the code carries (a constant of None
+    or 0 would restore the hang or a spurious fallback and pass the socket tests, which
+    compare against the same constant)."""
+    from logalert.activity import SYSLOG_SEND_TIMEOUT
+    text = _text()
+    logging_section = text[text.index("## Logging"):text.index("## Troubleshooting")]
+    assert f"is given {SYSLOG_SEND_TIMEOUT:g} s per send, twice" in logging_section
+    assert "`TimeoutError: timed out`" in logging_section
+    table = text[text.index("## Troubleshooting"):]
+    row = next(r for r in table.splitlines() if "TimeoutError: timed out" in r)
+    assert f"waited {SYSLOG_SEND_TIMEOUT:g} s twice" in row and "systemd-journald" in row

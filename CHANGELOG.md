@@ -121,6 +121,13 @@ its notes.
   read and a temp file stayed beside the state. A signalled run leaves one
   WARNING record and no end line.
 
+- `[contract]` **A syslog socket nobody drains costs a run two 2 s waits and
+  the loud stderr fallback, not a hang before the lock** (#35). journald
+  stopped or wedged under its socket unit blocked the first record for good;
+  the timeout lives in the stdlib's reconnect seam, where one set after
+  construction was lost. The probe's stream `connect` is bounded the same way,
+  and Python 3.14's `SysLogHandler(timeout=)` covers INET sockets only.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty
