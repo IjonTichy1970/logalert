@@ -218,19 +218,28 @@ def _run(argv: list[str], data: bytes, timeout: float) -> tuple[int, bytes | Non
         try:
             _, stderr = proc.communicate(data, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            if sys.platform == "win32":
-                proc.kill()
-            else:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:  # the group is already gone
-                    pass
+            _kill(proc)
             _, exc.stderr = proc.communicate()  # reap, close the pipes, keep what it said
             raise
-        except BaseException:
-            proc.kill()
+        except BaseException:  # Ctrl-C, SIGTERM (issue #33)
+            _kill(proc)
             raise
     return proc.returncode, stderr
+
+
+def _kill(proc: "subprocess.Popen[bytes]") -> None:
+    """The child and, on POSIX, its whole process group: a forking wrapper's grandchild
+    would otherwise survive (the timeout path always did this; the interrupt path called
+    ``proc.kill()``, issue #33)."""
+    if sys.platform == "win32":
+        proc.kill()
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:  # the group is already gone
+            pass
+        except PermissionError:  # no member is ours to signal (a wrapper that changed its
+            pass  # uids): the wait that follows reaps what exits on its own
 
 
 def _first_line(output: bytes | None) -> str:

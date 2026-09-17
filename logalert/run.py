@@ -65,7 +65,16 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     hundreds of identical lines on every run), per section the delivery (``transport`` logs
     it) or the failure with the transport's answer and the Message-ID, every failed item
     once at ERROR where it is collected, every expired entry, and the exit code at the end
-    -- on every exit the run returns (a killed run, Ctrl-C included, leaves no end line).
+    -- on every exit the run returns. A signalled run leaves no end line: Ctrl-C (exit 130)
+    and SIGTERM (exit 143, issue #33: a kill, a timeout wrapper, systemd's
+    ``TimeoutStartSec=``) each leave one WARNING instead, and reach every cleanup the
+    run has -- the sendmail child killed with its process group, a temp state file
+    unlinked, the lock released -- because ``terminating`` turns the signal into a
+    ``BaseException`` (``Terminated``) the way ``KeyboardInterrupt`` is one; the default
+    disposition bypassed all of it (measured: an orphaned sendmail child read on and
+    exited on its own -- a real MTA queues what it read -- and a temp file was left
+    beside the state). The handler is installed after the config and the log are set
+    up; a signal before that is the default disposition, with nothing held yet.
 """
 
 import logging
@@ -109,6 +118,47 @@ class ScanTimeout(BaseException):
     swallowed by ``logging.Handler.emit`` (review) -- the bound gone and the activity log
     declared dead. Nothing in the package catches ``BaseException`` except to clean up and
     re-raise."""
+
+
+class Terminated(BaseException):
+    """SIGTERM arrived. A ``BaseException`` like ``ScanTimeout``, for the same reason, raised
+    by the handler ``terminating`` installs; it lands in every existing cleanup and ``main``
+    turns it into one stderr line and exit 143 (issue #33)."""
+
+
+@contextmanager
+def terminating() -> Iterator[None]:
+    """``Terminated`` out of whatever the main thread is doing when SIGTERM arrives -- main
+    thread only (a handler is installable nowhere else), the previous disposition restored
+    on the way out (tests call ``main()`` in-process). Installed on Windows too, where
+    ``signal.signal`` accepts SIGTERM and the system never delivers it."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def arrived(signum: int, frame: object) -> None:
+        raise Terminated()
+
+    previous = signal.getsignal(signal.SIGTERM)
+    if previous is None:  # installed from C: not restorable, and never the CLI's case
+        previous = signal.SIG_DFL
+    try:
+        signal.signal(signal.SIGTERM, arrived)  # inside the try: the signal can land at
+        yield                                   # the very call that installs the handler
+    finally:
+        # a signal that lands just before the restore is delivered INSIDE signal.signal
+        # (CPython runs the pending handlers before changing anything): retry until the
+        # previous disposition is back, then let that late one out (review: measured,
+        # 99 of 145 handlers leaked past the restore under a SIGTERM hammer without this)
+        late: Terminated | None = None
+        while True:
+            try:
+                signal.signal(signal.SIGTERM, previous)
+                break
+            except Terminated as exc:
+                late = exc
+        if late is not None:
+            raise late
 
 
 @contextmanager

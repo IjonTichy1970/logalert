@@ -334,8 +334,10 @@ def check_state_dir(state_file: str) -> None:
         raise StateError(f"state directory {directory} is not writable ({exc.strerror}) -- "
                          f"nothing was sent, because a run that cannot save its position "
                          f"would send everything again next time") from exc
-    os.close(fd)
-    os.unlink(temp)
+    try:
+        os.close(fd)
+    finally:
+        os.unlink(temp)  # a signal between the two must not leave the probe (issue #33)
     # lstat, never stat (issue #39): a link at state_file was silently replaced by a regular
     # file on the first save (os.replace replaces the link itself), and the owner rule below
     # would have judged the link's target, which is whatever the link's planter chose

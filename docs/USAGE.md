@@ -79,7 +79,8 @@ example and exits before the run-only flags are examined.
 | 0 | The run completed; every section that had something to send was sent. | Nothing, on either stream. A match is the normal outcome, not an event. |
 | 1 | Something needs attention: a file that could not be read, a delivery that failed, a recipient the server refused, a state file that could not be saved, a stale lock, a corrupt state file. | Exactly one line on stderr naming every failed item, and the detail in the activity log. |
 | 2 | A usage or configuration error; nothing ran. | argparse's own message, or `logalert: <what is wrong>`. |
-| 130 | Interrupted (Ctrl-C). The lock is released. | `logalert: interrupted`. |
+| 130 | Interrupted (Ctrl-C). The lock is released, a sendmail child is killed with its process group, no temp file is left. | `logalert: interrupted`. |
+| 143 | Terminated (SIGTERM: `kill`, a `timeout` wrapper's expiry -- `timeout` itself then reports 124 unless given `--preserve-status` -- or systemd's `TimeoutStartSec=`). The same cleanup as 130; a message the sendmail child had read entirely may still be queued. | `logalert: terminated`. |
 
 The one line of exit 1 has a fixed shape:
 
@@ -697,9 +698,11 @@ DEBUG record too, and each glob gets one INFO summary per run (`<glob>: N
 file(s), M with new lines, K matched`), so a daily directory does not write a
 line per file per run -- per section the message sent with its recipients,
 size and `Message-ID` -- or the failure with the transport's answer -- every
-failed item at ERROR, every expired position, and the exit code at the end. The
-lines are one line each, the level shown as a word for `warning:`, `error:` and
-`debug:` (INFO carries none).
+failed item at ERROR, every expired position, and the exit code at the end. A
+run ended by a signal has no end line: it records one warning instead,
+`interrupted (SIGINT); no lock is held, the state is as last saved` or
+`terminated (SIGTERM); ...`. The lines are one line each, the level shown as a
+word for `warning:`, `error:` and `debug:` (INFO carries none).
 
 **Where.** With the default `log = syslog`, on a systemd host:
 

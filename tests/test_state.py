@@ -345,7 +345,8 @@ def test_write_fsyncs_the_temp_file_before_replacing(
 def test_write_cleans_up_the_temp_file_on_an_interrupt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # cron's SIGTERM arrives as an exception too; the temp must not litter the state dir
+    # SIGTERM arrives as an exception too since issue #33 (the handler raises one); the temp
+    # must not litter the state dir
     def interrupted(src: str, dst: str) -> None:
         raise KeyboardInterrupt
 

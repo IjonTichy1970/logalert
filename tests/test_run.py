@@ -1,9 +1,10 @@
 """The run (issue #12): end to end through ``main()`` over fixture logs, the fake sendmail
 behind ``sendmail_path``, the exit codes, the one stderr line, dry-run, the lock, expiry.
 
-Real on both platforms; the three POSIX-only tests (a 0500 state directory, a planted lock
+Real on both platforms; the POSIX-only tests (a 0500 state directory, a planted lock
 symlink, another user's state directory -- the first and last also skipped in the root
-sandbox) and the one Windows-only test (a read-only state file) say so.
+sandbox -- the scan-timeout test of issue #28 and the SIGTERM tests of issue #33) and the
+one Windows-only test (a read-only state file) say so.
 """
 
 import errno
@@ -11,8 +12,10 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -23,6 +26,7 @@ import pytest
 from esmtp_stub import StubConfig, run_stub
 from fake_sendmail import install
 
+import logalert.__main__
 import logalert.cursor
 import logalert.run
 from logalert.__main__ import main
@@ -635,6 +639,13 @@ def test_dry_run_words_the_expiry_as_conditional(
     assert gone in site.state()["router-disk"]
 
 
+def _records_of_the_last_run(site: Site) -> list[str]:
+    """The activity log from the last start line on: what one run recorded."""
+    records = site.activity()
+    starts = [i for i, r in enumerate(records) if r.startswith("start: ")]
+    return records[starts[-1]:]
+
+
 def test_an_interrupt_is_one_line_and_exit_130_with_the_lock_released(
         site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     site.prime()
@@ -649,6 +660,10 @@ def test_an_interrupt_is_one_line_and_exit_130_with_the_lock_released(
     probe = RunLock(str(site.state_dir / "lock"), 3600)
     probe.acquire()  # LockBusy here would mean the interrupted run kept it
     probe.release()
+    # the one record a signalled run leaves (issue #33), and no end line after it
+    records = _records_of_the_last_run(site)
+    assert [r for r in records if r.startswith(("warning: interrupted", "end:"))] == [
+        "warning: interrupted (SIGINT); no lock is held, the state is as last saved"]
 
 
 def test_debug_output_is_one_clean_line_per_record_and_leaves_no_handler(
@@ -1125,3 +1140,227 @@ def test_a_regex_that_hangs_is_a_failed_item_within_scan_timeout_and_the_cursor_
         # scan_bound is a no-op for it -- pinned on the context manager directly
         with logalert.run.scan_bound(0):
             assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+# -- SIGTERM (issue #33) ----------------------------------------------------------------------
+
+
+def _sigterm_self(*args: Any, **kwargs: Any) -> Any:
+    """A stand-in that sends the process SIGTERM; the handler raises before it returns (and
+    without the handler the signal ends the test process itself -- the mutation is loud)."""
+    os.kill(os.getpid(), signal.SIGTERM)
+    time.sleep(5)  # never reached: the signal lands at the next bytecode boundary
+    raise AssertionError("the SIGTERM handler did not fire")
+
+
+def _sigterm_once(real: Any) -> Any:
+    """A stand-in that sends SIGTERM the FIRST time and is the real thing after (the WARNING
+    main logs on the way out must not fire it again)."""
+    fired: list[bool] = []
+
+    def stand_in(*args: Any, **kwargs: Any) -> Any:
+        if fired:
+            return real(*args, **kwargs)
+        fired.append(True)
+        return _sigterm_self()
+
+    return stand_in
+
+
+def test_a_sigterm_during_the_delivery_is_one_line_exit_143_the_lock_free_and_one_record(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Measured before the fix (sandbox): exit status -15, nothing on stderr, no record, the
+    sendmail child left to finish on its own, a temp state file left behind."""
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    before = site.offset("router-disk", site.router)
+    site.append(site.router, "disk failure now")
+    monkeypatch.setattr(logalert.run, "deliver", _sigterm_self)
+    previous = signal.getsignal(signal.SIGTERM)
+    assert site.run() == 143
+    assert capsys.readouterr() == ("", "logalert: terminated" + NL)
+    probe = RunLock(str(site.state_dir / "lock"), 3600)
+    probe.acquire()  # LockBusy here would mean the terminated run kept it
+    probe.release()
+    records = _records_of_the_last_run(site)
+    assert [r for r in records if r.startswith(("warning: terminated", "end:"))] == [
+        "warning: terminated (SIGTERM); no lock is held, the state is as last saved"]
+    assert signal.getsignal(signal.SIGTERM) == previous  # restored on the way out
+    assert site.offset("router-disk", site.router) == before  # nothing saved past the mail
+
+
+def test_a_sigterm_inside_the_save_unlinks_the_temp_file(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    before = site.state_file.read_bytes()
+    site.append(site.router, "disk failure now")
+    monkeypatch.setattr(os, "fsync", _sigterm_self)  # what write_atomically calls
+    assert site.run() == 143
+    assert capsys.readouterr().err == "logalert: terminated" + NL
+    assert sorted(p.name for p in site.state_dir.iterdir()) == ["lock", "state.json"]
+    assert site.state_file.read_bytes() == before  # the old file, whole
+    assert len(site.calls()) == 1  # the mail went out; the save was the step that died
+
+
+def _gone(pid: int, within: float) -> bool:
+    """Whether the process is gone (or a zombie awaiting its reaper) within the bound."""
+    deadline = time.monotonic() + within
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as fh:
+                if fh.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    return True  # awaiting its reaper: as good as gone
+        except OSError:
+            pass  # no procfs: kill(0) decides
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+
+
+def test_a_sigterm_kills_the_sendmail_child_and_a_wrappers_grandchild(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI as a subprocess, the fake sleeping after it read the message: SIGTERM to
+    logalert kills the child -- and, behind a shell wrapper without exec, the grandchild,
+    which proc.kill() alone left alive (the interrupt path's gap the issue names)."""
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    wrapper = site.root / "wrapper.sh"
+    wrapper.write_text("#!/bin/sh" + NL + f'"{site.binary.as_posix()}" "$@"' + NL,
+                       encoding="ascii", newline=NL)  # no exec: the fake is a grandchild
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("LOGALERT_FAKE_SLEEP", "30")
+    pid_file = site.fake_dir / "pid.txt"
+    for binary in (site.binary, wrapper):
+        site.write_config(sendmail=binary.as_posix())
+        site.append(site.router, "disk failure now")
+        if pid_file.exists():
+            pid_file.unlink()
+        proc = subprocess.Popen([sys.executable, "-m", "logalert", "-f", str(site.conf)],
+                                stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 20
+            while not (pid_file.exists() and pid_file.read_text(encoding="ascii").strip()):
+                assert time.monotonic() < deadline, "the fake never started"
+                time.sleep(0.05)
+            child = int(pid_file.read_text(encoding="ascii").strip())
+            parent = _parent_of(child)
+            if parent is not None:  # procfs: the wrapper really is in between
+                assert (parent == proc.pid) == (binary is site.binary), binary
+            proc.send_signal(signal.SIGTERM)
+            _, err = proc.communicate(timeout=20)
+        finally:
+            proc.kill()  # a red run must not leave a sleeper behind
+            proc.wait()
+        assert (proc.returncode, err) == (143, b"logalert: terminated" + NL.encode()), binary
+        assert _gone(child, within=5), f"{binary.name}: the fake (PID {child}) survived"
+    assert site.offset("router-disk", site.router) < site.router.stat().st_size  # re-read
+
+
+def _parent_of(pid: int) -> int | None:
+    """The parent PID from procfs, or None where there is none (a BSD)."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[1])
+    except OSError:
+        return None
+
+
+def test_terminating_installs_in_the_main_thread_only_and_restores() -> None:
+    # the base class is the whole design: an Exception raised inside a log write would be
+    # swallowed by Handler.emit, the log declared dead and the run carried on to the mail
+    assert issubclass(logalert.run.Terminated, BaseException)
+    assert not issubclass(logalert.run.Terminated, Exception)
+    previous = signal.getsignal(signal.SIGTERM)
+    with logalert.run.terminating():
+        assert signal.getsignal(signal.SIGTERM) is not previous
+    assert signal.getsignal(signal.SIGTERM) == previous
+    seen: list[object] = []
+
+    def elsewhere() -> None:
+        with logalert.run.terminating():
+            seen.append(signal.getsignal(signal.SIGTERM))
+
+    thread = threading.Thread(target=elsewhere)
+    thread.start()
+    thread.join()
+    assert seen == [previous]  # nothing installed off the main thread
+
+
+def test_a_sigterm_inside_a_log_write_still_ends_the_run(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The behavioural twin of the base-class pin: the signal lands inside the file
+    handler's flush. An Exception there is swallowed by Handler.emit -- the log declared
+    dead, the run carrying on to the mail and exit 0; a BaseException ends the run."""
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    site.append(site.router, "disk failure now")
+    monkeypatch.setattr(logging.StreamHandler, "flush",
+                        _sigterm_once(logging.StreamHandler.flush))
+    assert site.run() == 143
+    assert capsys.readouterr().err.endswith("logalert: terminated" + NL)
+    assert site.calls() == []
+
+
+def test_reset_state_and_test_mail_are_under_the_handler_too(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Every mode dispatches under it: a --reset-state save and a --test-mail child have the
+    run's windows (a handler around the run alone ends the test process here)."""
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    before = site.state_file.read_bytes()
+    monkeypatch.setattr(os, "fsync", _sigterm_self)
+    assert site.run("--reset-state") == 143
+    assert capsys.readouterr().err == "logalert: terminated" + NL
+    assert sorted(p.name for p in site.state_dir.iterdir()) == ["lock", "state.json"]
+    assert site.state_file.read_bytes() == before
+    probe = RunLock(str(site.state_dir / "lock"), 3600)
+    probe.acquire()
+    probe.release()
+    monkeypatch.setattr(logalert.__main__, "deliver", _sigterm_self)
+    assert site.run("--test-mail", "router-disk") == 143
+    assert capsys.readouterr() == ("", "logalert: terminated" + NL)
+    assert site.calls() == []
+
+
+@pytest.mark.parametrize("window", ["install", "restore"])
+def test_a_sigterm_inside_the_handlers_own_install_or_restore_leaves_the_previous_disposition(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+        window: str) -> None:
+    """Reproduced in review: a signal landing inside the signal.signal call that installs
+    the handler raised before terminating()'s try, and one landing inside the restoring
+    call (CPython delivers the pending handlers before changing the disposition) skipped
+    the restore -- the raising handler outlived main() either way."""
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    site.append(site.router, "disk failure now")
+    previous = signal.getsignal(signal.SIGTERM)
+    real_signal = signal.signal
+    fired: list[bool] = []
+
+    def landing(signum: int, handler: Any) -> Any:
+        installing = signum == signal.SIGTERM and handler is not previous
+        if signum == signal.SIGTERM and not fired and installing == (window == "install"):
+            fired.append(True)
+            if window == "restore":
+                os.kill(os.getpid(), signal.SIGTERM)  # pending before the restore is made
+        result = real_signal(signum, handler)
+        if fired == [True] and window == "install" and installing:
+            fired.append(True)  # once
+            os.kill(os.getpid(), signal.SIGTERM)  # delivered as the installing call returns
+        return result
+
+    monkeypatch.setattr(signal, "signal", landing)
+    assert site.run() == 143
+    assert capsys.readouterr().err == "logalert: terminated" + NL
+    assert signal.getsignal(signal.SIGTERM) == previous, window

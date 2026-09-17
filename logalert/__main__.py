@@ -22,7 +22,7 @@ from logalert.config import (
 from logalert.globs import expand, is_glob
 from logalert.lock import LockBusy, RunLock
 from logalert.mail import clean_header, compose_test
-from logalert.run import Options, run
+from logalert.run import Options, Terminated, run, terminating
 from logalert.state import (
     RESET_HINT,
     State,
@@ -38,6 +38,8 @@ log = logging.getLogger("logalert.main")
 EXIT_OK = 0
 EXIT_ATTENTION = 1  # ran, but something needs a look (a state problem, a stuck run, ...)
 EXIT_USAGE = 2  # usage or configuration error; nothing ran (argparse's own code too)
+EXIT_INTERRUPTED = 130  # the shell's convention for SIGINT
+EXIT_TERMINATED = 143  # and for SIGTERM (issue #33)
 
 RESET_ALL = "*"  # the --reset-state sentinel for "every file"; never a valid absolute path
 
@@ -168,31 +170,48 @@ def main(argv: list[str] | None = None) -> int:
         print(f"logalert: {clean_header(str(exc))}", file=sys.stderr)
         return EXIT_USAGE
     to_stderr = args.check_config or (args.dry_run and args.log is None)
+    # every mode under the SIGTERM handler (issue #33): a --reset-state save and a
+    # --test-mail child have the same windows as the run; the signal ends the call the
+    # way Ctrl-C does -- one line, the lock released, nothing half-written. The handler
+    # is gone before the two lines below: a second signal there ends the process the way
+    # the system does, without a traceback
     with activity.attach(log_spec, debug=args.debug, to_stderr=to_stderr):
-        if args.check_config:
-            resolved = activity.describe(log_spec) + (" (--log)" if args.log else "")
-            print(describe(config, args.sender, state_file, log=resolved, clean=clean_header))
-            try:
-                choose(config.settings)  # auto with no sendmail is a configuration error
-                resolve_sender(config.settings, args.sender)  # a From the run would refuse
-            except ConfigError as exc:
-                print(f"logalert: {clean_header(str(exc))}", file=sys.stderr)
-                return EXIT_USAGE
-            return EXIT_OK
-        if args.test_mail is not None:
-            return test_mail(config, args.test_mail, args.sender)
-        if args.reset_state is not None:
-            if args.reset_state != RESET_ALL and not os.path.isabs(args.reset_state):
-                # a cursor is keyed by the absolute path the config spells: no match ever
-                parser.error(f"--reset-state: {args.reset_state!r} is not an absolute path")
-            return reset_state(config, args.reset_state, state_file)
         try:
-            return run(config, Options(context=args.context, sender=args.sender,
-                                       attach=args.attach, from_start=args.from_start,
-                                       dry_run=args.dry_run, state_file=args.state_file))
+            with terminating():
+                return _dispatch(parser, args, config, state_file, log_spec)
         except KeyboardInterrupt:
+            log.warning("interrupted (SIGINT); no lock is held, the state is as last saved")
             print("logalert: interrupted", file=sys.stderr)
-            return 130  # the shell's convention for SIGINT; the lock was released
+            return EXIT_INTERRUPTED
+        except Terminated:
+            log.warning("terminated (SIGTERM); no lock is held, the state is as last saved")
+            print("logalert: terminated", file=sys.stderr)
+            return EXIT_TERMINATED
+
+
+def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace, config: Config,
+              state_file: str, log_spec: str) -> int:
+    """The mode the command line asked for, with the activity log wired."""
+    if args.check_config:
+        resolved = activity.describe(log_spec) + (" (--log)" if args.log else "")
+        print(describe(config, args.sender, state_file, log=resolved, clean=clean_header))
+        try:
+            choose(config.settings)  # auto with no sendmail is a configuration error
+            resolve_sender(config.settings, args.sender)  # a From the run would refuse
+        except ConfigError as exc:
+            print(f"logalert: {clean_header(str(exc))}", file=sys.stderr)
+            return EXIT_USAGE
+        return EXIT_OK
+    if args.test_mail is not None:
+        return test_mail(config, args.test_mail, args.sender)
+    if args.reset_state is not None:
+        if args.reset_state != RESET_ALL and not os.path.isabs(args.reset_state):
+            # a cursor is keyed by the absolute path the config spells: no match ever
+            parser.error(f"--reset-state: {args.reset_state!r} is not an absolute path")
+        return reset_state(config, args.reset_state, state_file)
+    return run(config, Options(context=args.context, sender=args.sender,
+                               attach=args.attach, from_start=args.from_start,
+                               dry_run=args.dry_run, state_file=args.state_file))
 
 
 def _same_file(a: str, b: str) -> bool:

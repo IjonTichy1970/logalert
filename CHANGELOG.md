@@ -114,6 +114,13 @@ its notes.
   package's module-level imports. Rehearsed in the sandbox, both with and
   without the libraries.
 
+- `[contract]` **SIGTERM ends a run the way Ctrl-C does: the sendmail child
+  killed with its process group, the temp state file unlinked, the lock
+  released, `logalert: terminated` and exit 143** (#33). The default
+  disposition bypassed every cleanup: an orphaned child queued what it had
+  read and a temp file stayed beside the state. A signalled run leaves one
+  WARNING record and no end line.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

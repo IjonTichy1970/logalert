@@ -1,6 +1,6 @@
 """docs/USAGE.md (issue #15) cannot drift from the package: the quoted example config IS
 ``logalert --example-config``, every command-line option and every configuration key is in
-the document, and the exit-code table names all four codes. Both platforms."""
+the document, and the exit-code table names all five codes. Both platforms."""
 
 import re
 import smtplib
@@ -53,7 +53,7 @@ def test_every_configuration_key_is_in_the_reference() -> None:
 def test_the_exit_code_table_names_every_code() -> None:
     text = _text()
     table = text[text.index("## Exit codes"):text.index("## Configuration reference")]
-    for code in ("0", "1", "2", "130"):
+    for code in ("0", "1", "2", "130", "143"):  # 143: SIGTERM, issue #33
         assert f"| {code} |" in table, f"exit {code} is not in the table"
 
 
