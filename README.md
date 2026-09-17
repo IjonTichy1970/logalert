@@ -42,10 +42,11 @@ key, rotation, mail, logging, troubleshooting).
 - **Python 3.11 or newer, as a versioned binary** (`python3.11`, `python3.12`,
   ...): the deployment venv must be created with the versioned name, for a
   reason [INSTALL.md](INSTALL.md) explains.
-- **A mail transfer agent** providing `/usr/sbin/sendmail` (Postfix, dma,
+- **A mail transfer agent** providing `/usr/sbin/sendmail` (Postfix, Exim, dma,
   msmtp-mta), configured to relay to your mail server -- or an SMTP relay
-  logalert can hand messages to directly (`transport = smtp`). A fresh server
-  has neither; logalert says so and stops instead of running without one.
+  logalert can hand messages to directly (`transport = smtp`, no login: a relay
+  that wants one is reached through msmtp or dma). A fresh server has neither;
+  logalert says so and stops instead of running without one.
 
 ## Installation
 

@@ -106,13 +106,13 @@ class RunLock:
             os.close(fd)
             raise
         self.fd = fd
-        moment = time.time() if now is None else now
         try:
+            moment = time.time() if now is None else now
             _write_holder(fd, f"{os.getpid()} {moment:.0f}\n".encode("ascii"))
-        except OSError:
+            log.debug("lock %s taken (PID %d)", self.path, os.getpid())
+        except BaseException:  # an OSError, or a signal landing here (issue #33)
             self.release()  # the lock was taken; do not keep it with no info behind it
             raise
-        log.debug("lock %s taken (PID %d)", self.path, os.getpid())
 
     def release(self) -> None:
         if self.fd is None:

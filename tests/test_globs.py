@@ -233,6 +233,7 @@ def test_unlistable_directory_natively(tmp_path: Path) -> None:
     ("192.0.2.1", None), ("198.51.100.254", None), ("2026-09-15", None), ("2001-db8--1", None),
     ("router1.2", None), ("python3.12", None), ("sshd-4.9", None), ("router1-20260915", None),
     ("router.log", None), ("router2.log", None), (".bak", None), (".gz", None),
+    ("worker.2.log", None), ("access-20260916.log", None),  # the extension form needs a base
     ("web-2026-09-15.log", None), ("2026-09-15.log", None), ("router.log.10000", None),
     ("messages", None), ("router.log-20261340", None),
 ])
@@ -264,6 +265,22 @@ def test_shape_holds_while_the_live_file_is_absent(tmp_path: Path) -> None:
     assert [os.path.basename(p) for p in found.archives] == ["router.log.1", "router.log.2.gz"]
 
 
+def test_the_extension_form_is_kin_of_its_base_only(tmp_path: Path) -> None:
+    """Issue #51: logrotate's `extension .log` names the copies router.1.log and
+    router-20260916.log.gz; a glob read the plain one as a file of its own (measured), the
+    whole renamed copy mailed. Judged against the matches beside it: worker.2.log alone and
+    a rotatelogs-style access-20260916.log without access.log stay files of their own."""
+    make(tmp_path, "router.log", "router.1.log", "router.2.log.gz", "router-20260916.log.gz",
+         "worker.2.log", "access-20260916.log", "web/access.log", "web/access-20260916.log")
+    found = expand((tmp_path / "*").as_posix())
+    assert relative(tmp_path, found) == ["access-20260916.log", "router.log", "worker.2.log"]
+    assert [os.path.basename(p) for p in found.archives] == [
+        "router-20260916.log.gz", "router.1.log", "router.2.log.gz"]
+    found = expand((tmp_path / "web" / "*").as_posix())
+    assert relative(tmp_path, found) == ["web/access.log"]
+    assert [os.path.basename(p) for p in found.archives] == ["access-20260916.log"]
+
+
 def test_kin_is_judged_within_one_directory(tmp_path: Path) -> None:
     """The kin tier catches the bases the shape rule declines (a base ending in a digit),
     against the names matched in the same directory only."""
@@ -291,3 +308,11 @@ def test_include_archives_reads_every_match(tmp_path: Path) -> None:
     assert relative(tmp_path, found) == ["access_log.1726358400", "access_log.1726444800",
                                          "access_log.bak"]
     assert found.archives == ()
+
+
+def test_kin_bases_carry_no_duplicates() -> None:
+    from logalert.globs import _kin_bases
+
+    bases = _kin_bases("router.log-20260916.log")
+    assert len(bases) == len(set(bases))
+    assert "router.log" in bases and "router.log-20260916" in bases

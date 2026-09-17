@@ -10,9 +10,17 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     ownership (BEFORE the lock: a root run refused for another user's state must not leave a
     root-owned lock behind, which would break the very remedy it names; and BEFORE any mail:
     a run that can send but cannot persist would double-send next time); then the lock, the
-    state file (a corrupt one is a hard error naming ``--reset-state``), and expiry of the
-    entries unseen for ``state_ttl`` days. ``--dry-run`` takes no lock and needs no writable
-    directory: it reads the state if there is one and never writes.
+    state file (a corrupt one is a hard error naming ``--reset-state``), expiry of the
+    entries unseen for ``state_ttl`` days -- and then ONE SAVE of the state as loaded, before
+    the first section (issue #30): the directory's 0-byte probe passes on a full filesystem
+    (ENOSPC, an exhausted quota), where only the real write fails, and a run that sent and
+    then could not save re-sent the same lines on every run until space was freed
+    (measured: three runs, three mails, the offset never moved). The opening save is the
+    exact operation, so what fails there is what would have failed after the mail for a
+    state that does not grow; it is exit 1 naming the error, nothing sent (the residual
+    window, a disk with room for the state but not for its growth, is in ``state.py``'s
+    rule). ``--dry-run`` takes no lock and needs no writable directory: it reads the state
+    if there is one and never writes.
   * Per section, in file order, each glob expanded in its place (``logalert.globs``: sorted,
     regular files only, rotated copies left out unless ``include_archives``; a directory
     that cannot be listed is a failed item, a glob matching nothing is nothing to do), each
@@ -20,15 +28,18 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     that cannot be read is a failed item and its cursor stays where it was, the section
     continues; a file absent this run is nothing to do (its cursor and its ``last_seen``
     stay, so it expires in time); a source is scanned with the section's context (or
-    ``-c``) and its ``max_lines`` cap, its cursor taken after the read. A first sight starts
-    at the end of the file unless ``--from-start`` or ``start = beginning`` -- or, for a
+    ``-c``) and its ``max_lines`` cap, its cursor taken after the read; a rotation catch-up a
+    permission refused (issue #38) is a failed item too, with the cursor moving on. A first
+    sight starts at the end of the file unless ``--from-start`` or ``start = beginning`` --
+    or, for a
     path a glob matched, the NEW-FILE RULE (issue #18): some glob that matched it has a
     recorded moment (the start of the last saved run that listed its directories without
     error) and the file's mtime is not older than it -- a new daily file is all new
     content -- and then it is read from 0. The moments are written with the section's
     cursors (``state.record_run``), so a glob added to the list first-sights every match at
-    the end, a section whose delivery failed reads the same new file from 0 again next
-    run, and a glob whose directory was away or unlistable keeps its moment, so a file
+    the end, a section whose delivery failed keeps its moment (the new file it read keeps
+    an entry at the beginning, issue #31, and a file it did not reach is still new next
+    run), and a glob whose directory was away or unlistable keeps its moment, so a file
     created during the outage is read whole once the directory is back. A listed path is
     never new, wherever a glob also matches it: its first sight is #7's, unchanged; a
     path is one path however it is spelled (``normcase``, ``normpath``).
@@ -46,7 +57,18 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     still names it -- and context never crosses files) -- a file at its first sight in that
     run would otherwise be first-sighted again next time and lose what was written in
     between. Every file read is ``touch``ed so it never expires while its mail keeps
-    failing. The state is saved after EACH section, never once at the end.
+    failing -- and a contributing file with NO entry yet (a first sight under
+    ``--from-start``, ``start = beginning`` or the new-file rule; a plain first sight a
+    writer appended to between the end-seek and the read) gets one at the offset its read
+    began (``start_cursor``, issue #31): ``touch`` is a no-op without an entry, and the
+    next run first-sighted a ``--from-start`` file or a plain first sight at its END, its
+    lines never sent and never recoverable (the file had a cursor by then); under
+    ``start = beginning`` and the new-file rule the next run re-read from 0 by its own
+    rule, and what was missing was the entry itself. A first sight whose READ fails (a
+    corrupt stream, a scan timeout) gets the same entry for the same reason: "its cursor
+    stays" is vacuous for a file that has none, and a new-file-rule file lost its content
+    to the record moving past it (review). The state is saved after EACH section, never
+    once at the end.
   * Exit 0 writes nothing to stdout or stderr -- cron mails every byte, or discards it with a
     note. Every non-zero exit writes exactly ONE line to stderr naming each failed item:
     ``logalert: 2 of 3 sections sent; failed: [router-disk] sendmail exit 75 (EX_TEMPFAIL);
@@ -65,9 +87,19 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     hundreds of identical lines on every run), per section the delivery (``transport`` logs
     it) or the failure with the transport's answer and the Message-ID, every failed item
     once at ERROR where it is collected, every expired entry, and the exit code at the end
-    -- on every exit the run returns (a killed run, Ctrl-C included, leaves no end line).
+    -- on every exit the run returns. A signalled run leaves no end line: Ctrl-C (exit 130)
+    and SIGTERM (exit 143, issue #33: a kill, a timeout wrapper, systemd's
+    ``TimeoutStartSec=``) each leave one WARNING instead, and reach every cleanup the
+    run has -- the sendmail child killed with its process group, a temp state file
+    unlinked, the lock released -- because ``terminating`` turns the signal into a
+    ``BaseException`` (``Terminated``) the way ``KeyboardInterrupt`` is one; the default
+    disposition bypassed all of it (measured: an orphaned sendmail child read on and
+    exited on its own -- a real MTA queues what it read -- and a temp file was left
+    beside the state). The handler is installed after the config and the log are set
+    up; a signal before that is the default disposition, with nothing held yet.
 """
 
+import errno
 import logging
 import os
 import signal
@@ -83,7 +115,7 @@ from logalert.globs import expand, is_glob
 from logalert.lock import LockBusy, RunLock
 from logalert.mail import Mail, clean_header, compose
 from logalert.match import FileReport, progress, scan
-from logalert.rotation import open_source
+from logalert.rotation import CatchUpSource, open_source
 from logalert.state import (
     Cursor,
     State,
@@ -109,6 +141,47 @@ class ScanTimeout(BaseException):
     swallowed by ``logging.Handler.emit`` (review) -- the bound gone and the activity log
     declared dead. Nothing in the package catches ``BaseException`` except to clean up and
     re-raise."""
+
+
+class Terminated(BaseException):
+    """SIGTERM arrived. A ``BaseException`` like ``ScanTimeout``, for the same reason, raised
+    by the handler ``terminating`` installs; it lands in every existing cleanup and ``main``
+    turns it into one stderr line and exit 143 (issue #33)."""
+
+
+@contextmanager
+def terminating() -> Iterator[None]:
+    """``Terminated`` out of whatever the main thread is doing when SIGTERM arrives -- main
+    thread only (a handler is installable nowhere else), the previous disposition restored
+    on the way out (tests call ``main()`` in-process). Installed on Windows too, where
+    ``signal.signal`` accepts SIGTERM and the system never delivers it."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def arrived(signum: int, frame: object) -> None:
+        raise Terminated()
+
+    previous = signal.getsignal(signal.SIGTERM)
+    if previous is None:  # installed from C: not restorable, and never the CLI's case
+        previous = signal.SIG_DFL
+    try:
+        signal.signal(signal.SIGTERM, arrived)  # inside the try: the signal can land at
+        yield                                   # the very call that installs the handler
+    finally:
+        # a signal that lands just before the restore is delivered INSIDE signal.signal
+        # (CPython runs the pending handlers before changing anything): retry until the
+        # previous disposition is back, then let that late one out (review: measured,
+        # 99 of 145 handlers leaked past the restore under a SIGTERM hammer without this)
+        late: Terminated | None = None
+        while True:
+            try:
+                signal.signal(signal.SIGTERM, previous)
+                break
+            except Terminated as exc:
+                late = exc
+        if late is not None:
+            raise late
 
 
 @contextmanager
@@ -215,8 +288,8 @@ def run(config: Config, options: Options) -> int:
             log.info("%s; this run exits quietly", busy.describe())
             return _finish(outcome)
         except OSError as exc:
-            outcome.fail(f"state directory: {exc.strerror or exc} ({lock_path(state_file)}) -- "
-                         f"the lock file must belong to the user logalert runs as")
+            outcome.fail(f"state directory: {exc.strerror or exc} ({lock_path(state_file)})"
+                         + ownership_hint(exc))
             return _finish(outcome)
     try:
         try:
@@ -234,6 +307,15 @@ def run(config: Config, options: Options) -> int:
                       section,
                       "would be forgotten" if options.dry_run else "forgotten",
                       config.settings.state_ttl_days)
+        if not options.dry_run:
+            # the second half of the proof (issue #30): the exact write a section's save
+            # performs, before any mail -- see the module docstring
+            try:
+                state.save()
+            except (StateError, OSError) as exc:
+                outcome.fail(f"state file: {exc} -- nothing was sent, because a run that "
+                             f"cannot save its position would send everything again next time")
+                return _finish(outcome)
         for watch in config.watches:
             _section(watch, config, options, sender, state, outcome, started)
     finally:
@@ -256,6 +338,7 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
     context = options.context if watch.context is None else watch.context
     reports: list[FileReport] = []
     cursors: dict[str, Cursor] = {}
+    starts: dict[str, Cursor] = {}  # where each read began (issue #31)
     paths, seen = _files(watch, outcome)
     tally: dict[str, list[int]] = {}  # per glob: files matched, with new lines, lines matched
     for path, globs in paths:
@@ -280,17 +363,24 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
         progress.file, progress.line, progress.pattern = path, 0, None
         try:
             with source:
+                starts[path] = source.start_cursor()  # before the read: it needs nothing of it
                 with scan_bound(config.settings.scan_timeout):
                     report = scan(path, source.lines(), watch, context=context,
                                   before=source.context_before, cap=watch.max_lines)
                 # outside the bound (review): an alarm handled on the way out of it must
                 # not leave a cursor here for _advance to save past lines never mailed
                 cursors[path] = source.cursor()
+            if isinstance(source, CatchUpSource) and source.failed_item():
+                # a permission kept a copy out of reach, the holder or a chain member
+                # (issue #38): a failed item, the position moving on all the same
+                outcome.fail(f"[{watch.name}] {path}: {source.failed_item()}")
         except OSError as exc:  # an archive vanishing mid-read, a corrupt stream
             outcome.fail(f"[{watch.name}] {path}: {_reason(exc, path)}")
+            _pin_first_sight(watch, state, path, starts)
             continue
         except ScanTimeout as exc:  # the cursor stays: the file is re-read next run
             outcome.fail(f"[{watch.name}] {path}: {exc}")
+            _pin_first_sight(watch, state, path, starts)
             continue
         # a glob's quiet file is a DEBUG record and counted in the glob's summary (issue
         # #50: a daily directory or a host tree wrote thousands of identical lines per run);
@@ -327,6 +417,10 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
         for path, cursor in cursors.items():
             if path in quiet:
                 state.set(watch.name, path, cursor)
+            elif state.get(watch.name, path) is None:
+                # a first sight that contributed (issue #31): its entry is where the read
+                # began, so the next run re-sends exactly these lines
+                state.set(watch.name, path, starts[path])
             else:
                 state.touch(watch.name, path)
         _save(state, watch.name, outcome, delivered=False)
@@ -335,6 +429,16 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
     for recipient, answer in delivery.refused:
         outcome.fail(f"[{watch.name}] refused: {recipient} -- {answer}")
     _advance(watch, state, cursors, options, outcome, started, seen, delivered=True)
+
+
+def _pin_first_sight(watch: Watch, state: State, path: str, starts: dict[str, Cursor]) -> None:
+    """A failed read leaves a saved cursor where it was; a FIRST SIGHT has none to leave
+    (review of issue #31): without an entry the next run first-sights the file at its end
+    -- a new-file-rule file whose read failed lost its content that way, the record moving
+    past it -- so its entry is where this read began, and the next run reads from there
+    (a timeout there is the documented case: --reset-state <file> skips it)."""
+    if path in starts and state.get(watch.name, path) is None:
+        state.set(watch.name, path, starts[path])
 
 
 def _files(watch: Watch, outcome: Outcome) -> tuple[list[tuple[str, tuple[str, ...]]],
@@ -392,6 +496,18 @@ def _new_file(section: str, globs: tuple[str, ...], path: str, state: State) -> 
         if at is not None and mtime >= parse_timestamp(at).timestamp():
             return glob
     return None
+
+
+LOCK_OWNER_HINT = " -- the lock file must belong to the user logalert runs as"
+
+
+def ownership_hint(exc: OSError, subject: str = "the lock file") -> str:
+    """The lock's remedy when the errno is a permission (``--reset-state`` uses it too, with
+    its own subject): a full disk (ENOSPC, issue #30) or an I/O error is not an ownership
+    problem, and the hint would send the operator the wrong way."""
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return LOCK_OWNER_HINT.replace("the lock file", subject)
+    return ""
 
 
 def _reason(exc: OSError, path: str) -> str:

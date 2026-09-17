@@ -86,6 +86,95 @@ def test_the_readme_names_the_documents_and_the_site() -> None:
     assert "pip install logalert" in readme and "GitHub" in readme  # not on PyPI, said plainly
 
 
+def test_the_mta_lists_name_exim_and_the_login_limit() -> None:
+    """Issue #58: Exim is Debian's default MTA and provides the binary `transport = auto`
+    looks for; a Debian operator reading 'Postfix, dma or msmtp-mta' installed a second one.
+    And the relay `transport = smtp` reaches must take mail without a login."""
+    install = _text("INSTALL.md")
+    step = install[install.index("### 6. Mail"):install.index("### 7. Schedule it")]
+    assert "Exim" in step and "exim4-daemon-light" in step
+    assert "SMTP AUTH" in step and "msmtp-mta" in step
+    readme = _text("README.md")
+    assert "Exim" in readme and "no login" in readme
+    table = install[install.index("## Troubleshooting"):]
+    row = next(r for r in table.splitlines() if "Authentication required" in r)
+    assert "SMTPSenderRefused: 530" in row and "msmtp-mta" in row and "Exim" in row
+    assert "SMTP AUTH is not supported" in example_config()  # the shipped comment, too
+
+
+def test_the_service_users_files_are_documented_with_the_programs_own_words() -> None:
+    """Issue #37: the file: log the service user cannot create, the login.defs umask trap
+    and the root-owned lock were measured and undocumented. The pre-create line, the umask
+    form and the service-user check are in the steps; the rows quote the messages the
+    code emits, and 'owned by' is the word for the state directory in both documents."""
+    install = _text("INSTALL.md")
+    usage = _text("docs/USAGE.md")
+    line = "install -o logalert -g logalert -m 640 /dev/null /var/log/logalert.log"
+    step8 = install[install.index("### 8. Where the log is"):install.index("## Keep the venv")]
+    assert "sudo " + line in step8 and "create 640 logalert logalert" in step8
+    logging = usage[usage.index("## Logging"):usage.index("## Troubleshooting")]
+    assert line in logging.replace(NL, " ")  # the destination paragraph, wrapped
+    syslog_row = next(r for r in usage.splitlines()
+                      if r.startswith("| `warning: no usable syslog socket"))
+    assert line in syslog_row
+    step1 = install[install.index("### 1. Create the venv"):install.index("### 2. Download")]
+    assert "sudo sh -c 'umask 022; python3.12 -m venv /opt/logalert-venv'" in step1
+    step5 = install[install.index("### 5. Configuration and state"):install.index("### 6. Mail")]
+    assert "sudo -u logalert /opt/logalert-venv/bin/logalert --version" in step5
+    assert "**owned** by" in step5
+    usage_row = next(r for r in usage.splitlines() if r.startswith("| `state_file` |"))
+    assert "owned by the user" in usage_row and "writable by the user" not in usage_row
+    assert "must exist and be OWNED by the user" in example_config()
+    messages = {"cannot open the activity log ": "activity.py",
+                "logging to stderr": "activity.py",
+                "state directory: Permission denied (": "INSTALL.md",
+                "the lock file must belong to the user logalert runs as": "run.py",
+                "cannot take the run lock ": "__main__.py",
+                "cannot read (": "state.py", "is it owned ": "state.py",
+                "by another user?": "state.py",
+                "No module named 'logalert.__main__'": "INSTALL.md"}
+    for message, module in messages.items():
+        if module.endswith(".py"):  # the rows quote the program (a measured shape otherwise)
+            source = (REPO_ROOT / "logalert" / module).read_text(encoding="utf-8")
+            assert message in source, (message, module)
+        for name, text in (("INSTALL.md", install), ("docs/USAGE.md", usage)):
+            table = text[text.index("## Troubleshooting"):]
+            assert message.strip() in table, (name, message)
+    for name, text in (("INSTALL.md", install), ("docs/USAGE.md", usage)):
+        table = text[text.index("## Troubleshooting"):]
+        umask = next(r for r in table.splitlines() if "status=203/EXEC" in r)
+        assert "chmod -R o+rX /opt/logalert-venv" in umask and "login.defs" in umask, name
+        lock = next(r for r in table.splitlines() if "cannot take the run lock" in r)
+        assert "chown logalert:logalert" in lock and "every position kept" in lock, name
+
+
+def test_the_import_check_names_the_modules_the_package_imports_at_module_level() -> None:
+    """Issue #23: an interpreter built without one of these libraries runs `make` to the
+    end and fails at logalert's startup (measured: `No module named '_bz2'`). The
+    documented check lists exactly the stdlib compression and TLS modules the package
+    imports at module level, and the apt line names the -dev package each one needs."""
+    packages = {"bz2": "libbz2-dev", "gzip": "zlib1g-dev", "lzma": "liblzma-dev",
+                "zlib": "zlib1g-dev", "ssl": "libssl-dev",
+                "compression.zstd": "libzstd-dev"}  # lazy today; module-level one day
+    imported: set[str] = set()
+    for path in (REPO_ROOT / "logalert").glob("*.py"):
+        names = re.findall(r"^(?:import|from) ([\w.]+)", path.read_text(encoding="utf-8"), re.M)
+        imported |= {name for name in names if name in packages}
+    assert imported  # the package does import them; a lazy import would leave this empty
+    install = _text("INSTALL.md")
+    section = install[install.index("## Python on an older distribution"):
+                      install.index("## Install")]
+    check = re.search(r'-c "import ([a-z0-9, ]+); print', section)
+    assert check is not None, "the import check moved"
+    assert {m.strip() for m in check.group(1).split(",")} == imported
+    apt = next(line for line in section.splitlines() if line.startswith("sudo apt install"))
+    for module in imported:
+        assert packages[module] in apt, (module, packages[module])
+    assert "make altinstall" in section and "make install`" in section  # the never
+    moving = install[install.index("## Moving to a new host"):install.index("## Uninstall")]
+    assert "state.json" in moving and "first sight" in moving
+
+
 def test_the_classifiers_claim_linux_and_nothing_else() -> None:
     with open(REPO_ROOT / "pyproject.toml", "rb") as handle:
         classifiers = tomllib.load(handle)["project"]["classifiers"]

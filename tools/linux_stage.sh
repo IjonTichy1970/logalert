@@ -322,6 +322,9 @@ cleanup() {
     pkill -TERM -P "$BG_PID" 2>/dev/null
     wait "$BG_PID" 2>/dev/null
   fi
+  if [ -n "${FULL_MOUNTED:-}" ]; then  # the full-disk check's tmpfs: before the tree goes
+    bounded "$BOUND_CMD" umount "$T/full" 2>/dev/null && FULL_MOUNTED=""
+  fi
   [ -n "${T:-}" ] && rm -rf "$T"
 }
 trap cleanup EXIT
@@ -334,6 +337,7 @@ trap cleanup EXIT
 # mirrors it into, and runuser's session lines in auth.log.
 T=""
 BG_PID=""
+FULL_MOUNTED=""
 SVC="${LOGALERT_STAGE_USER:-nobody}"   # the service user: exists everywhere, owns nothing
 BOUND_BUILD="${LOGALERT_BOUND_BUILD:-240}"   # the wheel build and install: a cold pip cache fetches setuptools
 
@@ -417,9 +421,10 @@ run_native_checks() {
     T=""
     skip "mktemp -d failed (TMPDIR=${TMPDIR:-unset}) -- no private tree to work in"; return
   fi
-  # The caller's umask is not ours: sudo carries a hardened 027 or 077 into the re-exec, and
-  # everything below must be readable (the venv, the confs, the fixture) and the console
-  # script executable by $SVC. mktemp gives 0700 whatever the umask.
+  # The caller's umask is not ours: pam_umask sets login.defs' UMASK (027 or 077 on a
+  # hardened host) in every sudo session whatever the caller's shell had, and everything
+  # below must be readable (the venv, the confs, the fixture) and the console script
+  # executable by $SVC. mktemp gives 0700 whatever the umask.
   umask 022
   chmod 755 "$T"
   mkdir -p "$T/bin" "$T/logs" "$T/fake" "$T/conf2"
@@ -791,6 +796,52 @@ EOF
     fail "the state directory is '$dr' after the runs, not the '750 $SVC' it was created with" "mode-dir"
   else
     ok "state file 600, lock 600, directory 750, all owned by $SVC"
+  fi
+
+  echo "-- full disk: a state directory with no room refuses before any mail (issue #30)"
+  # A 1 MiB tmpfs holding the service user's state directory: with a saved position and a
+  # matching line pending, the run on the full disk must send nothing (measured before the
+  # fix: a mail on every run), and a lock file created on the full disk is named by the
+  # errno, not the ownership. Mounting takes the privilege the sandbox and CI's sudo have.
+  mkdir -p "$T/full"
+  if ! bounded "$BOUND_CMD" mount -t tmpfs -o size=1m tmpfs "$T/full" > "$T/mount.err" 2>&1; then
+    skip "cannot mount a 1 MiB tmpfs under $T ($(head -1 "$T/mount.err")) -- the full-disk check needs one"
+  else
+    FULL_MOUNTED=1
+    install -d -m 750 -o "$SVC" "$T/full/state"
+    sed "s|^state_file = .*|state_file = $T/full/state/state.json|" "$T/logalert.conf" > "$T/full.conf"
+    chmod 644 "$T/full.conf"
+    as_svc f1 -f "$T/full.conf"; rc=$?  # first sight: the state file and the lock take their blocks
+    echo "disk failure on a full disk" >> "$T/logs/router.log"
+    before="$(fake_calls)"
+    # dd ends with ENOSPC by design; a bound in case the mount misbehaves
+    bounded "$BOUND_CMD" dd if=/dev/zero of="$T/full/filler" bs=4096 > /dev/null 2>&1
+    as_svc f2 -f "$T/full.conf"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+      skip "the run on the full disk did not finish within ${BOUND_CMD}s"
+    elif [ "$rc" -ne 1 ] || ! grep -q 'state file: state file .*cannot write (No space left on device) -- nothing was sent' "$T/f2.err"; then
+      fail "the run on the full disk exited $rc: $(first_err f2)" "full-disk"
+    elif [ "$(fake_calls)" -ne "$before" ]; then
+      fail "the run on the full disk mailed $(( $(fake_calls) - before )) time(s); nothing must leave the box" "full-disk"
+    else
+      ok "a full disk: exit 1, the refusal on stderr, no mail"
+    fi
+    # the lock created for the first time on the full disk: the freed block goes to the
+    # filler first, so the holder line has nowhere to go
+    rm -f "$T/full/state/lock"
+    bounded "$BOUND_CMD" dd if=/dev/zero of="$T/full/filler" bs=4096 oflag=append conv=notrunc > /dev/null 2>&1
+    as_svc f3 -f "$T/full.conf"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+      skip "the run with a fresh lock on the full disk did not finish within ${BOUND_CMD}s"
+    elif [ "$rc" -ne 1 ] || ! grep -q 'state directory: No space left on device (' "$T/f3.err" || grep -q 'must belong' "$T/f3.err"; then
+      fail "a fresh lock on the full disk: exit $rc, $(first_err f3)" "full-disk-lock"
+    elif [ "$(fake_calls)" -ne "$before" ]; then
+      fail "the run with a fresh lock on the full disk mailed" "full-disk-lock"
+    else
+      ok "a fresh lock on the full disk: exit 1, the errno without the ownership hint, no mail"
+    fi
+    rm -f "$T/full/filler"
+    bounded "$BOUND_CMD" umount "$T/full" && FULL_MOUNTED=""
   fi
 }
 

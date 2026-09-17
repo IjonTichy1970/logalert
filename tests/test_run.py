@@ -1,9 +1,10 @@
 """The run (issue #12): end to end through ``main()`` over fixture logs, the fake sendmail
 behind ``sendmail_path``, the exit codes, the one stderr line, dry-run, the lock, expiry.
 
-Real on both platforms; the three POSIX-only tests (a 0500 state directory, a planted lock
+Real on both platforms; the POSIX-only tests (a 0500 state directory, a planted lock
 symlink, another user's state directory -- the first and last also skipped in the root
-sandbox) and the one Windows-only test (a read-only state file) say so.
+sandbox -- the scan-timeout test of issue #28 and the SIGTERM tests of issue #33) and the
+one Windows-only test (a read-only state file) say so.
 """
 
 import errno
@@ -11,8 +12,10 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -23,6 +26,7 @@ import pytest
 from esmtp_stub import StubConfig, run_stub
 from fake_sendmail import install
 
+import logalert.__main__
 import logalert.cursor
 import logalert.run
 from logalert.__main__ import main
@@ -309,7 +313,8 @@ def test_state_not_saved_after_a_delivery_is_named_loudly(
     site.prime()
     site.append(site.router, "disk failure now")
     real_save = State.save
-    failures = iter([StateError("disk full")])  # the first save fails, later ones work
+    # the opening save (issue #30) passes; the section's, the second, fails; later ones work
+    failures = iter([None, StateError("disk full")])
 
     def flaky(self: State) -> None:
         problem = next(failures, None)
@@ -610,7 +615,23 @@ def test_a_save_failure_says_whether_a_mail_went_out(
     caplog.set_level(logging.ERROR, logger="logalert.run")
     site.prime()
     site.append(site.router, "quiet again")  # nothing matched: no mail
-    monkeypatch.setattr(State, "save", lambda self: (_ for _ in ()).throw(StateError("full")))
+    real_save = State.save
+    opening: set[int] = set()  # the states whose first save, the opening one, is due
+
+    def load(path: str) -> State:
+        state = load_state(path)
+        opening.add(id(state))
+        return state
+
+    def save(self: State) -> None:
+        if id(self) in opening:  # the opening save (issue #30) passes; the section's fails
+            opening.discard(id(self))
+            real_save(self)
+            return
+        raise StateError("full")
+
+    monkeypatch.setattr("logalert.run.load_state", load)
+    monkeypatch.setattr(State, "save", save)
     assert site.run() == 1
     assert not any("the mail went out" in m for m in caplog.messages)
     caplog.clear()
@@ -635,6 +656,13 @@ def test_dry_run_words_the_expiry_as_conditional(
     assert gone in site.state()["router-disk"]
 
 
+def _records_of_the_last_run(site: Site) -> list[str]:
+    """The activity log from the last start line on: what one run recorded."""
+    records = site.activity()
+    starts = [i for i, r in enumerate(records) if r.startswith("start: ")]
+    return records[starts[-1]:]
+
+
 def test_an_interrupt_is_one_line_and_exit_130_with_the_lock_released(
         site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     site.prime()
@@ -649,6 +677,10 @@ def test_an_interrupt_is_one_line_and_exit_130_with_the_lock_released(
     probe = RunLock(str(site.state_dir / "lock"), 3600)
     probe.acquire()  # LockBusy here would mean the interrupted run kept it
     probe.release()
+    # the one record a signalled run leaves (issue #33), and no end line after it
+    records = _records_of_the_last_run(site)
+    assert [r for r in records if r.startswith(("warning: interrupted", "end:"))] == [
+        "warning: interrupted (SIGINT); no lock is held, the state is as last saved"]
 
 
 def test_debug_output_is_one_clean_line_per_record_and_leaves_no_handler(
@@ -1125,3 +1157,535 @@ def test_a_regex_that_hangs_is_a_failed_item_within_scan_timeout_and_the_cursor_
         # scan_bound is a no-op for it -- pinned on the context manager directly
         with logalert.run.scan_bound(0):
             assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+# -- SIGTERM (issue #33) ----------------------------------------------------------------------
+
+
+def _sigterm_self(*args: Any, **kwargs: Any) -> Any:
+    """A stand-in that sends the process SIGTERM; the handler raises before it returns (and
+    without the handler the signal ends the test process itself -- the mutation is loud)."""
+    os.kill(os.getpid(), signal.SIGTERM)
+    time.sleep(5)  # never reached: the signal lands at the next bytecode boundary
+    raise AssertionError("the SIGTERM handler did not fire")
+
+
+def _sigterm_once(real: Any, at: int = 1) -> Any:
+    """A stand-in that sends SIGTERM on the ``at``-th call and is the real thing otherwise
+    (the WARNING main logs on the way out must not fire it again)."""
+    calls: list[bool] = []
+
+    def stand_in(*args: Any, **kwargs: Any) -> Any:
+        calls.append(True)
+        if len(calls) != at:
+            return real(*args, **kwargs)
+        return _sigterm_self()
+
+    return stand_in
+
+
+def test_a_sigterm_during_the_delivery_is_one_line_exit_143_the_lock_free_and_one_record(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Measured before the fix (sandbox): exit status -15, nothing on stderr, no record, the
+    sendmail child left to finish on its own, a temp state file left behind."""
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    before = site.offset("router-disk", site.router)
+    site.append(site.router, "disk failure now")
+    monkeypatch.setattr(logalert.run, "deliver", _sigterm_self)
+    previous = signal.getsignal(signal.SIGTERM)
+    assert site.run() == 143
+    assert capsys.readouterr() == ("", "logalert: terminated" + NL)
+    probe = RunLock(str(site.state_dir / "lock"), 3600)
+    probe.acquire()  # LockBusy here would mean the terminated run kept it
+    probe.release()
+    records = _records_of_the_last_run(site)
+    assert [r for r in records if r.startswith(("warning: terminated", "end:"))] == [
+        "warning: terminated (SIGTERM); no lock is held, the state is as last saved"]
+    assert signal.getsignal(signal.SIGTERM) == previous  # restored on the way out
+    assert site.offset("router-disk", site.router) == before  # nothing saved past the mail
+
+
+def test_a_sigterm_inside_the_save_unlinks_the_temp_file(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    before = site.state_file.read_bytes()
+    site.append(site.router, "disk failure now")
+    # the second fsync: the section's save (the first is the run's opening save, issue #30)
+    monkeypatch.setattr(os, "fsync", _sigterm_once(os.fsync, at=2))
+    assert site.run() == 143
+    assert capsys.readouterr().err == "logalert: terminated" + NL
+    assert sorted(p.name for p in site.state_dir.iterdir()) == ["lock", "state.json"]
+    assert site.state_file.read_bytes() == before  # the old file, whole
+    assert len(site.calls()) == 1  # the mail went out; the save was the step that died
+
+
+def _gone(pid: int, within: float) -> bool:
+    """Whether the process is gone (or a zombie awaiting its reaper) within the bound."""
+    deadline = time.monotonic() + within
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as fh:
+                if fh.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    return True  # awaiting its reaper: as good as gone
+        except OSError:
+            pass  # no procfs: kill(0) decides
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+
+
+def test_a_sigterm_kills_the_sendmail_child_and_a_wrappers_grandchild(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI as a subprocess, the fake sleeping after it read the message: SIGTERM to
+    logalert kills the child -- and, behind a shell wrapper without exec, the grandchild,
+    which proc.kill() alone left alive (the interrupt path's gap the issue names)."""
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    wrapper = site.root / "wrapper.sh"
+    wrapper.write_text("#!/bin/sh" + NL + f'"{site.binary.as_posix()}" "$@"' + NL,
+                       encoding="ascii", newline=NL)  # no exec: the fake is a grandchild
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("LOGALERT_FAKE_SLEEP", "30")
+    pid_file = site.fake_dir / "pid.txt"
+    for binary in (site.binary, wrapper):
+        site.write_config(sendmail=binary.as_posix())
+        site.append(site.router, "disk failure now")
+        if pid_file.exists():
+            pid_file.unlink()
+        proc = subprocess.Popen([sys.executable, "-m", "logalert", "-f", str(site.conf)],
+                                stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 20
+            while not (pid_file.exists() and pid_file.read_text(encoding="ascii").strip()):
+                assert time.monotonic() < deadline, "the fake never started"
+                time.sleep(0.05)
+            child = int(pid_file.read_text(encoding="ascii").strip())
+            parent = _parent_of(child)
+            if parent is not None:  # procfs: the wrapper really is in between
+                assert (parent == proc.pid) == (binary is site.binary), binary
+            proc.send_signal(signal.SIGTERM)
+            _, err = proc.communicate(timeout=20)
+        finally:
+            proc.kill()  # a red run must not leave a sleeper behind
+            proc.wait()
+        assert (proc.returncode, err) == (143, b"logalert: terminated" + NL.encode()), binary
+        assert _gone(child, within=5), f"{binary.name}: the fake (PID {child}) survived"
+    assert site.offset("router-disk", site.router) < site.router.stat().st_size  # re-read
+
+
+def _parent_of(pid: int) -> int | None:
+    """The parent PID from procfs, or None where there is none (a BSD)."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[1])
+    except OSError:
+        return None
+
+
+def test_terminating_installs_in_the_main_thread_only_and_restores() -> None:
+    # the base class is the whole design: an Exception raised inside a log write would be
+    # swallowed by Handler.emit, the log declared dead and the run carried on to the mail
+    assert issubclass(logalert.run.Terminated, BaseException)
+    assert not issubclass(logalert.run.Terminated, Exception)
+    previous = signal.getsignal(signal.SIGTERM)
+    with logalert.run.terminating():
+        assert signal.getsignal(signal.SIGTERM) is not previous
+    assert signal.getsignal(signal.SIGTERM) == previous
+    seen: list[object] = []
+
+    def elsewhere() -> None:
+        with logalert.run.terminating():
+            seen.append(signal.getsignal(signal.SIGTERM))
+
+    thread = threading.Thread(target=elsewhere)
+    thread.start()
+    thread.join()
+    assert seen == [previous]  # nothing installed off the main thread
+
+
+def test_a_sigterm_inside_a_log_write_still_ends_the_run(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The behavioural twin of the base-class pin: the signal lands inside the file
+    handler's flush. An Exception there is swallowed by Handler.emit -- the log declared
+    dead, the run carrying on to the mail and exit 0; a BaseException ends the run."""
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    site.append(site.router, "disk failure now")
+    monkeypatch.setattr(logging.StreamHandler, "flush",
+                        _sigterm_once(logging.StreamHandler.flush))
+    assert site.run() == 143
+    assert capsys.readouterr().err.endswith("logalert: terminated" + NL)
+    assert site.calls() == []
+
+
+def test_reset_state_and_test_mail_are_under_the_handler_too(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Every mode dispatches under it: a --reset-state save and a --test-mail child have the
+    run's windows (a handler around the run alone ends the test process here)."""
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    before = site.state_file.read_bytes()
+    monkeypatch.setattr(os, "fsync", _sigterm_self)
+    assert site.run("--reset-state") == 143
+    assert capsys.readouterr().err == "logalert: terminated" + NL
+    assert sorted(p.name for p in site.state_dir.iterdir()) == ["lock", "state.json"]
+    assert site.state_file.read_bytes() == before
+    probe = RunLock(str(site.state_dir / "lock"), 3600)
+    probe.acquire()
+    probe.release()
+    monkeypatch.setattr(logalert.__main__, "deliver", _sigterm_self)
+    assert site.run("--test-mail", "router-disk") == 143
+    assert capsys.readouterr() == ("", "logalert: terminated" + NL)
+    assert site.calls() == []
+
+
+@pytest.mark.parametrize("window", ["install", "restore"])
+def test_a_sigterm_inside_the_handlers_own_install_or_restore_leaves_the_previous_disposition(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+        window: str) -> None:
+    """Reproduced in review: a signal landing inside the signal.signal call that installs
+    the handler raised before terminating()'s try, and one landing inside the restoring
+    call (CPython delivers the pending handlers before changing the disposition) skipped
+    the restore -- the raising handler outlived main() either way."""
+    if sys.platform == "win32":
+        pytest.skip("SIGTERM reaches no handler on Windows; runs in the sandbox and on CI")
+    site.prime()
+    site.append(site.router, "disk failure now")
+    previous = signal.getsignal(signal.SIGTERM)
+    real_signal = signal.signal
+    fired: list[bool] = []
+
+    def landing(signum: int, handler: Any) -> Any:
+        installing = signum == signal.SIGTERM and handler is not previous
+        if signum == signal.SIGTERM and not fired and installing == (window == "install"):
+            fired.append(True)
+            if window == "restore":
+                os.kill(os.getpid(), signal.SIGTERM)  # pending before the restore is made
+        result = real_signal(signum, handler)
+        if fired == [True] and window == "install" and installing:
+            fired.append(True)  # once
+            os.kill(os.getpid(), signal.SIGTERM)  # delivered as the installing call returns
+        return result
+
+    monkeypatch.setattr(signal, "signal", landing)
+    assert site.run() == 143
+    assert capsys.readouterr().err == "logalert: terminated" + NL
+    assert signal.getsignal(signal.SIGTERM) == previous, window
+
+
+# -- a full filesystem (issue #30) --------------------------------------------------------------
+
+
+def test_a_full_filesystem_is_refused_before_any_mail(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Measured in the sandbox before the fix (a full tmpfs): the 0-byte probe passed, three
+    runs mailed three times and the offset never moved. The opening save is the real write;
+    here the replace is what the full disk refuses, as the ENOSPC atomic-write test does."""
+    site.prime()
+    site.append(site.router, "disk failure now")
+    before = site.state_file.read_bytes()
+    real_replace = os.replace
+
+    def full(src: str, dst: str) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", full)
+    assert site.run() == 1
+    out = capsys.readouterr()
+    assert out.err == (f"logalert: failed: state file: state file {site.state_file.as_posix()}: "
+                       f"cannot write (No space left on device) -- nothing was sent, because a "
+                       f"run that cannot save its position would send everything again next "
+                       f"time; see the log" + NL)
+    assert site.calls() == []  # the whole point
+    assert site.state_file.read_bytes() == before
+    assert sorted(p.name for p in site.state_dir.iterdir()) == ["lock", "state.json"]
+    # the next run, with space back, sends once and moves on
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert site.run() == 0
+    assert len(site.calls()) == 1
+    assert site.offset("router-disk", site.router) == site.router.stat().st_size
+
+
+def test_the_opening_save_is_skipped_by_a_dry_run(site: Site, monkeypatch: pytest.MonkeyPatch,
+                                                  capsys: pytest.CaptureFixture[str]) -> None:
+    site.prime()
+    site.append(site.router, "disk failure now")
+    monkeypatch.setattr(State, "save", lambda self: (_ for _ in ()).throw(StateError("full")))
+    assert site.run("-n") == 0  # never saves, so never refused
+    assert "disk failure now" in capsys.readouterr().out
+
+
+def test_a_lock_the_disk_refuses_names_the_errno_without_the_ownership_hint(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Measured on a full tmpfs: a lock file created for the first time fails its holder
+    write with ENOSPC, and the run blamed the file's ownership."""
+    site.prime()
+    site.append(site.router, "disk failure now")
+
+    def full(self: RunLock, now: float | None = None) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(RunLock, "acquire", full)
+    assert site.run() == 1
+    err = capsys.readouterr().err
+    assert err == (f"logalert: failed: state directory: No space left on device "
+                   f"({lock_path(site.state_file.as_posix())}); see the log" + NL)
+    assert site.calls() == []
+    assert site.run("--reset-state") == 1
+    err = capsys.readouterr().err
+    assert err.startswith("logalert: cannot take the run lock ") and "(No space left" in err
+    assert "must belong" not in err
+
+
+def test_the_opening_save_writes_the_state_as_loaded_before_the_first_section(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #30: a save of an EMPTY state at the opening (the --reset-state escape hatch's
+    own call) passed the refusal test -- the in-memory state survived and the section's save
+    rewrote the file -- while a run killed before its first section lost every position."""
+    site.prime()
+    primed = site.state_file.read_bytes()
+    stamp = site.state_file.stat()
+    site.append(site.router, "disk failure now")
+    seen: list[tuple[bytes, os.stat_result]] = []
+    real_section = logalert.run._section
+
+    def peek(*args: Any, **kwargs: Any) -> None:
+        if not seen:  # the first section: what the opening left on disk
+            seen.append((site.state_file.read_bytes(), site.state_file.stat()))
+        real_section(*args, **kwargs)
+
+    monkeypatch.setattr(logalert.run, "_section", peek)
+    time.sleep(0.05)  # a moved mtime must be measurable on a coarse clock
+    assert site.run() == 0
+    (written, stat), = seen
+    assert json.loads(written) == json.loads(primed)  # the state as loaded, entries and all
+    # rewritten, not left alone: a fresh file replaced the old one
+    assert stat.st_mtime_ns != stamp.st_mtime_ns or stat.st_ino != stamp.st_ino
+
+
+# -- a first sight in a section whose delivery failed (issue #31) -------------------------------
+
+
+def _mails_with(site: Site, line: str) -> int:
+    return sum(body_of(stdin).count(line) for _, stdin in site.calls())
+
+
+def test_a_first_sight_under_from_start_that_contributed_keeps_its_place_on_a_failure(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Measured before the fix (both platforms): --from-start with the fake exiting 75 left
+    no entry, the next run first-sighted the file at its end and the lines were never sent;
+    a later --from-start could not recover them (the file had a cursor by then)."""
+    site.append(site.router, "disk failure now")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    assert site.run("--from-start") == 1
+    entry = site.state()["router-disk"][site.router.as_posix()]
+    assert (entry["offset"], entry["line"]) == (0, 0)  # where the read began
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT")
+    assert site.run() == 0  # a plain run: the entry is honoured, nothing first-sighted
+    after = site.state()["router-disk"][site.router.as_posix()]
+    identity = ("ino", "dev", "fingerprint", "realpath")  # the open's, not a blank
+    assert [entry[k] for k in identity] == [after[k] for k in identity]
+    assert len(site.calls()) == 2  # the refused attempt, then the sent one
+    assert _mails_with(site, "disk failure now") == 2
+    assert body_of(site.calls()[1][1]).count("disk failure now") == 1
+    assert site.run() == 0
+    assert len(site.calls()) == 2  # nothing twice
+
+
+def test_a_first_sight_under_start_beginning_keeps_its_place_on_a_failure(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    site.write_config(router="start = beginning" + NL)
+    site.append(site.router, "disk failure now")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    assert site.run() == 1
+    assert site.state()["router-disk"][site.router.as_posix()]["offset"] == 0
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT")
+    assert site.run() == 0
+    assert body_of(site.calls()[-1][1]).count("disk failure now") == 1 and len(site.calls()) == 2
+    # the re-run continued from the entry: one first sight in the log, not two
+    router = [r for r in site.activity() if "first sight" in r and "router.log" in r]
+    assert len(router) == 1
+    assert site.run() == 0 and len(site.calls()) == 2
+
+
+def test_a_new_file_under_a_glob_keeps_its_place_on_a_failure(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    site.write_config(firewall_files=(site.root / "fw-*.log").as_posix())
+    site.prime()  # the glob's moment is recorded (its directory was listed)
+    new = site.root / "fw-new.log"
+    new.write_text("DENY 192.0.2.9" + NL, encoding="utf-8", newline=NL)
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT_IF_RCPT", "fw@example.net")
+    assert site.run() == 1  # new since the last run: read from 0, mailed, refused
+    assert site.state()["firewall"][new.as_posix()]["offset"] == 0
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT")
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT_IF_RCPT")
+    assert site.run() == 0
+    assert body_of(site.calls()[-1][1]).count("DENY 192.0.2.9") == 1 and len(site.calls()) == 2
+    # the re-run continued from the entry, the rule applied once (the failed run's)
+    assert sum("new since the last run" in r for r in site.activity()) == 1
+    assert site.run() == 0 and len(site.calls()) == 2
+
+
+def test_a_plain_first_sight_a_writer_appended_to_keeps_its_place_on_a_failure(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The trigger is not strictly --from-start: a line appended between the end-seek at
+    the open and the read contributes too, and its entry is the end the open saw."""
+    late = site.root / "late.log"
+    late.write_text("DENY 192.0.2.1 before the first sight" + NL + "up" + NL, encoding="utf-8",
+                    newline=NL)
+    site.write_config(firewall_files=late.as_posix())
+    real_scan = scan
+
+    def scan_after_an_append(path: str, lines: Any, watch: Any, **kw: Any) -> Any:
+        if path == late.as_posix():
+            site.append(late, "DENY 192.0.2.9")  # the source is open at the old end
+        return real_scan(path, lines, watch, **kw)
+
+    monkeypatch.setattr("logalert.run.scan", scan_after_an_append)
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT_IF_RCPT", "fw@example.net")
+    assert site.run() == 1
+    entry = site.state()["firewall"][late.as_posix()]
+    end = len("DENY 192.0.2.1 before the first sight" + NL + "up" + NL)
+    assert (entry["offset"], entry["line"]) == (end, 2)  # the end the open saw, line 2
+    monkeypatch.setattr("logalert.run.scan", real_scan)
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT")
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT_IF_RCPT")
+    assert site.run() == 0
+    body = body_of(site.calls()[-1][1])
+    assert body.count("DENY 192.0.2.9") == 1 and len(site.calls()) == 2
+    assert "3: DENY 192.0.2.9" in body  # numbered as the file numbers it
+    assert "192.0.2.1 before" not in body  # a stale identity would read from 0
+    after = site.state()["firewall"][late.as_posix()]
+    identity = ("ino", "dev", "fingerprint", "realpath")
+    assert [entry[k] for k in identity] == [after[k] for k in identity]
+
+
+def test_from_start_against_a_saved_position_continues_from_it(
+        site: Site) -> None:
+    """TEST-1 (#41): USAGE.md's "only a first sight is affected; a file with a saved
+    position continues from it" had no test against a saved cursor -- a hoisted "from-start
+    means byte 0" in LogFile._start_offset survived the suite and re-mailed the whole log
+    every run under start = beginning."""
+    site.write_config(router="start = beginning" + NL)
+    site.append(site.router, "disk failure 1")
+    assert site.run() == 0  # from 0: the first line mailed
+    site.append(site.router, "disk failure 2")
+    assert site.run("--from-start") == 0
+    assert len(site.calls()) == 2
+    second = body_of(site.calls()[1][1])
+    assert "disk failure 2" in second and "disk failure 1" not in second
+    assert site.run() == 0 and len(site.calls()) == 2
+
+
+def test_a_compressed_first_sight_that_contributed_is_re_read_then_settled(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #31: a start cursor carrying the archive's size and mtime (the shape of
+    cursor()) would have made the next run's unchanged-archive short-circuit skip the file
+    for good, the refused lines never re-sent; the start cursor carries neither."""
+    import gzip
+    archive = site.root / "old.log.gz"
+    archive.write_bytes(gzip.compress(("up" + NL + "DENY 192.0.2.9 archived" + NL).encode()))
+    site.write_config(firewall_files=archive.as_posix())
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    assert site.run("--from-start") == 1
+    entry = site.state()["firewall"][archive.as_posix()]
+    assert [entry[k] for k in ("offset", "line", "size", "mtime")] == [0, 0, None, None]
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT")
+    assert site.run() == 0  # decompressed again, the lines re-sent once
+    assert len(site.calls()) == 2 and "DENY 192.0.2.9 archived" in body_of(site.calls()[1][1])
+    entry = site.state()["firewall"][archive.as_posix()]
+    assert entry["size"] == archive.stat().st_size and entry["mtime"] is not None  # settled
+    real_open = logalert.cursor.open_log
+
+    def never(path: str, **kw: Any) -> Any:
+        assert path != archive.as_posix(), "an unchanged archive was decompressed again"
+        return real_open(path, **kw)
+
+    monkeypatch.setattr(logalert.cursor, "open_log", never)
+    assert site.run() == 0 and len(site.calls()) == 2  # not opened, nothing twice
+
+
+def test_a_first_sight_whose_read_fails_keeps_its_place_too(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review of #31, the failed-READ door: a new-file-rule file whose scan raised mid-read
+    had no entry, the section's record moved past it, and the next run first-sighted it at
+    the end -- its content never sent. With the entry at the read's start it is re-read."""
+    site.write_config(firewall_files=(site.root / "fw-*.log").as_posix())
+    site.prime()
+    new = site.root / "fw-new.log"
+    new.write_text("DENY 192.0.2.9" + NL + "DENY 192.0.2.10" + NL, encoding="utf-8", newline=NL)
+    real_scan = scan
+
+    def failing_scan(path: str, lines: Any, watch: Any, **kw: Any) -> Any:
+        if path == new.as_posix():
+            next(lines)  # one line read, then the stream dies
+            raise OSError(f"{path}: incomplete or corrupt compressed stream (staged)")
+        return real_scan(path, lines, watch, **kw)
+
+    monkeypatch.setattr("logalert.run.scan", failing_scan)
+    assert site.run() == 1
+    assert "incomplete or corrupt compressed stream (staged)" in capsys.readouterr().err
+    assert site.state()["firewall"][new.as_posix()]["offset"] == 0  # where the read began
+    monkeypatch.setattr("logalert.run.scan", real_scan)
+    assert site.run() == 0
+    body = body_of(site.calls()[-1][1])
+    assert "DENY 192.0.2.9" in body and "DENY 192.0.2.10" in body and len(site.calls()) == 1
+
+
+def test_a_quiet_first_sight_read_from_the_start_moves_on_in_a_failed_section(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The branch order (review of #31): a first sight that contributed NOTHING moves to
+    its end even under --from-start, as the rule says; the no-entry branch is for the
+    files whose lines are in the message."""
+    quiet = site.root / "fw-quiet.log"
+    quiet.write_text("up" + NL + "still up" + NL, encoding="utf-8", newline=NL)
+    site.write_config(firewall_files=site.firewall.as_posix() + NL + f"    {quiet.as_posix()}")
+    site.append(site.firewall, "DENY 192.0.2.9")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT_IF_RCPT", "fw@example.net")
+    assert site.run("--from-start") == 1
+    assert site.offset("firewall", quiet) == quiet.stat().st_size  # read from 0, moved on
+    assert site.offset("firewall", site.firewall) == 0  # contributed: where its read began
+
+
+def test_a_permission_on_the_rotated_copy_is_a_failed_item_and_the_position_moves_on(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The owner's call on #38 (option C): exit 1 naming what the permission kept out of
+    reach, so cron carries the line once per rotation, while the cursor moves on to the
+    live file -- a kept cursor would leave the section stuck behind a permanent mode."""
+    site.prime()
+    site.append(site.router, "disk failure before the rotation")
+    copy = site.root / "router.log.1"
+    site.router.replace(copy)  # a rename rotation; the copy holds the position
+    site.router.write_text("disk failure after" + NL, encoding="utf-8", newline=NL)
+    real_open = logalert.cursor.open_log  # the name rotation looks up
+
+    def refuse(target: str, *, follow_links: bool = False) -> Any:
+        if os.path.normcase(target) == os.path.normcase(str(copy)):
+            raise PermissionError(13, "Permission denied", target)
+        return real_open(target, follow_links=follow_links)
+
+    monkeypatch.setattr("logalert.rotation.open_log", refuse)
+    assert site.run() == 1
+    err = capsys.readouterr().err
+    assert err == (f"logalert: 1 of 1 section sent; failed: [router-disk] "
+                   f"{site.router.as_posix()}: a permission kept the rotated copies out of reach "
+                   f"(router.log.1); the lines before the rotation are lost; see the log" + NL)
+    (_, stdin), = site.calls()
+    body = body_of(stdin)
+    assert "disk failure after" in body and "before the rotation" not in body
+    assert site.offset("router-disk", site.router) == site.router.stat().st_size  # moved on
+    assert site.run() == 0 and len(site.calls()) == 1  # the next run: nothing to say

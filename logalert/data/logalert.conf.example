@@ -22,7 +22,7 @@
 #from = logalert@example.net
 
 # Where logalert remembers its position in each file between runs. The
-# directory must exist and be writable by the user cron runs logalert as; the
+# directory must exist and be OWNED by the user cron runs logalert as; the
 # file is written 0600 and the run lock (`lock`) sits next to it. To forget a
 # position: `logalert --reset-state /path/to/file` (every file: no path).
 #state_file = /var/lib/logalert/state.json
@@ -37,7 +37,9 @@
 
 # How alert emails leave the box: auto (default) uses the local sendmail
 # binary when it exists and otherwise refuses to start with a message saying
-# what to install; sendmail; or smtp to a relay.
+# what to install; sendmail; or smtp to a relay that accepts mail from this
+# host without a login (SMTP AUTH is not supported: a relay that wants one is
+# reached through msmtp or dma as the sendmail transport).
 #transport = auto
 #sendmail_path = /usr/sbin/sendmail
 #smtp_host = mail.example.net
@@ -86,7 +88,9 @@ to =
 files =
     /var/log/router.log
 
-# What to look for. Literal text is matched case-SENSITIVELY:
+# What to look for. Literal text is matched case-SENSITIVELY. Lines are decoded
+# as UTF-8, so non-ASCII text in a pattern is found in a UTF-8 log only (and no
+# ordinary pattern matches a UTF-16 log); `--check-config` points it out:
 patterns =
     disk failure
     Requesting reboot

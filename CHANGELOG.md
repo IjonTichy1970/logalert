@@ -88,6 +88,73 @@ its notes.
   lines were never mailed. A copy renamed or gone between the directory listing
   and its open makes the plan list the directory again, once.
 
+- `[contract]` **The documents say SMTP AUTH is not supported and name the way
+  through: `msmtp-mta` or `dma` as the sendmail transport** (#58). A relay's
+  `530 Authentication required` and `554 Relay access denied` get a
+  troubleshooting row; Exim, Debian's default MTA, is named beside Postfix,
+  `dma` and `msmtp-mta`.
+
+- `[contract]` **Lines are decoded as UTF-8, the pattern and exclude rows say
+  so, and `--check-config` points out a pattern with non-ASCII text, once per
+  key** (#57). A latin-1 log never matched an umlaut pattern (and an umlaut
+  exclude let the line through), no ordinary pattern matched a UTF-16 export,
+  and a UTF-8 BOM defeated `^` -- all silently. A troubleshooting row names
+  the three shapes.
+
+- `[contract]` **The service user's files are documented: the `file:` log is
+  pre-created (`install -o logalert -m 640 /dev/null`), the venv is made under
+  `umask 022` on a hardened host, and the state directory is owned by the
+  user, not merely writable** (#37). Three troubleshooting rows quote the
+  messages and give the remedies, including a root-owned lock.
+
+- `[contract]` **`INSTALL.md` gains "Python on an older distribution" -- a
+  versioned CPython built from source with `make altinstall` -- and "Moving to
+  a new host"** (#23). The four libraries the build needs at import time are
+  named with the check that proves them; a test pins that check to the
+  package's module-level imports. Rehearsed in the sandbox, both with and
+  without the libraries.
+
+- `[contract]` **SIGTERM ends a run the way Ctrl-C does: the sendmail child
+  killed with its process group, the temp state file unlinked, the lock
+  released, `logalert: terminated` and exit 143** (#33). The default
+  disposition bypassed every cleanup: an orphaned child queued what it had
+  read and a temp file stayed beside the state. A signalled run leaves one
+  WARNING record and no end line.
+
+- `[contract]` **A syslog socket nobody drains costs a run two 2 s waits and
+  the loud stderr fallback, not a hang before the lock** (#35). journald
+  stopped or wedged under its socket unit blocked the first record for good;
+  the timeout lives in the stdlib's reconnect seam, where one set after
+  construction was lost. The probe's stream `connect` is bounded the same way,
+  and Python 3.14's `SysLogHandler(timeout=)` covers INET sockets only.
+
+- `[contract]` **A full disk or quota is refused before any mail: the run
+  saves the state once, as loaded, before its first section** (#30). The
+  writable-directory probe is a 0-byte file that needs no block, so a full
+  filesystem passed it and the alert was mailed again on every run until space
+  was freed. A first lock on a full disk names the errno, not the ownership.
+
+- `[contract]` 🚨 **A file read for the first time in a section whose
+  delivery failed keeps its place too: an entry where that read began** (#31).
+  The #12 entry's "a failed delivery keeps the cursors of the files whose lines
+  the message carried" held for files with a saved position only; a
+  `--from-start` file got no entry, was first-sighted at its end next run,
+  and its lines were never sent.
+
+- `[contract]` **A rotated copy a permission keeps out of reach is a failed
+  item (exit 1), the position moving on all the same; a copy or directory the
+  user cannot read is one warning, and the no-copy line names the permission
+  first** (#38). The read failure was warned about twice, the unsearchable
+  directory dropped without a word, and the causes line named four causes the
+  run had just ruled out. A corrupt copy stays a warning.
+
+- `[contract]` **logrotate's `extension` form is a rotated copy:
+  `router.1.log.gz` is read after a rotation and left out of a glob beside
+  `router.log`** (#51). The interval's lines were lost under it and the plain
+  copy was mailed whole. The chain keeps to the matched copy's naming form, so
+  a numbered live sibling is never chained as a copy; the epoch suffix no
+  longer goes through `fromtimestamp`, which overflows on a 32-bit `time_t`.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

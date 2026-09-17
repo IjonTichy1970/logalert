@@ -283,6 +283,7 @@ def test_bounded_passes_success_and_failure_through_unchanged() -> None:
 # here are also the floor: each must be found at least once, so a rename cannot make the guard
 # vacuous.
 BOUNDED_BINARIES = ("runuser", "logrotate", "journalctl", "systemctl", "cp", "python3",
+                    "mount", "umount", "dd",  # the full-disk check's tmpfs (issue #30)
                     '"$pyx"', '"$T/venv/bin/python"', '"$T/bin/logalert"')
 _TREE_BINARY = re.compile(r'^"?\$\{?(?:T|pyx)\}?"?(?:/\S*)?$')
 # where a command may begin: after these, the next word is at a command position
