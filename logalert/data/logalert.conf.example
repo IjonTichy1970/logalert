@@ -88,7 +88,9 @@ to =
 files =
     /var/log/router.log
 
-# What to look for. Literal text is matched case-SENSITIVELY:
+# What to look for. Literal text is matched case-SENSITIVELY. Lines are decoded
+# as UTF-8, so non-ASCII text in a pattern is found in a UTF-8 log only (and no
+# ordinary pattern matches a UTF-16 log); `--check-config` points it out:
 patterns =
     disk failure
     Requesting reboot

@@ -702,6 +702,29 @@ def test_scan_timeout_is_a_non_negative_integer_with_zero_off(tmp_path: Path) ->
     assert "scan_timeout" in GLOBAL_KEYS and "scan_timeout" in example_config()
 
 
+def test_a_non_ascii_pattern_or_exclude_is_a_check_config_note_once_per_key(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Issue #57: lines are decoded as UTF-8, so a pattern with an umlaut never matches a
+    latin-1 log and a non-ASCII exclude lets the line through -- silently, until now. One
+    warning per key, naming the first such entry; an ASCII configuration gets none."""
+    umlaut = "Gr" + chr(0xF6) + "sse"  # o-umlaut from the code point: deliberate non-ASCII
+    plain = write(tmp_path, watch(tmp_path, "exclude = known bad\n"))
+    assert load_config(plain).warnings == ()
+    hot = write(tmp_path, usable(tmp_path, watch(
+        tmp_path, f"ipatterns = link down\n    [high] {umlaut} zu klein\n    {umlaut}\n"
+        "iexclude = M" + chr(0xFC) + "ll\n")))
+    config = load_config(hot)
+    assert config.warnings == (
+        # the first NON-ASCII entry, named after its priority tag is stripped
+        f"[router-disk] ipatterns: '{umlaut} zu klein' has non-ASCII text; lines are decoded "
+        "as UTF-8, so a log in another encoding cannot match that text (see USAGE.md)",
+        "[router-disk] iexclude: 'M" + chr(0xFC) + "ll' has non-ASCII text; lines are decoded "
+        "as UTF-8, so a log in another encoding cannot match that text (see USAGE.md)",
+    )  # two such entries under ipatterns, one note; the exclude gets its own
+    assert main(["--check-config", "-f", hot]) == 0
+    assert capsys.readouterr().out.count("has non-ASCII text") == 2
+
+
 def test_a_nested_quantifier_is_a_check_config_warning_never_a_refusal(
         tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """(x+)+ and its kin backtrack without bound on a long line of ordinary words (measured:

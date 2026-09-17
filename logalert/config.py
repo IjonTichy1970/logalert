@@ -434,6 +434,7 @@ def _patterns(
     is_regex = "regex" in key
     ignore_case = key.startswith("i")
     result: list[Pattern] = []
+    noted = False  # one non-ASCII note per key (issue #57)
     for line in _list(where, section, key, required=False):
         priority: Priority | None = None
         text = line
@@ -443,6 +444,12 @@ def _patterns(
                 priority = cast(Priority, tag.group(1))
                 # stripped like every untagged entry: "[high]  x" must not become " x"
                 text = tag.group(2).strip()
+        if warnings is not None and not noted and not text.isascii():
+            # lines are decoded as UTF-8: a latin-1 or UTF-16 log never matches this
+            warnings.append(f"{where} {key}: {text!r} has non-ASCII text; lines are decoded "
+                            f"as UTF-8, so a log in another encoding cannot match that "
+                            f"text (see USAGE.md)")
+            noted = True
         compiled: re.Pattern[str] | None = None
         if is_regex:
             try:
@@ -727,8 +734,9 @@ def _expansion_note(found: Expansion) -> str:
 
 def describe(config: Config, sender: str | None = None, state_file: str | None = None,
              log: str | None = None, *, clean: Callable[[str], str] = str) -> str:
-    """The effective settings, one ASCII line each, for ``--check-config``; ``sender`` is
-    ``--from`` and ``state_file`` is ``--state-file``, each of which wins over the config
+    """The effective settings, one line each (ASCII, but for a non-ASCII pattern a warning
+    quotes), for ``--check-config``; ``sender`` is ``--from`` and ``state_file`` is
+    ``--state-file``, each of which wins over the config
     for the run it is given to; ``log`` is the destination as ``activity.describe`` resolves
     it (with `` (--log)`` when the command line chose it), else the setting is printed.
     ``clean`` is applied to every name that comes from a directory listing (``main`` passes

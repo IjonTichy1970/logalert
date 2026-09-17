@@ -94,6 +94,13 @@ its notes.
   troubleshooting row; Exim, Debian's default MTA, is named beside Postfix,
   `dma` and `msmtp-mta`.
 
+- `[contract]` **Lines are decoded as UTF-8, the pattern and exclude rows say
+  so, and `--check-config` points out a pattern with non-ASCII text, once per
+  key** (#57). A latin-1 log never matched an umlaut pattern (and an umlaut
+  exclude let the line through), no ordinary pattern matched a UTF-16 export,
+  and a UTF-8 BOM defeated `^` -- all silently. A troubleshooting row names
+  the three shapes.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

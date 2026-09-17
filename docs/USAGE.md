@@ -160,11 +160,11 @@ The file's rules:
 | `subject` | required | The Subject of the alert, verbatim (plus the suffix above). |
 | `to` | required | The recipients, one per line or comma-separated. |
 | `files` | required | The log files to read, absolute, one per line; an entry with `*`, `?` or `[` is a glob, expanded at every run ([Globs](#globs)). Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly and are read as a live log -- right for a one-off `start = beginning` read of a static archive, never for a rotated copy of a log the section already lists: the catch-up reads the copies itself, and a listed copy is mailed whole after every rotation (`--check-config` warns). An archive that has not changed since it was last read (same inode, size and mtime) is not decompressed again. A file the list names more than once, or a glob matches after it was named, is read once. A listed symbolic link is followed only when its owner is root, the running user or the file's owner ([Globs](#globs)). |
-| `patterns` | | Literal text, matched case-SENSITIVELY against the whole line. A line matches when any pattern of any of the four shapes is found in it. |
+| `patterns` | | Literal text, matched case-SENSITIVELY against the whole line. A line matches when any pattern of any of the four shapes is found in it. Lines are decoded as UTF-8 (a byte that is not becomes U+FFFD), so non-ASCII text in a pattern is found in a UTF-8 log only, and no ordinary pattern matches a UTF-16 log; `--check-config` points such a pattern out ([Troubleshooting](#troubleshooting)). |
 | `ipatterns` | | Literal text, case-insensitive. |
 | `regex` | | Python regular expressions (`re.search`), case-sensitive. `re` has no backtracking limit: a nested or ambiguous quantifier (`(x+)+`, `(x*)*`, `(\w+\s?)+`) can run for hours on one long line of ordinary words, holding the lock -- `--check-config` warns about that shape, and `scan_timeout` bounds the damage. An anchor or a delimiter class (`[^ ]+`) usually stops it. |
 | `iregex` | | Regular expressions, case-insensitive. |
-| `exclude`, `iexclude`, `exclude_regex`, `iexclude_regex` | | Noise: a line that matched a pattern but also matches one of these is dropped, and the count of dropped lines is in the mail's summary. The same four shapes. |
+| `exclude`, `iexclude`, `exclude_regex`, `iexclude_regex` | | Noise: a line that matched a pattern but also matches one of these is dropped, and the count of dropped lines is in the mail's summary. The same four shapes, matched against the same decoded line: an exclude with non-ASCII text never fires on a log in another encoding, and the line is mailed. |
 | `priority` | off | `high`, `medium` or `low`. The priority system is OFF unless a section sets this or a pattern carries a tag; when on, the mail carries `X-Logalert-Priority` plus the conventional `X-Priority` (`1`/`3`/`5`) and `Importance` (`high`/`normal`/`low`), the highest across the mail's matches. A pattern can carry its own tag: `[high] Requesting reboot` (lowercase, one space); any other bracketed prefix is part of the literal. |
 | `report` | `inline` | `inline` puts the report in the body; `attachment` attaches it as `<section>-<YYYYmmddTHHMM>.txt`, the section name reduced to ASCII letters, digits, `.`, `_` and `-` and cut to 40 characters (see [Mail](#mail)). The body opens with a summary either way. `--attach` forces the attachment for one run. |
 | `context` | the command line's `-c` | Lines of context before and after each match, like `grep -C`. Context never crosses from one file into another. |
@@ -273,7 +273,9 @@ to =
 files =
     /var/log/router.log
 
-# What to look for. Literal text is matched case-SENSITIVELY:
+# What to look for. Literal text is matched case-SENSITIVELY. Lines are decoded
+# as UTF-8, so non-ASCII text in a pattern is found in a UTF-8 log only (and no
+# ordinary pattern matches a UTF-16 log); `--check-config` points it out:
 patterns =
     disk failure
     Requesting reboot
@@ -759,6 +761,7 @@ configured destination still gets INFO and above.
 | `warning: From address '...' has no domain part; set from = in [logalert]` | The default From is `<user>@<short hostname>` | Set `from = logalert@example.net` |
 | `'...' is not a bare local@domain address` (exit 2; as `[logalert] from:`, `[<section>] to:` or `--from:`) | A display name, angle brackets or spaces in an address; a leading `-` is refused separately as `'...' starts with '-'` | Bare addresses only |
 | `scanning exceeded scan_timeout (300 s) at line N while trying regex '...'` (exit 1), or `stale lock` every run with PID N alive at 100 % CPU | A regex with a nested quantifier on a long line (`(x+)+`, `(\w+\s?)+`): `re` backtracks without bound; on Windows nothing bounds it | Simplify the regex (an anchor, a delimiter class instead of `\w+\s?`); the file is re-read next run, so `--reset-state <file>` skips the line if the log must keep it; `--check-config` names the shape |
+| A pattern or exclude with an umlaut (any non-ASCII text) never matches, or a `^` regex misses the first line, or a file is `N line(s) read, 0 matched` under an ASCII pattern, with `skipped M NUL bytes` in the log once it has more than one line | Lines are decoded as UTF-8 and nothing else: a latin-1 log, a UTF-8 BOM before line 1 (U+FEFF, which stands between `^` and the text), a UTF-16 export (every other byte is a NUL). Nothing warns at run time; a missed exclude lets the line through with U+FFFD where the byte was | Write the log as UTF-8 (`iconv -f latin1 -t utf-8`, or the exporter's encoding setting); an unanchored literal for a file with a BOM; `--check-config` names a non-ASCII pattern or exclude |
 | A pattern starting with `#` or `;` never matches | The parser drops such a continuation line as a comment | A regex with the escape: `\#`, `\;` |
 | `no rotated copy holds the saved position ...` in the log after every rotation | The archives are elsewhere, or fewer are kept than rotations happen between runs | Set `archive_dir`, or run logalert more often than the rotation |
 | `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config (or as `--check-config` lists a glob's match), or the file was never seen; given the glob itself it says `is a glob` | Use the exact path; `--reset-state` with no path forgets everything |

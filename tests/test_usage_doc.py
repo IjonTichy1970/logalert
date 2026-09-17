@@ -72,6 +72,23 @@ def test_the_mail_section_names_the_report_cap_and_the_escapes_from_a_refused_me
     assert "refusal in cron's mail every run" in table
 
 
+def test_the_reference_says_lines_are_decoded_as_utf_8_and_the_table_has_the_row() -> None:
+    """Issue #57: the decoding rule was stated for the display only; the pattern and
+    exclude rows, the shipped example's comment and the troubleshooting table say it now."""
+    text = _text()
+    reference = text[text.index("### A watch section"):text.index("### The example")]
+    rows = {row.split("|")[1].strip(): row for row in reference.splitlines()
+            if row.startswith("| `")}
+    assert "decoded as UTF-8" in rows["`patterns`"] and "UTF-16" in rows["`patterns`"]
+    excludes = rows["`exclude`, `iexclude`, `exclude_regex`, `iexclude_regex`"]
+    assert "matched against the same decoded line" in excludes
+    comment = example_config().replace(NL + "# ", " ")  # the shipped comment, unwrapped
+    assert "Lines are decoded as UTF-8, so non-ASCII text in a pattern" in comment
+    table = text[text.index("## Troubleshooting"):]
+    row = next(r for r in table.splitlines() if "umlaut" in r)
+    assert "UTF-16" in row and "U+FEFF" in row and "--check-config" in row
+
+
 def test_the_mail_section_says_smtp_auth_is_unsupported_and_names_the_way_through() -> None:
     """Issue #58: the deferral of SMTP AUTH (#11, #19) was on the record and not in the
     operator's contract; a relay's 530 named no way forward. The way is an MTA that can
