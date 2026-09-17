@@ -1472,3 +1472,190 @@ def test_the_opening_save_writes_the_state_as_loaded_before_the_first_section(
     assert json.loads(written) == json.loads(primed)  # the state as loaded, entries and all
     # rewritten, not left alone: a fresh file replaced the old one
     assert stat.st_mtime_ns != stamp.st_mtime_ns or stat.st_ino != stamp.st_ino
+
+
+# -- a first sight in a section whose delivery failed (issue #31) -------------------------------
+
+
+def _mails_with(site: Site, line: str) -> int:
+    return sum(body_of(stdin).count(line) for _, stdin in site.calls())
+
+
+def test_a_first_sight_under_from_start_that_contributed_keeps_its_place_on_a_failure(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Measured before the fix (both platforms): --from-start with the fake exiting 75 left
+    no entry, the next run first-sighted the file at its end and the lines were never sent;
+    a later --from-start could not recover them (the file had a cursor by then)."""
+    site.append(site.router, "disk failure now")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    assert site.run("--from-start") == 1
+    entry = site.state()["router-disk"][site.router.as_posix()]
+    assert (entry["offset"], entry["line"]) == (0, 0)  # where the read began
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT")
+    assert site.run() == 0  # a plain run: the entry is honoured, nothing first-sighted
+    after = site.state()["router-disk"][site.router.as_posix()]
+    identity = ("ino", "dev", "fingerprint", "realpath")  # the open's, not a blank
+    assert [entry[k] for k in identity] == [after[k] for k in identity]
+    assert len(site.calls()) == 2  # the refused attempt, then the sent one
+    assert _mails_with(site, "disk failure now") == 2
+    assert body_of(site.calls()[1][1]).count("disk failure now") == 1
+    assert site.run() == 0
+    assert len(site.calls()) == 2  # nothing twice
+
+
+def test_a_first_sight_under_start_beginning_keeps_its_place_on_a_failure(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    site.write_config(router="start = beginning" + NL)
+    site.append(site.router, "disk failure now")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    assert site.run() == 1
+    assert site.state()["router-disk"][site.router.as_posix()]["offset"] == 0
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT")
+    assert site.run() == 0
+    assert body_of(site.calls()[-1][1]).count("disk failure now") == 1 and len(site.calls()) == 2
+    # the re-run continued from the entry: one first sight in the log, not two
+    router = [r for r in site.activity() if "first sight" in r and "router.log" in r]
+    assert len(router) == 1
+    assert site.run() == 0 and len(site.calls()) == 2
+
+
+def test_a_new_file_under_a_glob_keeps_its_place_on_a_failure(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    site.write_config(firewall_files=(site.root / "fw-*.log").as_posix())
+    site.prime()  # the glob's moment is recorded (its directory was listed)
+    new = site.root / "fw-new.log"
+    new.write_text("DENY 192.0.2.9" + NL, encoding="utf-8", newline=NL)
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT_IF_RCPT", "fw@example.net")
+    assert site.run() == 1  # new since the last run: read from 0, mailed, refused
+    assert site.state()["firewall"][new.as_posix()]["offset"] == 0
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT")
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT_IF_RCPT")
+    assert site.run() == 0
+    assert body_of(site.calls()[-1][1]).count("DENY 192.0.2.9") == 1 and len(site.calls()) == 2
+    # the re-run continued from the entry, the rule applied once (the failed run's)
+    assert sum("new since the last run" in r for r in site.activity()) == 1
+    assert site.run() == 0 and len(site.calls()) == 2
+
+
+def test_a_plain_first_sight_a_writer_appended_to_keeps_its_place_on_a_failure(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The trigger is not strictly --from-start: a line appended between the end-seek at
+    the open and the read contributes too, and its entry is the end the open saw."""
+    late = site.root / "late.log"
+    late.write_text("DENY 192.0.2.1 before the first sight" + NL + "up" + NL, encoding="utf-8",
+                    newline=NL)
+    site.write_config(firewall_files=late.as_posix())
+    real_scan = scan
+
+    def scan_after_an_append(path: str, lines: Any, watch: Any, **kw: Any) -> Any:
+        if path == late.as_posix():
+            site.append(late, "DENY 192.0.2.9")  # the source is open at the old end
+        return real_scan(path, lines, watch, **kw)
+
+    monkeypatch.setattr("logalert.run.scan", scan_after_an_append)
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT_IF_RCPT", "fw@example.net")
+    assert site.run() == 1
+    entry = site.state()["firewall"][late.as_posix()]
+    end = len("DENY 192.0.2.1 before the first sight" + NL + "up" + NL)
+    assert (entry["offset"], entry["line"]) == (end, 2)  # the end the open saw, line 2
+    monkeypatch.setattr("logalert.run.scan", real_scan)
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT")
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT_IF_RCPT")
+    assert site.run() == 0
+    body = body_of(site.calls()[-1][1])
+    assert body.count("DENY 192.0.2.9") == 1 and len(site.calls()) == 2
+    assert "3: DENY 192.0.2.9" in body  # numbered as the file numbers it
+    assert "192.0.2.1 before" not in body  # a stale identity would read from 0
+    after = site.state()["firewall"][late.as_posix()]
+    identity = ("ino", "dev", "fingerprint", "realpath")
+    assert [entry[k] for k in identity] == [after[k] for k in identity]
+
+
+def test_from_start_against_a_saved_position_continues_from_it(
+        site: Site) -> None:
+    """TEST-1 (#41): USAGE.md's "only a first sight is affected; a file with a saved
+    position continues from it" had no test against a saved cursor -- a hoisted "from-start
+    means byte 0" in LogFile._start_offset survived the suite and re-mailed the whole log
+    every run under start = beginning."""
+    site.write_config(router="start = beginning" + NL)
+    site.append(site.router, "disk failure 1")
+    assert site.run() == 0  # from 0: the first line mailed
+    site.append(site.router, "disk failure 2")
+    assert site.run("--from-start") == 0
+    assert len(site.calls()) == 2
+    second = body_of(site.calls()[1][1])
+    assert "disk failure 2" in second and "disk failure 1" not in second
+    assert site.run() == 0 and len(site.calls()) == 2
+
+
+def test_a_compressed_first_sight_that_contributed_is_re_read_then_settled(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #31: a start cursor carrying the archive's size and mtime (the shape of
+    cursor()) would have made the next run's unchanged-archive short-circuit skip the file
+    for good, the refused lines never re-sent; the start cursor carries neither."""
+    import gzip
+    archive = site.root / "old.log.gz"
+    archive.write_bytes(gzip.compress(("up" + NL + "DENY 192.0.2.9 archived" + NL).encode()))
+    site.write_config(firewall_files=archive.as_posix())
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    assert site.run("--from-start") == 1
+    entry = site.state()["firewall"][archive.as_posix()]
+    assert [entry[k] for k in ("offset", "line", "size", "mtime")] == [0, 0, None, None]
+    monkeypatch.delenv("LOGALERT_FAKE_EXIT")
+    assert site.run() == 0  # decompressed again, the lines re-sent once
+    assert len(site.calls()) == 2 and "DENY 192.0.2.9 archived" in body_of(site.calls()[1][1])
+    entry = site.state()["firewall"][archive.as_posix()]
+    assert entry["size"] == archive.stat().st_size and entry["mtime"] is not None  # settled
+    real_open = logalert.cursor.open_log
+
+    def never(path: str, **kw: Any) -> Any:
+        assert path != archive.as_posix(), "an unchanged archive was decompressed again"
+        return real_open(path, **kw)
+
+    monkeypatch.setattr(logalert.cursor, "open_log", never)
+    assert site.run() == 0 and len(site.calls()) == 2  # not opened, nothing twice
+
+
+def test_a_first_sight_whose_read_fails_keeps_its_place_too(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review of #31, the failed-READ door: a new-file-rule file whose scan raised mid-read
+    had no entry, the section's record moved past it, and the next run first-sighted it at
+    the end -- its content never sent. With the entry at the read's start it is re-read."""
+    site.write_config(firewall_files=(site.root / "fw-*.log").as_posix())
+    site.prime()
+    new = site.root / "fw-new.log"
+    new.write_text("DENY 192.0.2.9" + NL + "DENY 192.0.2.10" + NL, encoding="utf-8", newline=NL)
+    real_scan = scan
+
+    def failing_scan(path: str, lines: Any, watch: Any, **kw: Any) -> Any:
+        if path == new.as_posix():
+            next(lines)  # one line read, then the stream dies
+            raise OSError(f"{path}: incomplete or corrupt compressed stream (staged)")
+        return real_scan(path, lines, watch, **kw)
+
+    monkeypatch.setattr("logalert.run.scan", failing_scan)
+    assert site.run() == 1
+    assert "incomplete or corrupt compressed stream (staged)" in capsys.readouterr().err
+    assert site.state()["firewall"][new.as_posix()]["offset"] == 0  # where the read began
+    monkeypatch.setattr("logalert.run.scan", real_scan)
+    assert site.run() == 0
+    body = body_of(site.calls()[-1][1])
+    assert "DENY 192.0.2.9" in body and "DENY 192.0.2.10" in body and len(site.calls()) == 1
+
+
+def test_a_quiet_first_sight_read_from_the_start_moves_on_in_a_failed_section(
+        site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The branch order (review of #31): a first sight that contributed NOTHING moves to
+    its end even under --from-start, as the rule says; the no-entry branch is for the
+    files whose lines are in the message."""
+    quiet = site.root / "fw-quiet.log"
+    quiet.write_text("up" + NL + "still up" + NL, encoding="utf-8", newline=NL)
+    site.write_config(firewall_files=site.firewall.as_posix() + NL + f"    {quiet.as_posix()}")
+    site.append(site.firewall, "DENY 192.0.2.9")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT_IF_RCPT", "fw@example.net")
+    assert site.run("--from-start") == 1
+    assert site.offset("firewall", quiet) == quiet.stat().st_size  # read from 0, moved on
+    assert site.offset("firewall", site.firewall) == 0  # contributed: where its read began

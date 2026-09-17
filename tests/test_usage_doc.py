@@ -133,7 +133,7 @@ def test_the_position_section_and_the_table_carry_the_full_disk_refusal() -> Non
     a dropped sentence or row reddens here."""
     text = _text()
     section = text[text.index("## Position tracking"):text.index("## Globs")]
-    assert "saved once at the start of every run but a" + NL + "dry run" in section
+    assert "saved once at the" + NL + "start of every run but a dry run" in section
     table = text[text.index("## Troubleshooting"):]
     row = next(r for r in table.splitlines() if "No space left on device" in r)
     assert "nothing was sent" in row and "Free space" in row and "Disk quota exceeded" in row
@@ -144,3 +144,12 @@ def test_the_position_section_and_the_table_carry_the_full_disk_refusal() -> Non
     assert "nothing was sent, because a run that " in source  # the line breaks there
     assert "cannot save its position would send everything again next time" in source
     assert "cannot write (" in (package / "state.py").read_text(encoding="utf-8")
+
+
+def test_the_position_section_says_a_first_sight_keeps_its_place_on_a_failed_delivery() -> None:
+    """Issue #31: the sentence held for files with a saved position only."""
+    text = _text()
+    section = text[text.index("## Position tracking"):text.index("## Globs")]
+    assert "file read for the first time that run is kept too" in section
+    assert "position where that" + NL + "read began" in section
+    assert "otherwise the end it started at" in section

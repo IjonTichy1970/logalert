@@ -735,6 +735,12 @@ class CatchUpSource:
         if self.live is not None:
             yield from self.live.lines()
 
+    def start_cursor(self, now: datetime | None = None) -> Cursor:
+        """The saved cursor, seen now: what a run over the copies would read again from
+        (issue #31; the same surface as ``LogFile``, never consumed here -- a catch-up has
+        an entry -- and a consumer must not move ``last_seen`` backwards)."""
+        return replace(self.saved, last_seen=timestamp(now))
+
     def cursor(self, now: datetime | None = None) -> Cursor:
         unfinished = [s for s in self.segments if s.started and not s.finished]
         if unfinished:

@@ -134,6 +134,13 @@ its notes.
   filesystem passed it and the alert was mailed again on every run until space
   was freed. A first lock on a full disk names the errno, not the ownership.
 
+- `[contract]` 🚨 **A file read for the first time in a section whose
+  delivery failed keeps its place too: an entry where that read began** (#31).
+  The #12 entry's "a failed delivery keeps the cursors of the files whose lines
+  the message carried" held for files with a saved position only; a
+  `--from-start` file got no entry, was first-sighted at its end next run,
+  and its lines were never sent.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

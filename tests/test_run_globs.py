@@ -182,7 +182,8 @@ def test_a_failed_delivery_leaves_the_record_so_the_rerun_reads_the_new_file_aga
     monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
     assert site.run() == 1
     assert at(site, "firewall", glob_of(site)) == timestamp(moment)  # the failed run: no move
-    assert new.as_posix() not in site.state().get("firewall", {})  # contributed: no cursor
+    # contributed: an entry at the offset the read began, 0 (issue #31; the record stays put)
+    assert site.state()["firewall"][new.as_posix()]["offset"] == 0
     monkeypatch.delenv("LOGALERT_FAKE_EXIT")
     assert site.run() == 0
     _, stdin = site.calls()[-1]

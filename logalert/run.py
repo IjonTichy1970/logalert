@@ -35,8 +35,9 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     error) and the file's mtime is not older than it -- a new daily file is all new
     content -- and then it is read from 0. The moments are written with the section's
     cursors (``state.record_run``), so a glob added to the list first-sights every match at
-    the end, a section whose delivery failed reads the same new file from 0 again next
-    run, and a glob whose directory was away or unlistable keeps its moment, so a file
+    the end, a section whose delivery failed keeps its moment (the new file it read keeps
+    an entry at the beginning, issue #31, and a file it did not reach is still new next
+    run), and a glob whose directory was away or unlistable keeps its moment, so a file
     created during the outage is read whole once the directory is back. A listed path is
     never new, wherever a glob also matches it: its first sight is #7's, unchanged; a
     path is one path however it is spelled (``normcase``, ``normpath``).
@@ -54,7 +55,18 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     still names it -- and context never crosses files) -- a file at its first sight in that
     run would otherwise be first-sighted again next time and lose what was written in
     between. Every file read is ``touch``ed so it never expires while its mail keeps
-    failing. The state is saved after EACH section, never once at the end.
+    failing -- and a contributing file with NO entry yet (a first sight under
+    ``--from-start``, ``start = beginning`` or the new-file rule; a plain first sight a
+    writer appended to between the end-seek and the read) gets one at the offset its read
+    began (``start_cursor``, issue #31): ``touch`` is a no-op without an entry, and the
+    next run first-sighted a ``--from-start`` file or a plain first sight at its END, its
+    lines never sent and never recoverable (the file had a cursor by then); under
+    ``start = beginning`` and the new-file rule the next run re-read from 0 by its own
+    rule, and what was missing was the entry itself. A first sight whose READ fails (a
+    corrupt stream, a scan timeout) gets the same entry for the same reason: "its cursor
+    stays" is vacuous for a file that has none, and a new-file-rule file lost its content
+    to the record moving past it (review). The state is saved after EACH section, never
+    once at the end.
   * Exit 0 writes nothing to stdout or stderr -- cron mails every byte, or discards it with a
     note. Every non-zero exit writes exactly ONE line to stderr naming each failed item:
     ``logalert: 2 of 3 sections sent; failed: [router-disk] sendmail exit 75 (EX_TEMPFAIL);
@@ -324,6 +336,7 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
     context = options.context if watch.context is None else watch.context
     reports: list[FileReport] = []
     cursors: dict[str, Cursor] = {}
+    starts: dict[str, Cursor] = {}  # where each read began (issue #31)
     paths, seen = _files(watch, outcome)
     tally: dict[str, list[int]] = {}  # per glob: files matched, with new lines, lines matched
     for path, globs in paths:
@@ -348,6 +361,7 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
         progress.file, progress.line, progress.pattern = path, 0, None
         try:
             with source:
+                starts[path] = source.start_cursor()  # before the read: it needs nothing of it
                 with scan_bound(config.settings.scan_timeout):
                     report = scan(path, source.lines(), watch, context=context,
                                   before=source.context_before, cap=watch.max_lines)
@@ -356,9 +370,11 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
                 cursors[path] = source.cursor()
         except OSError as exc:  # an archive vanishing mid-read, a corrupt stream
             outcome.fail(f"[{watch.name}] {path}: {_reason(exc, path)}")
+            _pin_first_sight(watch, state, path, starts)
             continue
         except ScanTimeout as exc:  # the cursor stays: the file is re-read next run
             outcome.fail(f"[{watch.name}] {path}: {exc}")
+            _pin_first_sight(watch, state, path, starts)
             continue
         # a glob's quiet file is a DEBUG record and counted in the glob's summary (issue
         # #50: a daily directory or a host tree wrote thousands of identical lines per run);
@@ -395,6 +411,10 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
         for path, cursor in cursors.items():
             if path in quiet:
                 state.set(watch.name, path, cursor)
+            elif state.get(watch.name, path) is None:
+                # a first sight that contributed (issue #31): its entry is where the read
+                # began, so the next run re-sends exactly these lines
+                state.set(watch.name, path, starts[path])
             else:
                 state.touch(watch.name, path)
         _save(state, watch.name, outcome, delivered=False)
@@ -403,6 +423,16 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
     for recipient, answer in delivery.refused:
         outcome.fail(f"[{watch.name}] refused: {recipient} -- {answer}")
     _advance(watch, state, cursors, options, outcome, started, seen, delivered=True)
+
+
+def _pin_first_sight(watch: Watch, state: State, path: str, starts: dict[str, Cursor]) -> None:
+    """A failed read leaves a saved cursor where it was; a FIRST SIGHT has none to leave
+    (review of issue #31): without an entry the next run first-sights the file at its end
+    -- a new-file-rule file whose read failed lost its content that way, the record moving
+    past it -- so its entry is where this read began, and the next run reads from there
+    (a timeout there is the documented case: --reset-state <file> skips it)."""
+    if path in starts and state.get(watch.name, path) is None:
+        state.set(watch.name, path, starts[path])
 
 
 def _files(watch: Watch, outcome: Outcome) -> tuple[list[tuple[str, tuple[str, ...]]],

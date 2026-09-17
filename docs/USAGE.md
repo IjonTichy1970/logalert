@@ -380,12 +380,15 @@ was last seen. Two sections watching the same file have two entries, so the
 section whose mail failed keeps its place while the other advances. The state is
 saved after each section, atomically; a section whose delivery failed keeps the
 positions of the files that contributed to the message (the next run re-sends
-them) and marks them seen, so a file whose mail keeps failing never expires; a
-file of that section that matched nothing moves on, since none of its lines is
-in the message. The state is also saved once at the start of every run but a
-dry run, as the proof that it can be: a full disk or an exhausted quota fails
-there, with nothing sent, where the writable-directory check alone passes (a
-0-byte probe needs no block).
+them) and marks them seen, so a file whose mail keeps failing never expires. A
+file read for the first time that run is kept too, at the position where that
+read began: the beginning under `--from-start`, `start = beginning` or the
+new-file rule, otherwise the end it started at. A file of that section that
+matched nothing moves on, since none of its lines is in the message. The
+state is also saved once at the
+start of every run but a dry run, as the proof that it can be: a full disk or
+an exhausted quota fails there, with nothing sent, where the
+writable-directory check alone passes (a 0-byte probe needs no block).
 
 **Rotation.** When a run finds the live file rotated (a different inode) or
 truncated (smaller than the saved offset, as `copytruncate` leaves it), it looks
@@ -526,10 +529,11 @@ run (a copy restored with its timestamps, a rotated copy under
 `include_archives = yes` -- `rename`, `gzip`, `xz` and `bzip2` keep the
 original's modification time), and every listed path, whose first sight is
 unchanged. A glob's moment is recorded when the section's positions are saved
--- never when its delivery failed, so the re-run reads the same new file from
-0 again, and never for a glob whose directory was away or could not be listed
-that run, so a file created during the outage is read whole once the directory
-is back. `--reset-state` forgets the section's moments with the positions: a
+-- never when its delivery failed (the new file it read keeps its position at
+the beginning, and a file the failed run did not reach is still new), and
+never for a glob whose directory was away or could not be listed that run, so
+a file created during the outage is read whole once the directory is back.
+`--reset-state` forgets the section's moments with the positions: a
 file that appears between the reset and the next run is a plain first sight
 at the end, so reset right before a run, or preview with `-n`. One consequence
 to know: a file the glob matched but could not open for a while (a `Permission
@@ -763,7 +767,7 @@ configured destination still gets INFO and above.
 | --- | --- | --- |
 | Nothing arrives, cron is quiet | The first run of a file starts at its end, so lines already there are never mailed; or the message is queued in the MTA | Append a matching line and wait for the next run, or run `logalert -n` and see what it would send; `mailq` for a queued message; `journalctl -t logalert` for what each run did |
 | `transport = auto but /usr/sbin/sendmail does not exist: ...` (exit 2) | No MTA on the host | Install one (`postfix`, `exim4-daemon-light`, `dma`, `msmtp-mta`; `dma` is in FreeBSD's base) or set `transport = smtp` and `smtp_host` |
-| The same `sendmail exit N` / `552` refusal in cron's mail every run, and nothing new from that section | The relay refuses the message for what it is (its size below the 1 MiB report cap, a content filter), and the run re-sends the same message each time -- everything behind it waits (a full disk is the other every-run shape: its row below) | Lower `max_lines` for one run so the block is accepted and the position moves past it; an `exclude_regex` for the shape; or `--reset-state <file>` (what is pending is forgotten). The MTA's log names the reason |
+| The same `sendmail exit N` / `552` refusal in cron's mail every run, and nothing new from that section | The relay refuses the message for what it is (its size below the 1 MiB report cap, a content filter), and the run re-sends the same message each time -- everything behind it waits (a full disk is the other every-run shape: its row below; a `--from-start` over a large file is the usual way into the size case) | Lower `max_lines` for one run so the block is accepted and the position moves past it; an `exclude_regex` for the shape; or `--reset-state <file>` (what is pending is forgotten). The MTA's log names the reason |
 | `... failed: [router-disk] sendmail exit 75 (EX_TEMPFAIL): ...; see the log` in cron's mail (exit 1), or `logalert: not delivered via sendmail (...): sendmail exit 75 (EX_TEMPFAIL): ...` from `--test-mail` | The MTA could not accept the message (its queue, its configuration) | The MTA's log; the run kept the section's position, so the next run re-sends (a `--test-mail` failure keeps nothing: there is no position) |
 | `not delivered via smtp (...): SMTPSenderRefused: 530 ...` from `--test-mail`, or `failed: [section] SMTPSenderRefused: 530 ...` in cron's mail every run (exit 1); or `every recipient refused: ... -- 554 ...` | The relay wants a login before it takes mail (`530 5.7.0 Authentication required` in RFC 4954's words; a hosted relay adds its own text), or takes mail only from hosts it knows (`... Relay access denied`); `transport = smtp` cannot log in | Reach the relay through an MTA that can, as the sendmail transport (`transport = auto`): Postfix and Exim in their smarthost configuration, `msmtp-mta` (`auth on`, the account in its configuration) or `dma`; or a relay of your own that accepts this host without a login |
 | The same lines arrive twice | A delivery whose state could not be saved afterwards (`state not saved` in the log) -- the mail went out, then the next run re-sent it | Make the state directory the running user's -- owned by it, and so writable (`state directory ... is not writable`). The run refuses to send when it cannot save: a directory it cannot write, and a full disk or quota, are refused before any mail (the row below). The window that remains is a disk with room for the positions as they were but not for what the run adds -- about one filesystem block -- where the same lines can arrive on every run until space is freed |

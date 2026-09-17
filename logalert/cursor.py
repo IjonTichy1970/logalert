@@ -584,6 +584,16 @@ class LogFile:
         """The byte just after the last complete line read so far."""
         return self.reader.offset
 
+    def start_cursor(self, now: datetime | None = None) -> Cursor:
+        """The cursor that would read again what this run read: the start offset and its
+        line count, with the identity taken at the open -- what a failed delivery saves for
+        a file that had no entry (issue #31), so the next run re-sends those lines instead
+        of first-sighting the file at its end. No size or mtime: an unread stream is not
+        settled."""
+        return Cursor(offset=self.start, ino=self.ino, dev=self.dev,
+                      fingerprint=self.fingerprint, realpath=self.realpath,
+                      last_seen=timestamp(now), line=self.start_line)
+
     def cursor(self, now: datetime | None = None) -> Cursor:
         return Cursor(offset=self.reader.offset, ino=self.ino, dev=self.dev,
                       fingerprint=self.fingerprint, realpath=self.realpath,
