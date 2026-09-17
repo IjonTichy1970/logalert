@@ -86,6 +86,22 @@ def test_the_readme_names_the_documents_and_the_site() -> None:
     assert "pip install logalert" in readme and "GitHub" in readme  # not on PyPI, said plainly
 
 
+def test_the_mta_lists_name_exim_and_the_login_limit() -> None:
+    """Issue #58: Exim is Debian's default MTA and provides the binary `transport = auto`
+    looks for; a Debian operator reading 'Postfix, dma or msmtp-mta' installed a second one.
+    And the relay `transport = smtp` reaches must take mail without a login."""
+    install = _text("INSTALL.md")
+    step = install[install.index("### 6. Mail"):install.index("### 7. Schedule it")]
+    assert "Exim" in step and "exim4-daemon-light" in step
+    assert "SMTP AUTH" in step and "msmtp-mta" in step
+    readme = _text("README.md")
+    assert "Exim" in readme and "no login" in readme
+    table = install[install.index("## Troubleshooting"):]
+    row = next(r for r in table.splitlines() if "Authentication required" in r)
+    assert "SMTPSenderRefused: 530" in row and "msmtp-mta" in row and "Exim" in row
+    assert "SMTP AUTH is not supported" in example_config()  # the shipped comment, too
+
+
 def test_the_classifiers_claim_linux_and_nothing_else() -> None:
     with open(REPO_ROOT / "pyproject.toml", "rb") as handle:
         classifiers = tomllib.load(handle)["project"]["classifiers"]

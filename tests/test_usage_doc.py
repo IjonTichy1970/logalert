@@ -3,6 +3,7 @@
 the document, and the exit-code table names all four codes. Both platforms."""
 
 import re
+import smtplib
 from pathlib import Path
 
 from logalert.__main__ import build_parser
@@ -69,3 +70,28 @@ def test_the_mail_section_names_the_report_cap_and_the_escapes_from_a_refused_me
         assert escape in mail, escape
     table = text[text.index("## Troubleshooting"):]
     assert "refusal in cron's mail every run" in table
+
+
+def test_the_mail_section_says_smtp_auth_is_unsupported_and_names_the_way_through() -> None:
+    """Issue #58: the deferral of SMTP AUTH (#11, #19) was on the record and not in the
+    operator's contract; a relay's 530 named no way forward. The way is an MTA that can
+    log in, as the sendmail transport, and the row quotes the transport's own words."""
+    text = _text()
+    mail = text[text.index("## Mail"):text.index("## Logging")]
+    paragraph = mail[mail.index("**SMTP AUTH is not supported.**"):mail.index("**`--test-mail")]
+    for name in ("Postfix", "Exim", "`msmtp-mta`", "`dma`", "`transport = auto`"):
+        assert name in paragraph, name
+    assert "`530`" in paragraph and "`554`" in paragraph
+    reference = text[text.index("## Configuration reference"):text.index("## Position tracking")]
+    assert "| `smtp_host` |" in reference and "No login" in reference
+    assert "exim's" in reference  # the sendmail_path row
+    table = text[text.index("## Troubleshooting"):]
+    row = next(r for r in table.splitlines() if "Authentication required" in r)
+    assert "every recipient refused" in row and "msmtp-mta" in row and "Exim" in row
+    assert "exim4-daemon-light" in table  # the no-MTA row names Debian's default
+    package = DOC.parents[1] / "logalert"
+    source = (package / "transport.py").read_text(encoding="utf-8")
+    assert "every recipient refused: " in source  # the row quotes the transport's text
+    assert "not delivered via smtp" in row  # __main__'s prefix for --test-mail
+    assert "not delivered via " in (package / "__main__.py").read_text(encoding="utf-8")
+    assert "SMTPSenderRefused" in row and hasattr(smtplib, "SMTPSenderRefused")

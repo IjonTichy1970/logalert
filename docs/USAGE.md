@@ -143,8 +143,8 @@ The file's rules:
 | `state_file` | `/var/lib/logalert/state.json` | Where the position in each file is kept between runs. The directory must exist and be writable by the user cron runs logalert as; logalert never creates it (a root run would leave it root-owned). The file is written `0600`, and so is the run lock, the file `lock` beside it (a lock any local user could open would be a lock any local user could hold). A `state_file` that is a symbolic link is refused (`is a symbolic link -- name the real path`): a link never worked as a redirect, since the first save would replace the link itself. Never under the venv. |
 | `log` | `syslog` | Where logalert writes its own activity: `syslog`, `stderr`, `file:/absolute/path` (outside the venv), or `udp:host:port` (`udp:[2001:db8::1]:514` for an IPv6 address; explicit only; never a fallback). See [Logging](#logging). |
 | `transport` | `auto` | How alerts leave the box: `auto` uses the local sendmail binary when it exists and otherwise refuses to start, saying what to install; `sendmail`; `smtp` to a relay. |
-| `sendmail_path` | `/usr/sbin/sendmail` | The sendmail binary (postfix's, dma's, msmtp's `sendmail` wrapper). Invoked as `sendmail -i -f <From> <recipients>`. |
-| `smtp_host` | | The relay, required when `transport = smtp`. A name, so the certificate can be verified under `smtp_starttls`. |
+| `sendmail_path` | `/usr/sbin/sendmail` | The sendmail binary (postfix's, exim's, dma's, msmtp's `sendmail` wrapper). Invoked as `sendmail -i -f <From> <recipients>`. |
+| `smtp_host` | | The relay, required when `transport = smtp`. A name, so the certificate can be verified under `smtp_starttls`. No login: see [Mail](#mail). |
 | `smtp_port` | `25` | The relay's port. |
 | `smtp_starttls` | `no` | Ask for STARTTLS with the platform's default certificate verification; a relay that cannot is a delivery failure, never a silent downgrade. |
 | `mail_timeout` | `60` | Seconds to wait for the mail system. For sendmail the whole child; for SMTP each socket operation (a slow relay can hold a run for a few multiples of it and still succeed). At most 3600. |
@@ -222,7 +222,9 @@ This is `logalert --example-config`, verbatim (a test keeps the two identical):
 
 # How alert emails leave the box: auto (default) uses the local sendmail
 # binary when it exists and otherwise refuses to start with a message saying
-# what to install; sendmail; or smtp to a relay.
+# what to install; sendmail; or smtp to a relay that accepts mail from this
+# host without a login (SMTP AUTH is not supported: a relay that wants one is
+# reached through msmtp or dma as the sendmail transport).
 #transport = auto
 #sendmail_path = /usr/sbin/sendmail
 #smtp_host = mail.example.net
@@ -596,7 +598,9 @@ local `sendmail` binary; a fresh Ubuntu server has none, and the run refuses to
 start rather than fail silently: `transport = auto but /usr/sbin/sendmail does
 not exist: install an MTA (Ubuntu: apt install postfix, dma or msmtp-mta;
 FreeBSD 14+: dma is in base) or set transport = smtp and smtp_host`. Any of
-those provides `/usr/sbin/sendmail`; configure it to relay to your mail server.
+those provides `/usr/sbin/sendmail`, and so does Exim, Debian's default MTA
+(`exim4-daemon-light`), which `transport = auto` finds as it is; configure
+whichever you have to relay to your mail server.
 `--check-config` reports whether the binary exists and is executable.
 
 **SMTP.** `transport = smtp` with `smtp_host` (a name), `smtp_port` and
@@ -614,6 +618,19 @@ everything written after the block waits behind it. The escapes: lower
 moves past the whole block), an `exclude_regex` for the offending shape, or
 `--reset-state <file>`, which forgets what is pending.
 
+**SMTP AUTH is not supported.** `transport = smtp` is for a relay that accepts
+mail from this host without a login -- port 25 inside a network, the usual
+shape. A relay that wants a login first answers with a `530` (`530 5.7.0
+Authentication required` in RFC 4954's words; a hosted relay on the submission
+port adds its own text) and every run fails with it; one that takes mail only
+from hosts it knows answers with a `554` (`... Relay access denied`). Reach such
+a relay through an MTA that can log in, as the sendmail transport, and leave
+`transport = auto`: Postfix and Exim can, in their smarthost configuration; the
+small ones are `msmtp-mta` (`auth on` and the account in its configuration; its
+`sendmail` wrapper takes logalert's `-i -f` and exits with the sysexits codes
+logalert names, `EX_TEMPFAIL` and the rest) and `dma`. There is no `smtp_user`
+key to find.
+
 **`--test-mail SECTION`** sends one real one-line message to that section's
 recipients and prints what happened:
 
@@ -629,7 +646,8 @@ with exit 1, or the configuration error with exit 2.
 **"Accepted for queueing" is not "delivered".** A sendmail exit 0 means the MTA
 took the message; it may still sit in the queue if the relay is unreachable.
 `mailq` (and the MTA's own log: `journalctl -u 'postfix*'`, `journalctl -t dma`,
-`/var/log/mail.log`) is where a message that never arrived is found. The
+`/var/log/mail.log`, Exim's `/var/log/exim4/mainlog`) is where a message that
+never arrived is found. The
 activity log records every message with its recipients, size and `Message-ID`
 (also in the mail's summary), the key to correlate the two.
 
@@ -728,9 +746,10 @@ configured destination still gets INFO and above.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Nothing arrives, cron is quiet | The first run of a file starts at its end, so lines already there are never mailed; or the message is queued in the MTA | Append a matching line and wait for the next run, or run `logalert -n` and see what it would send; `mailq` for a queued message; `journalctl -t logalert` for what each run did |
-| `transport = auto but /usr/sbin/sendmail does not exist: ...` (exit 2) | No MTA on the host | Install one (`postfix`, `dma`, `msmtp-mta`; `dma` is in FreeBSD's base) or set `transport = smtp` and `smtp_host` |
+| `transport = auto but /usr/sbin/sendmail does not exist: ...` (exit 2) | No MTA on the host | Install one (`postfix`, `exim4-daemon-light`, `dma`, `msmtp-mta`; `dma` is in FreeBSD's base) or set `transport = smtp` and `smtp_host` |
 | The same `sendmail exit N` / `552` refusal in cron's mail every run, and nothing new from that section | The relay refuses the message for what it is (its size below the 1 MiB report cap, a content filter), and the run re-sends the same message each time -- everything behind it waits | Lower `max_lines` for one run so the block is accepted and the position moves past it; an `exclude_regex` for the shape; or `--reset-state <file>` (what is pending is forgotten). The MTA's log names the reason |
 | `... failed: [router-disk] sendmail exit 75 (EX_TEMPFAIL): ...; see the log` in cron's mail (exit 1), or `logalert: not delivered via sendmail (...): sendmail exit 75 (EX_TEMPFAIL): ...` from `--test-mail` | The MTA could not accept the message (its queue, its configuration) | The MTA's log; the run kept the section's position, so the next run re-sends (a `--test-mail` failure keeps nothing: there is no position) |
+| `not delivered via smtp (...): SMTPSenderRefused: 530 ...` from `--test-mail`, or `failed: [section] SMTPSenderRefused: 530 ...` in cron's mail every run (exit 1); or `every recipient refused: ... -- 554 ...` | The relay wants a login before it takes mail (`530 5.7.0 Authentication required` in RFC 4954's words; a hosted relay adds its own text), or takes mail only from hosts it knows (`... Relay access denied`); `transport = smtp` cannot log in | Reach the relay through an MTA that can, as the sendmail transport (`transport = auto`): Postfix and Exim in their smarthost configuration, `msmtp-mta` (`auth on`, the account in its configuration) or `dma`; or a relay of your own that accepts this host without a login |
 | The same lines arrive twice | A delivery whose state could not be saved afterwards (`state not saved` in the log) -- the mail went out, then the next run re-sent it | Make the state directory writable by the running user (`state directory ... is not writable`); the run refuses to send when it cannot save, once it knows |
 | `[section] /var/log/x.log: Permission denied` (exit 1) | The running user cannot read that file; the other files of the section were processed | Grant read access (a group, ACLs) or run as a user that has it |
 | `state file ... belongs to <user>; a run as root would leave it root-owned ...` -- or, before the first run, `state directory ... belongs to <user>; ...` (exit 1) | A root run against a cron user's state | Run as that user: `sudo -u <user> logalert ...` |

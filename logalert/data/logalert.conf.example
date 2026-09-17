@@ -37,7 +37,9 @@
 
 # How alert emails leave the box: auto (default) uses the local sendmail
 # binary when it exists and otherwise refuses to start with a message saying
-# what to install; sendmail; or smtp to a relay.
+# what to install; sendmail; or smtp to a relay that accepts mail from this
+# host without a login (SMTP AUTH is not supported: a relay that wants one is
+# reached through msmtp or dma as the sendmail transport).
 #transport = auto
 #sendmail_path = /usr/sbin/sendmail
 #smtp_host = mail.example.net

@@ -88,6 +88,12 @@ its notes.
   lines were never mailed. A copy renamed or gone between the directory listing
   and its open makes the plan list the directory again, once.
 
+- `[contract]` **The documents say SMTP AUTH is not supported and name the way
+  through: `msmtp-mta` or `dma` as the sendmail transport** (#58). A relay's
+  `530 Authentication required` and `554 Relay access denied` get a
+  troubleshooting row; Exim, Debian's default MTA, is named beside Postfix,
+  `dma` and `msmtp-mta`.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

@@ -134,9 +134,16 @@ The default transport hands each message to the local `/usr/sbin/sendmail`; a
 fresh server has none, and logalert refuses to start rather than run without
 one (`transport = auto but /usr/sbin/sendmail does not exist: install an MTA
 ...`). Install one and point it at your mail server -- Postfix, `dma` or
-`msmtp-mta` on Debian and Ubuntu (`dma` is in FreeBSD's base) -- or set
-`transport = smtp` and `smtp_host` in `[logalert]` to hand messages to a relay
-directly. Then, as the service user:
+`msmtp-mta` on Debian and Ubuntu (`dma` is in FreeBSD's base); on Debian, Exim
+(`exim4-daemon-light`) is the default MTA and, where the standard install put
+it, already provides `/usr/sbin/sendmail`: configure it rather than install a
+second one beside it -- or set `transport = smtp` and `smtp_host` in
+`[logalert]` to hand messages to a relay directly. That relay must accept mail
+from this host without a login: SMTP AUTH is not supported, and a relay that
+wants one (a `530`, `Authentication required`) is reached through an MTA that
+can log in as the sendmail transport instead -- Postfix or Exim in their
+smarthost configuration, `msmtp-mta` (`auth on`) or `dma`
+([docs/USAGE.md](docs/USAGE.md#mail)). Then, as the service user:
 
 ```bash
 sudo -u logalert logalert --check-config
@@ -293,6 +300,7 @@ sudo rm -rf /opt/logalert-venv
 | `state directory /var/lib/logalert does not exist -- create it, owned by the user logalert runs as` (exit 1) | Step 5 was skipped, or the run is under a different user's `state_file` | Create it, owned by the service user (step 5); a root run never creates it for you |
 | `state directory ... belongs to <user>; a run as root would leave the state and the lock root-owned ...` (exit 1) | `sudo logalert` against the service user's state | Run as that user: `sudo -u logalert logalert ...` |
 | `transport = auto but /usr/sbin/sendmail does not exist: install an MTA ...` (exit 2) | No mail transfer agent on the host | Install one, or `transport = smtp` with `smtp_host` (step 6) |
+| `not delivered via smtp (...): SMTPSenderRefused: 530 ...` from `--test-mail`, or the same `530` as `failed: [section] ...` in cron's mail every run (exit 1) | The relay wants a login (`Authentication required`); `transport = smtp` cannot log in | Reach it through an MTA that can, as the sendmail transport (`transport = auto`): Postfix or Exim in their smarthost configuration, `msmtp-mta` (`auth on`) or `dma` (step 6) |
 | `[section] /var/log/x.log: Permission denied` (exit 1) | The service user cannot read that log | `sudo usermod -aG adm logalert` on Debian/Ubuntu, or a group/ACL of your own (step 5) |
 
 ## Platform notes
