@@ -57,7 +57,7 @@ def test_round_trip_and_the_on_disk_shape(tmp_path: Path) -> None:
     entry = data["entries"]["router-disk"]["/var/log/router.log"]
     assert entry == {"offset": 10, "ino": 1234, "dev": 56, "fingerprint": "ab" * 32,
                      "realpath": "/var/log/r.log", "last_seen": "2026-09-14T12:00:00Z",
-                     "line": None}
+                     "line": None, "size": None, "mtime": None}  # size/mtime: issue #44
     assert data["entries"]["firewall"]["/var/log/router.log"]["fingerprint"] is None
     again = load_state(path)
     assert again.entries == state.entries
@@ -420,6 +420,48 @@ def test_a_bad_line_count_is_a_hard_error(tmp_path: Path, bad: str) -> None:
             '"line": BAD}}}}').replace("BAD", bad)
     path.write_text(text, encoding="utf-8", newline="\n")
     with pytest.raises(StateError, match="'line' is not a non-negative integer"):
+        load_state(str(path))
+
+
+# -- size and mtime (issue #44) ---------------------------------------------------------------
+
+
+def test_size_and_mtime_round_trip_and_a_file_without_them_loads(tmp_path: Path) -> None:
+    """What a compressed file looked like when it was last read, so an unchanged archive is
+    not decompressed again; optional, so 0.1.0's state loads and 0.1.0 drops them on save."""
+    path = str(tmp_path / "state.json")
+    state = State(path)
+    cursor = Cursor(offset=10, ino=1, dev=2, fingerprint=None, realpath="/var/log/r.log.gz",
+                    last_seen="2026-09-14T12:00:00Z", line=7, size=4096, mtime=1758067200.25)
+    state.set("s", "/var/log/r.log.gz", cursor)
+    state.save()
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    entry = data["entries"]["s"]["/var/log/r.log.gz"]
+    assert entry["size"] == 4096 and entry["mtime"] == 1758067200.25
+    assert load_state(path).get("s", "/var/log/r.log.gz") == cursor
+    Path(path).write_text(
+        '{"version": 1, "entries": {"a": {"/x": {"offset": 1, "ino": 2, "dev": 3, '
+        '"fingerprint": null, "realpath": "/x", "last_seen": "2026-09-14T12:00:00Z"}}}}',
+        encoding="utf-8", newline="\n")
+    loaded = load_state(path).get("a", "/x")
+    assert loaded is not None and loaded.size is None and loaded.mtime is None
+
+
+@pytest.mark.parametrize("field, bad, message", [
+    ("size", "-1", "'size' is not a non-negative integer"),
+    ("size", "1.5", "'size' is not a non-negative integer"),
+    ("mtime", '"soon"', "'mtime' is not a number"),
+    ("mtime", "true", "'mtime' is not a number"),
+    ("mtime", "NaN", "'mtime' is not a number"),
+])
+def test_a_bad_size_or_mtime_is_a_hard_error(tmp_path: Path, field: str, bad: str,
+                                             message: str) -> None:
+    path = tmp_path / "state.json"
+    text = ('{"version": 1, "entries": {"a": {"/x": {"offset": 1, "ino": 2, "dev": 3, '
+            '"fingerprint": null, "realpath": "/x", "last_seen": "2026-09-14T12:00:00Z", '
+            '"FIELD": BAD}}}}').replace("FIELD", field).replace("BAD", bad)
+    path.write_text(text, encoding="utf-8", newline="\n")
+    with pytest.raises(StateError, match=message):
         load_state(str(path))
 
 

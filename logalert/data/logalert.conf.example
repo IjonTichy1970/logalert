@@ -157,14 +157,15 @@ patterns =
 #include_archives = no
 
 # ---------------------------------------------------------------------------
-# A second watch, on a compressed log, with case-insensitive matching.
+# A second watch, with case-insensitive matching. The rotated copies
+# (firewall.log.0.gz, ...) are read by the catch-up when the file rotates;
+# listing one beside the live file would mail it whole after every rotation.
 
 #[firewall-denies]
 #subject = Firewall denies
 #to = noc@example.net, security@example.net
 #files =
 #    /var/log/firewall.log
-#    /var/log/firewall.log.0.gz
 #ipatterns =
 #    deny
 #exclude_regex =

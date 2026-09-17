@@ -159,7 +159,7 @@ The file's rules:
 | --- | --- | --- |
 | `subject` | required | The Subject of the alert, verbatim (plus the suffix above). |
 | `to` | required | The recipients, one per line or comma-separated. |
-| `files` | required | The log files to read, absolute, one per line; an entry with `*`, `?` or `[` is a glob, expanded at every run ([Globs](#globs)). Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly. A file the list names more than once, or a glob matches after it was named, is read once. A listed symbolic link is followed only when its owner is root, the running user or the file's owner ([Globs](#globs)). |
+| `files` | required | The log files to read, absolute, one per line; an entry with `*`, `?` or `[` is a glob, expanded at every run ([Globs](#globs)). Compressed files (`.gz`, `.bz2`, `.xz`; `.zst` on Python 3.14+) may be listed directly and are read as a live log -- right for a one-off `start = beginning` read of a static archive, never for a rotated copy of a log the section already lists: the catch-up reads the copies itself, and a listed copy is mailed whole after every rotation (`--check-config` warns). An archive that has not changed since it was last read (same inode, size and mtime) is not decompressed again. A file the list names more than once, or a glob matches after it was named, is read once. A listed symbolic link is followed only when its owner is root, the running user or the file's owner ([Globs](#globs)). |
 | `patterns` | | Literal text, matched case-SENSITIVELY against the whole line. A line matches when any pattern of any of the four shapes is found in it. |
 | `ipatterns` | | Literal text, case-insensitive. |
 | `regex` | | Python regular expressions (`re.search`), case-sensitive. `re` has no backtracking limit: a nested or ambiguous quantifier (`(x+)+`, `(x*)*`, `(\w+\s?)+`) can run for hours on one long line of ordinary words, holding the lock -- `--check-config` warns about that shape, and `scan_timeout` bounds the damage. An anchor or a delimiter class (`[^ ]+`) usually stops it. |
@@ -342,14 +342,15 @@ patterns =
 #include_archives = no
 
 # ---------------------------------------------------------------------------
-# A second watch, on a compressed log, with case-insensitive matching.
+# A second watch, with case-insensitive matching. The rotated copies
+# (firewall.log.0.gz, ...) are read by the catch-up when the file rotates;
+# listing one beside the live file would mail it whole after every rotation.
 
 #[firewall-denies]
 #subject = Firewall denies
 #to = noc@example.net, security@example.net
 #files =
 #    /var/log/firewall.log
-#    /var/log/firewall.log.0.gz
 #ipatterns =
 #    deny
 #exclude_regex =

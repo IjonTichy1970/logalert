@@ -65,6 +65,12 @@ its notes.
   its position kept. Enforced on POSIX; Windows reports the key and cannot
   enforce it.
 
+- `[contract]` **A listed compressed file is decompressed once at first sight
+  and not at all while unchanged** (#44). The cursor records the archive's size
+  and mtime; the example's second watch no longer lists a rotated copy beside
+  its log, and `--check-config` warns when a listed entry is one (it was read
+  as a live log and mailed whole after every rotation).
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty
