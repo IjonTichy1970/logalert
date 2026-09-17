@@ -169,6 +169,13 @@ its notes.
   the directory. A refused delivery now keeps the entry's sighting too (touched
   once halfway to `state_ttl`), so the gap's bound stays at the position.
 
+- `[contract]` **A live file rotated and compressed while the plan was made
+  is read once, from the copy** (#67). gzip finishing inside that window made
+  the `.gz` a chain member beside the handle it was made from, and the file's
+  lines were mailed twice. The handle is skipped when the last copy read has
+  its first line, its modification time and at least its length; any of the
+  three failing keeps the read.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

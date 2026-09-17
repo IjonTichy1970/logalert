@@ -313,3 +313,36 @@ def test_a_gap_deeper_than_rotate_keeps_reads_the_surviving_copies(
     warned = [r.getMessage() for r in caplog.records if "no rotated copy" in r.getMessage()]
     assert len(warned) == 1 and "the archive aged out" in warned[0]
     assert "reading the 1 rotated copy written since the last run" in warned[0]
+
+
+def test_compress_finishing_inside_the_plan_mails_the_rotated_file_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #67, with real logrotate: gzip finishing between the live open and the listing
+    made the .gz a chain member beside the handle it was made from ('middle 1' twice)."""
+    import logalert.rotation as rotation_module
+
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1\n")
+    logrotate(tmp_path, path, "    create\n    compress\n")
+    append(path, b"middle 1\n")
+    real_scan = rotation_module.scan_directories
+    calls = {"n": 0}
+
+    def rotate_before_the_listing(directories: list[str], base: str) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:  # the live file is open already: its rotation and gzip land now
+            logrotate(tmp_path, path, "    create\n    compress\n")
+            append(path, b"live 1\n")
+        return real_scan(directories, base)
+
+    monkeypatch.setattr(rotation_module, "scan_directories", rotate_before_the_listing)
+    caplog.set_level("INFO", logger="logalert.rotation")
+    source, lines, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.absorbed
+    assert lines == ["since 1", "middle 1"]
+    assert any("rotated and compressed during the run (router.log.1.gz)" in r.getMessage()
+               for r in caplog.records)
+    _, rest, _ = run(path, parked)
+    assert rest == ["live 1"]

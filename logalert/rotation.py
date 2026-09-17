@@ -113,7 +113,16 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     every name with its new inode and no other signal); a second rotation inside one run
     reaches the no-copy warning, which names that cause. The stop needs the archive it
     parks on to survive until the next run: retention one rotation deeper than the
-    interval needs.
+    interval needs. The live handle's own file can be rotated and
+    compressed inside that window too (issue #67, ``compress`` without ``delaycompress``
+    on a small log): the ``.gz`` is a new inode the live-handle exclusion cannot know,
+    so the same lines came once from the copy and once through the handle (measured).
+    When the handle's identity was absent from the listing and the LAST copy read has
+    the handle's first line, its mtime (to the second; gzip and logrotate keep it) and
+    at least its length, the copy is that file: the handle is skipped and the cursor
+    parks on the copy. The absence alone is not the signal -- ``olddir`` without
+    ``archive_dir`` moves the file out of every listed directory -- and any of the three
+    failing keeps the read: a duplicate at worst, never a loss.
 """
 
 import errno
@@ -519,6 +528,8 @@ class Plan:
     verified: "Verified | None" = None  # the match's open handle, positioned at the offset
     denied: str = ""  # the failed item when a permission kept the copies out of reach and
     #                    nothing matched (issue #38, the owner's call); the run collects it
+    live_listed: bool = True  # the live handle's identity was in the last listing; False
+    #                           after a rotation that moved it on (issue #67)
 
 
 @dataclass
@@ -603,6 +614,7 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
                 if directory not in refused:
                     refused.append(directory)
         if exclude is not None:
+            plan.live_listed = any((a.ino, a.dev) == exclude for a in everything)
             everything = [a for a in everything if (a.ino, a.dev) != exclude]
             archives = [a for a in archives if (a.ino, a.dev) != exclude]
         return {(a.path, a.ino, a.dev) for a in everything}
@@ -976,6 +988,7 @@ class CatchUpSource:
         self.saved = saved
         self.verdict: Verdict | Literal["absent"] = live.verdict if live else "absent"
         self.stopped = False  # a chain member renamed under us: nothing past it this run
+        self.absorbed = False  # the live handle's file was read as the last copy (#67)
         self.realpath = os.path.realpath(path)  # what a parked cursor records (issue #32)
         self.segments: list[Segment] = []
         if plan.match is not None:
@@ -1010,7 +1023,35 @@ class CatchUpSource:
                             os.path.basename(segment.path), resume)
                 return
         if self.live is not None:
+            copy = self._compressed_under_us()
+            if copy is not None:
+                self.absorbed = True  # the cursor parks on the copy
+                log.info("[%s] %s: the live file was rotated and compressed during the run "
+                         "(%s); its lines were read from there", self.section, self.path,
+                         os.path.basename(copy.path))
+                return
             yield from self.live.lines()
+
+    def _compressed_under_us(self) -> Segment | None:
+        """The copy that IS the live handle's file, compressed during the plan (issue #67):
+        the handle's identity was not in the listing, and the last copy read -- read in
+        FULL: the match, read from the saved offset, never yielded the lines before it
+        (review: a banner log's handle absorbed by its own copy as the match lost them)
+        -- has the handle's first line, its mtime to the second and at least its
+        length. None otherwise, and the handle is read as before."""
+        if self.live is None or self.verdict != "rotated" or self.plan.live_listed:
+            return None
+        last = self._last_read()
+        if (last is None or last.start != 0 or last.mtime is None
+                or self.live.fingerprint is None or last.fingerprint != self.live.fingerprint):
+            return None
+        try:
+            st = os.fstat(self.live.handle.fileno())
+        except OSError:
+            return None
+        if int(last.mtime) != int(st.st_mtime) or last.offset < st.st_size:
+            return None  # written after its compression, or another file: read it
+        return last
 
     def start_cursor(self, now: datetime | None = None) -> Cursor:
         """The saved cursor, seen now: what a run over the copies would read again from
@@ -1034,7 +1075,7 @@ class CatchUpSource:
             return self._parked(unfinished[0], now)  # stopped inside an archive: resume there
         if self.segments and not self.segments[0].started:
             return self.saved  # nothing read yet
-        if self.stopped or self.live is None:  # the next run plans from the last archive read
+        if self.stopped or self.absorbed or self.live is None:  # from the last archive read
             last = self._last_read()
             return self._parked(last, now) if last else self.saved
         return self.live.cursor(now)

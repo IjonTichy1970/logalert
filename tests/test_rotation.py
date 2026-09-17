@@ -2479,3 +2479,262 @@ def test_an_absent_live_file_with_a_refused_holder_and_a_readable_copy_is_the_it
     assert isinstance(source, CatchUpSource) and lines == ["middle 1", "live 1"]
     assert source.failed_item() == ("a permission kept the rotated copies out of reach "
                                     "(router.log.3); the lines before the rotation are lost")
+
+
+# -- the live handle's file compressed during the plan (issue #67) -----------------------------
+
+
+def _compress_rotation(tmp_path: Path, fresh: bytes, *, late: bytes = b"") -> None:
+    """logrotate's create + compress, without delaycompress, in its order: .N.gz shift up,
+    the live file renamed to .1, a fresh live file CREATED, then .1 gzipped into .1.gz (a
+    new inode, the mtime kept as gzip keeps it) and removed -- the fresh file first, or
+    ext4 hands it the freed inode and a banner log's fresh file reads as a continuation
+    (review). ``late``: lines an application that ignored the reload wrote into the
+    renamed file after its compression."""
+    for n in (3, 2, 1):
+        source = tmp_path / f"router.log.{n}.gz"
+        if source.exists():
+            source.replace(tmp_path / f"router.log.{n + 1}.gz")
+    plain = tmp_path / "router.log.1"
+    (tmp_path / "router.log").replace(plain)
+    (tmp_path / "router.log").write_bytes(fresh)
+    stamp = plain.stat().st_mtime
+    compress_to(tmp_path / "router.log.1.gz", plain.read_bytes())
+    os.utime(tmp_path / "router.log.1.gz", (stamp, stamp))
+    if late:
+        append(plain, late)
+        os.utime(plain, (stamp, stamp))  # in the same second: the length must tell
+    plain.unlink()
+
+
+def _hooked_scan(monkeypatch: pytest.MonkeyPatch, when: str,
+                 action: Callable[[], None]) -> dict[str, int]:
+    """``scan_directories`` with ``action`` run before or after its first call."""
+    real = rotation.scan_directories
+    calls = {"n": 0}
+
+    def wrapped(directories: list[str], base: str) -> Any:
+        calls["n"] += 1
+        if when == "before" and calls["n"] == 1:
+            action()
+        found = real(directories, base)
+        if when == "after" and calls["n"] == 1:
+            action()
+        return found
+
+    monkeypatch.setattr(rotation, "scan_directories", wrapped)
+    return calls
+
+
+def _one_compress_rotation_behind(tmp_path: Path) -> tuple[Path, Cursor]:
+    """seen at OLD; 'since 1' appended; one compress rotation (.1.gz holds it); the live
+    file holds 'middle 1'."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1" + NLB)
+    _compress_rotation(tmp_path, b"middle 1" + NLB)
+    return path, saved
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_the_live_file_compressed_inside_the_plan_is_read_once_from_the_copy(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+        when: str) -> None:
+    """Measured (the #32 review, S3): gzip finishing between the live open and the listing,
+    or between the two listings, made the .gz a chain member beside the handle it was made
+    from: 'middle 1' twice. The copy is recognised and the handle skipped."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _one_compress_rotation_behind(tmp_path)
+    _hooked_scan(monkeypatch, when, lambda: _compress_rotation(tmp_path, b"live 1" + NLB))
+    caplog.set_level(logging.INFO, logger="logalert.rotation")
+    source, lines, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.absorbed
+    assert lines == ["since 1", "middle 1"]
+    assert any("the live file was rotated and compressed during the run (router.log.1.gz); "
+               "its lines were read from there" in r.getMessage() for r in caplog.records)
+    assert parked is not None and parked.ino == (tmp_path / "router.log.1.gz").stat().st_ino
+    assert parked.mtime == (tmp_path / "router.log.1.gz").stat().st_mtime
+    again, rest, _ = run(path, parked)  # the hook acted on the first listing only
+    assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
+    assert rest == ["live 1"]
+
+
+def test_a_live_file_moved_out_beside_a_longer_banner_copy_is_still_read(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mutation: the first line and the length alone would take an older copy of a
+    banner log for the handle's file when the live file was moved to an unlisted place
+    (olddir by hand); the mtime tells them apart."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path = tmp_path / "router.log"
+    saved = seen(path, BANNER + OLD)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")  # longer than the live file that follows
+    aged = time.time() - 30
+    os.utime(tmp_path / "router.log.1", (aged, aged))
+    path.write_bytes(BANNER + b"middle 1" + NLB)
+    elsewhere = tmp_path / "old"
+    elsewhere.mkdir()
+
+    def move_out() -> None:
+        path.replace(elsewhere / "router.log.1")
+        path.write_bytes(BANNER + b"live 1" + NLB)
+
+    _hooked_scan(monkeypatch, "before", move_out)  # gone before the listing: absent from it
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and not source.absorbed
+    assert lines == ["since 1", "=== router boot log ===", "middle 1"]
+
+
+def test_a_renamed_file_written_after_its_compression_is_read_through_the_handle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An application that ignored the reload wrote on into the renamed file within the
+    same second: the copy is shorter than the handle's file, so the handle is read --
+    'middle 1' twice (today's shape), the late line never lost."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _one_compress_rotation_behind(tmp_path)
+    _hooked_scan(monkeypatch, "after",
+                 lambda: _compress_rotation(tmp_path, b"live 1" + NLB, late=b"late 1" + NLB))
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and not source.absorbed
+    assert lines == ["since 1", "middle 1", "middle 1", "late 1"]
+
+
+def test_the_live_handle_is_listed_by_default(tmp_path: Path) -> None:
+    path, saved = _two_rotations(tmp_path)
+    source, _, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.live_listed
+    assert not source.absorbed
+
+
+def test_the_live_file_compressed_inside_a_no_match_plan_is_read_once_too(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The #64 chain can hold the handle's own compression as well (review of #64): rotate 1
+    drops the holder, the .gz made from the live file is the one recent copy, and the
+    handle would read the same lines again."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _one_compress_rotation_behind(tmp_path)
+
+    def rotate_1_with_compress() -> None:
+        _compress_rotation(tmp_path, b"live 1" + NLB)
+        (tmp_path / "router.log.2.gz").unlink()  # rotate 1: the holder is gone
+
+    _hooked_scan(monkeypatch, "before", rotate_1_with_compress)
+    source, lines, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is None and source.absorbed
+    assert lines == ["middle 1"]
+    assert parked is not None and parked.ino == (tmp_path / "router.log.1.gz").stat().st_ino
+    _, rest, _ = run(path, parked)
+    assert rest == ["live 1"]
+
+
+def test_the_match_read_from_the_offset_never_stands_in_for_the_handle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #67: a banner log, rotate 1 + compress, the handle's file compressed before
+    the listing with the holder aged out -- the content stage takes the handle's own copy as
+    the MATCH and reads it from the saved offset. Absorbing the handle then lost the copy's
+    lines before that offset; only a copy read in full can stand in (a duplicate, as before,
+    where the guess was wrong)."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path = tmp_path / "router.log"
+    saved = seen(path, BANNER + OLD)  # offset 36
+    append(path, b"since 1" + NLB)
+    _compress_rotation(tmp_path, BANNER + b"middle 0001" + NLB + b"middle 2" + NLB)  # 45 bytes
+
+    def rotate_1_with_compress() -> None:
+        # logrotate's order: the fresh live file exists before the plain copy is unlinked,
+        # else ext4 hands the freed inode to the fresh file and the verdict is continue
+        (tmp_path / "router.log.1.gz").unlink()  # rotate 1: the holder is gone
+        plain = tmp_path / "router.log.1"
+        (tmp_path / "router.log").replace(plain)
+        (tmp_path / "router.log").write_bytes(BANNER + b"live 1" + NLB)
+        stamp = plain.stat().st_mtime
+        compress_to(tmp_path / "router.log.1.gz", plain.read_bytes())
+        os.utime(tmp_path / "router.log.1.gz", (stamp, stamp))
+        plain.unlink()
+
+    _hooked_scan(monkeypatch, "before", rotate_1_with_compress)
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "content"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.1.gz")
+    assert not source.absorbed
+    assert lines == ["middle 2", "=== router boot log ===", "middle 0001", "middle 2"]
+
+
+def test_the_listing_is_the_signal_for_a_same_second_banner_copy(
+        tmp_path: Path) -> None:
+    """A busy banner log read within the second of a plain rename: the last copy has the
+    banner, the live file's second and a greater length, and only the listing says the
+    handle's file is its own (the handle was in it)."""
+    path = tmp_path / "router.log"
+    saved = seen(path, BANNER + OLD)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(BANNER + b"middle 1" + NLB + b"middle 2" + NLB + b"middle 3" + NLB)
+    (tmp_path / "router.log.1").replace(tmp_path / "router.log.2")
+    rotate(path, tmp_path / "router.log.1")  # the chain member, read in full
+    path.write_bytes(BANNER + b"live 1" + NLB)  # shorter, the banner, the same second
+    stamp = (tmp_path / "router.log.1").stat().st_mtime
+    os.utime(path, (stamp, stamp))
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.live_listed and not source.absorbed
+    assert lines == ["since 1", "=== router boot log ===", "middle 1", "middle 2", "middle 3",
+                     "=== router boot log ===", "live 1"]
+
+
+def test_a_live_file_moved_out_beside_a_copy_with_another_first_line_is_read(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The first line is one of the three: a longer copy stamped in the same second but
+    opening differently is not the handle's file."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(b"other 1" + NLB + b"other 2" + NLB)  # another first line, longer
+    (tmp_path / "router.log.1").replace(tmp_path / "router.log.2")
+    rotate(path, tmp_path / "router.log.1")  # the chain member, read in full
+    path.write_bytes(b"middle 1" + NLB)
+    stamp = path.stat().st_mtime
+    os.utime(tmp_path / "router.log.1", (stamp, stamp))
+    elsewhere = tmp_path / "old"
+    elsewhere.mkdir()
+
+    def move_out() -> None:
+        path.replace(elsewhere / "router.log.1")
+        path.write_bytes(b"live 1" + NLB)
+
+    _hooked_scan(monkeypatch, "before", move_out)
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and not source.absorbed
+    assert lines == ["since 1", "other 1", "other 2", "middle 1"]
+
+
+def test_a_copy_stamped_to_the_whole_second_still_absorbs_the_handle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """bzip2 by hand keeps the second (measured); the comparison is whole seconds."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _one_compress_rotation_behind(tmp_path)
+
+    def rotation_by_hand() -> None:
+        _compress_rotation(tmp_path, b"live 1" + NLB)
+        whole = float(int((tmp_path / "router.log.1.gz").stat().st_mtime))
+        os.utime(tmp_path / "router.log.1.gz", (whole, whole))
+
+    _hooked_scan(monkeypatch, "before", rotation_by_hand)
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.absorbed
+    assert lines == ["since 1", "middle 1"]
