@@ -77,6 +77,11 @@ its notes.
   burying the ones the section exists for. A listed file, and a glob's file
   with new lines, keep their own record.
 
+- `[internal]` **The rotation catch-up decompresses the matched archive once,
+  not three times** (#46). The handle the content stage verified travels to
+  the read, and the context window before the saved position is kept from the
+  confirming seek. Measured: 2.9 passes over the archive down to 1.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

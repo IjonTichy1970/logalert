@@ -75,13 +75,19 @@ from logalert.cursor import (
     count_newlines,
     fingerprint,
     lines_before,
+    lines_from_window,
     open_log,
+    window_for,
 )
 from logalert.state import Cursor, parse_timestamp, timestamp
 
 log = logging.getLogger("logalert.rotation")
 _READ_ERRORS: tuple[type[Exception], ...] = (OSError, *STREAM_ERRORS)  # what a bad archive raises
 _SLACK = 2.0  # seconds: last_seen is whole seconds; mtimes are not
+TAIL = 256 * 1024  # bytes before the saved offset kept from the confirming seek (issue #46):
+#                    the context hook's window for up to 98 lines of the cap (window_for(98)
+#                    = 261 634 <= TAIL - 1), far past any real `context`; a wider one falls
+#                    back to a second open
 
 Style = Literal["numeric", "dated", "other"]
 DatedKey = tuple[int, int, int, int, int, int, int]  # Y, M, D, HH, MM, SS, epoch
@@ -269,33 +275,90 @@ def scan_directories(directories: list[str], base: str) -> tuple[list[Archive], 
 
 
 def _content_matches(section: str, path: str, archive: Archive, saved: Cursor, *,
-                     by_content: bool) -> bool | None:
-    """Whether the archive's first line and length fit the saved cursor; None if unreadable.
+                     by_content: bool) -> "Verified | Literal[False] | None":
+    """The archive's open handle at the saved offset when its first line and length fit the
+    saved cursor (``Verified``); False when it does not fit; None if unreadable.
 
     ``by_content`` (stage 2) demands the first lines be EQUAL: a file with no complete first
     line identifies nothing. The inode stage only asks that the archive not contradict the
     saved line -- and a file that HAD a first line cannot have lost it, so None contradicts.
     """
     try:
-        with open_log(archive.path) as handle:
-            st = os.fstat(handle.fileno())
-            if (st.st_ino, st.st_dev) != (archive.ino, archive.dev):
-                log.warning("[%s] %s: %s was renamed under us; skipped this run",
-                            section, path, archive.path)
-                return None
-            current = fingerprint(handle)
-            if by_content and current != saved.fingerprint:
-                return False
-            if saved.fingerprint is not None and current != saved.fingerprint:
-                return False
-            if archive.compressed:
-                handle.seek(saved.offset)  # a seek past the end is silent: ask tell()
-                return handle.tell() >= saved.offset
-            return archive.size >= saved.offset
+        handle = open_log(archive.path)
     except _READ_ERRORS as exc:
         log.warning("[%s] %s: rotated copy %s could not be read (%s); skipped",
                     section, path, archive.path, exc)
         return None
+    try:
+        st = os.fstat(handle.fileno())
+        if (st.st_ino, st.st_dev) != (archive.ino, archive.dev):
+            log.warning("[%s] %s: %s was renamed under us; skipped this run",
+                        section, path, archive.path)
+            handle.close()
+            return None
+        current = fingerprint(handle)
+        if by_content and current != saved.fingerprint:
+            handle.close()
+            return False
+        if saved.fingerprint is not None and current != saved.fingerprint:
+            handle.close()
+            return False
+        if archive.compressed:
+            # the confirming seek, by hand: a seek past the end is silent, so the bytes
+            # are read instead -- keeping the tail for the context hook and counting the
+            # lines, the two later passes issue #46 measured
+            reached, tail, newlines = _forward(handle, saved.offset, TAIL)
+            if not reached:
+                handle.close()
+                return False
+            return Verified(handle, current, tail, newlines)
+        if archive.size < saved.offset:
+            handle.close()
+            return False
+        return Verified(handle, current, _tail_of(handle, saved.offset, TAIL), None)
+    except _READ_ERRORS as exc:
+        handle.close()
+        log.warning("[%s] %s: rotated copy %s could not be read (%s); skipped",
+                    section, path, archive.path, exc)
+        return None
+    except BaseException:
+        handle.close()
+        raise
+
+
+def _forward(handle: BinaryStream, offset: int, keep: int) -> tuple[bool, bytes, int]:
+    """Read a compressed stream forward from 0 to ``offset``: whether the stream reaches it,
+    the last ``keep`` bytes before it, and the newlines before it. One pass, the position
+    left at the offset (or at the end of a shorter stream)."""
+    handle.seek(0)
+    tail = b""
+    newlines = 0
+    position = 0
+    while position < offset:
+        chunk = handle.read1(min(65536, offset - position))
+        if not chunk:
+            return False, b"", newlines
+        newlines += chunk.count(b"\n")
+        position += len(chunk)
+        tail = (tail + chunk)[-keep:] if keep else b""
+    return True, tail, newlines
+
+
+def _tail_of(handle: BinaryStream, offset: int, keep: int) -> bytes:
+    """The last ``keep`` bytes before ``offset`` of a plain file (a seek is free there), the
+    position left at the offset."""
+    start = max(0, offset - keep)
+    handle.seek(start)
+    parts: list[bytes] = []
+    remaining = offset - start
+    while remaining > 0:
+        chunk = handle.read1(remaining)
+        if not chunk:
+            break
+        parts.append(chunk)
+        remaining -= len(chunk)
+    handle.seek(offset)
+    return b"".join(parts)
 
 
 @dataclass
@@ -306,6 +369,25 @@ class Plan:
     chain: list[Archive] = field(default_factory=list)
     stage: str = ""  # "inode" | "content" | "" (nothing matched)
     searched: list[str] = field(default_factory=list)
+    verified: "Verified | None" = None  # the match's open handle, positioned at the offset
+
+
+@dataclass
+class Verified:
+    """What the content stage learned about the archive that fits, kept for the read (issue
+    #46): the open handle positioned at the saved offset (a descriptor cannot be renamed
+    under us, so no second open and no second identity check), its first-line hash, the
+    last ``TAIL`` bytes before the offset (the context hook's window, read on the way),
+    and -- for a compressed stream -- the complete lines before the offset, counted on the
+    way too (a cursor from before #9 has no count)."""
+
+    handle: BinaryStream = field(repr=False)
+    fingerprint: str | None
+    tail: bytes = field(repr=False)  # 256 KiB: not for a failing assertion's output
+    lines_before: int | None
+
+    def close(self) -> None:
+        self.handle.close()
 
 
 Fits = Callable[[Archive], bool]
@@ -331,49 +413,64 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
         archives = [a for a in archives if (a.ino, a.dev) != exclude]
     plan = Plan(searched=directories)
     unreadable: set[str] = set()
+    kept: dict[str, Verified] = {}
 
     def fits(archive: Archive, *, by_content: bool) -> bool:
         answer = _content_matches(section, path, archive, saved, by_content=by_content)
         if answer is None:
             unreadable.add(archive.path)
-        return bool(answer)
+            return False
+        if answer is False:
+            return False
+        kept[archive.path] = answer
+        return True
 
-    since = parse_timestamp(saved.last_seen).timestamp() - _SLACK
-    recent = _oldest_first([a for a in archives if a.mtime >= since])
-    older = list(reversed(_oldest_first([a for a in archives if a.mtime < since])))
-    if saved.fingerprint is not None:
-        plan.match = next((a for a in recent if fits(a, by_content=True)), None)
-    if plan.match is None and verdict != "truncated":  # a truncated file kept its inode
-        for archive in everything:
-            if (archive.ino, archive.dev) != (saved.ino, saved.dev):
-                continue
-            if saved.fingerprint is None and not archive.of_log:
-                continue  # an inode number alone would accept another log's archive
-            if fits(archive, by_content=False):
-                plan.match = archive
-                break
-    if plan.match is None and saved.fingerprint is not None:
-        plan.match = _newest_older_fit(section, path, older, saved,
-                                       lambda a: fits(a, by_content=True))
-    if plan.match is None:
-        _nothing_matched(section, path, saved, verdict, directories)
+    try:
+        since = parse_timestamp(saved.last_seen).timestamp() - _SLACK
+        recent = _oldest_first([a for a in archives if a.mtime >= since])
+        older = list(reversed(_oldest_first([a for a in archives if a.mtime < since])))
+        if saved.fingerprint is not None:
+            plan.match = next((a for a in recent if fits(a, by_content=True)), None)
+        if plan.match is None and verdict != "truncated":  # a truncated file kept its inode
+            for archive in everything:
+                if (archive.ino, archive.dev) != (saved.ino, saved.dev):
+                    continue
+                if saved.fingerprint is None and not archive.of_log:
+                    continue  # an inode number alone would accept another log's archive
+                if fits(archive, by_content=False):
+                    plan.match = archive
+                    break
+        if plan.match is None and saved.fingerprint is not None:
+            plan.match = _newest_older_fit(section, path, older, saved,
+                                           lambda a: fits(a, by_content=True))
+        if plan.match is None:
+            for leftover in kept.values():
+                leftover.close()
+            _nothing_matched(section, path, saved, verdict, directories)
+            return plan
+        plan.stage = "inode" if (plan.match.ino, plan.match.dev) == (saved.ino, saved.dev) \
+            else "content"
+        match = plan.match
+        later = [a for a in archives
+                 if a.path != match.path and a.path not in unreadable and newer(a, match)
+                 and (a.style != "other" or (match.style == "other" and match.of_log))]
+        plan.chain = _oldest_first(later)
+        styles = {a.style for a in [match, *plan.chain]}
+        if plan.chain and (len(styles) > 1 or "other" in styles):
+            log.info("[%s] %s: the archive names mix styles or are not a recognised rotation "
+                     "style; ordering by mtime", section, path)
+        steps = [f"{os.path.basename(match.path)} from {saved.offset}"]
+        steps += [os.path.basename(a.path) for a in plan.chain]
+        log.info("[%s] %s: found the saved position by %s; reading %s%s", section, path, plan.stage,
+                 ", then ".join(steps), ", then the live file" if verdict is not None else "")
+        plan.verified = kept.pop(plan.match.path, None)  # last: kept until here, see except
+        for leftover in kept.values():  # a fit that was not chosen (none today)
+            leftover.close()
         return plan
-    plan.stage = "inode" if (plan.match.ino, plan.match.dev) == (saved.ino, saved.dev) \
-        else "content"
-    match = plan.match
-    later = [a for a in archives
-             if a.path != match.path and a.path not in unreadable and newer(a, match)
-             and (a.style != "other" or (match.style == "other" and match.of_log))]
-    plan.chain = _oldest_first(later)
-    styles = {a.style for a in [match, *plan.chain]}
-    if plan.chain and (len(styles) > 1 or "other" in styles):
-        log.info("[%s] %s: the archive names mix styles or are not a recognised rotation style; "
-                 "ordering by mtime", section, path)
-    steps = [f"{os.path.basename(match.path)} from {saved.offset}"]
-    steps += [os.path.basename(a.path) for a in plan.chain]
-    log.info("[%s] %s: found the saved position by %s; reading %s%s", section, path, plan.stage,
-             ", then ".join(steps), ", then the live file" if verdict is not None else "")
-    return plan
+    except BaseException:  # a KeyboardInterrupt between a fit and the return (review)
+        for leftover in kept.values():
+            leftover.close()
+        raise
 
 
 def _newest_older_fit(section: str, path: str, older: list[Archive], saved: Cursor,
@@ -425,8 +522,10 @@ class Segment:
     """One archive read from ``start``; ``offset`` is where the read ended."""
 
     def __init__(self, section: str, path: str, start: int,
-                 expected: tuple[int, int] | None, start_line: int | None = 0) -> None:
+                 expected: tuple[int, int] | None, start_line: int | None = 0,
+                 verified: Verified | None = None) -> None:
         self.section = section
+        self.verified = verified  # the content stage's handle, for the match (issue #46)
         self.path = path
         self.start = start
         self.expected = expected  # the (ino, dev) the plan saw; a rename since is skipped
@@ -439,23 +538,27 @@ class Segment:
         self.started = False
         self.finished = False
         self.yielded = False  # at least one line came out of it
-        self.handle: BinaryStream | None = None
+        self.handle: BinaryStream | None = verified.handle if verified else None
 
     def lines(self) -> Iterator[Line]:
         self.started = True
         try:
-            with open_log(self.path) as handle:
+            with self._open() as handle:
                 self.handle = handle
                 st = os.fstat(handle.fileno())
-                if self.expected is not None and (st.st_ino, st.st_dev) != self.expected:
+                if (self.verified is None and self.expected is not None
+                        and (st.st_ino, st.st_dev) != self.expected):
                     log.warning("[%s] %s: %s was renamed under us; skipped this run",
                                 self.section, self.path, os.path.basename(self.path))
                     self.finished = True
                     return
                 self.ino, self.dev = st.st_ino, st.st_dev
-                self.fingerprint = fingerprint(handle)
+                self.fingerprint = (self.verified.fingerprint if self.verified
+                                    else fingerprint(handle))
                 if self.start_line is None:
-                    self.start_line = count_newlines(handle, self.start)
+                    counted = self.verified.lines_before if self.verified else None
+                    self.start_line = (counted if counted is not None
+                                       else count_newlines(handle, self.start))
                     self.line = self.start_line
                 reader = LineReader(handle, self.start, start_line=self.start_line,
                                     path=self.path)
@@ -476,15 +579,32 @@ class Segment:
         finally:
             self.handle = None
 
+    def _open(self) -> BinaryStream:
+        """The content stage's handle when it verified this archive, else a fresh open."""
+        if self.verified is not None:
+            return self.verified.handle
+        return open_log(self.path)
+
     def cursor(self, now: datetime | None = None) -> Cursor:
         return Cursor(offset=self.offset, ino=self.ino, dev=self.dev, fingerprint=self.fingerprint,
                       realpath=os.path.realpath(self.path), last_seen=timestamp(now),
                       line=self.line)
 
     def context_before(self, n: int) -> list[Line]:
-        """The lines before ``start`` in this archive, numbered; see ``LogFile``."""
+        """The lines before ``start`` in this archive, numbered; see ``LogFile``. Answered
+        from the tail the content stage kept when it covers the window (issue #46), else
+        from a second open."""
         if n <= 0 or self.start == 0:
             return []
+        if self.verified is not None:
+            tail = self.verified.tail
+            window = window_for(n)
+            if len(tail) >= self.start or len(tail) - 1 >= window:
+                start = max(0, self.start - window)
+                buf = tail[len(tail) - (self.start - max(0, start - 1)):]
+                return lines_from_window(buf, start, n, self.start_line or 0, self.path)
+            log.debug("[%s] %s: the context window (%d lines) is wider than the kept tail; "
+                      "a second read", self.section, self.path, n)
         try:
             with open_log(self.path) as handle:
                 st = os.fstat(handle.fileno())
@@ -520,7 +640,8 @@ class CatchUpSource:
         self.segments: list[Segment] = []
         if plan.match is not None:
             self.segments.append(Segment(section, plan.match.path, saved.offset,
-                                         (plan.match.ino, plan.match.dev), saved.line))
+                                         (plan.match.ino, plan.match.dev), saved.line,
+                                         verified=plan.verified))
             self.segments += [Segment(section, a.path, 0, (a.ino, a.dev)) for a in plan.chain]
 
     def context_before(self, n: int) -> list[Line]:
@@ -595,4 +716,11 @@ def open_source(section: str, path: str, saved: Cursor | None, *,
         raise
     if live is None and plan.match is None:
         return None
-    return CatchUpSource(section, path, plan, live, saved)
+    try:
+        return CatchUpSource(section, path, plan, live, saved)
+    except BaseException:
+        if plan.verified is not None:
+            plan.verified.close()
+        if live is not None:
+            live.close()
+        raise

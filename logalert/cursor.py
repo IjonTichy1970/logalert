@@ -640,10 +640,23 @@ def lines_before(handle: BinaryStream, offset: int, n: int, line: int,
     counted but not returned, as the reader skips them."""
     if n <= 0 or offset <= 0:
         return []
-    start = max(0, offset - (n * (LINE_CAP + 1) + _CHUNK))
+    start = max(0, offset - window_for(n))
     handle.seek(max(0, start - 1))  # one byte more: it says whether the window starts a line
     buf = _read_up_to(handle, offset - max(0, start - 1))
     handle.seek(0)
+    return lines_from_window(buf, start, n, line, path)
+
+
+def window_for(n: int) -> int:
+    """The bytes before the offset that ``n`` context lines can need."""
+    return n * (LINE_CAP + 1) + _CHUNK
+
+
+def lines_from_window(buf: bytes, start: int, n: int, line: int, path: str = "") -> list[Line]:
+    """The parsing half of ``lines_before``: ``buf`` holds the bytes from ``max(0, start - 1)``
+    to the offset (the byte before the window, when there is one, says whether the window
+    starts a line). The rotation catch-up keeps that window from its confirming seek and
+    answers the hook from it without a second decompression (issue #46)."""
     if start > 0:
         # the window's first line is complete only if the byte before it is a newline;
         # otherwise it is the tail of a line that began earlier, and is dropped

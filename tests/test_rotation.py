@@ -31,6 +31,7 @@ from logalert.rotation import (
 from logalert.state import Cursor
 
 SECTION = "router-disk"
+NLB = chr(10).encode()  # a newline as bytes, for fixtures built in a comprehension
 NOWHERE = 2**40 + 7  # an inode number no filesystem in a test will hand out
 
 
@@ -921,3 +922,106 @@ def test_non_stem_gz_carries_its_compressed_flag(tmp_path: Path) -> None:
     (tmp_path / "keep.gz").write_bytes(gzip.compress(b"x\n"))
     everything, _ = scan_directories([str(tmp_path)], "router.log")
     assert [a.compressed for a in everything if a.path.endswith("keep.gz")] == [True]
+
+
+# -- issue #46: the matched archive is decompressed once, the hook answered from its tail -------
+
+
+def test_the_matched_archive_is_read_in_one_pass_with_the_context_from_its_tail(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Measured before this change: the content stage seeks to the saved offset on one
+    handle, the segment opens a second and seeks again, and the context hook opens a third
+    and seeks back -- 2.9 passes over a 550 KB archive to read a 30 MB tail. Now the
+    verified handle travels and the hook is answered from the tail kept on the way: one."""
+    counter = {"bytes": 0}
+    real_open = open
+
+    def counting_open(fd: object, *args: object, **kwargs: object) -> object:
+        handle = real_open(fd, *args, **kwargs)  # type: ignore[call-overload]
+        if isinstance(fd, int):
+            original1, original = handle.read1, handle.read  # gzip reads its input via read()
+
+            def read1(n: int = -1) -> bytes:
+                data: bytes = original1(n)
+                counter["bytes"] += len(data)
+                return data
+
+            def read(n: int = -1) -> bytes:
+                data: bytes = original(n)
+                counter["bytes"] += len(data)
+                return data
+
+            handle.read1, handle.read = read1, read
+        return handle
+
+    monkeypatch.setattr("logalert.cursor.open", counting_open, raising=False)
+    path = tmp_path / "router.log"
+    old = b"".join(b"line %d %s" % (i, os.urandom(60).hex().encode()) + NLB
+                   for i in range(5_000))
+    saved = seen(path, old)
+    append(path, b"since 1" + NLB + b"since 2" + NLB)
+    rotate(path, tmp_path / "router.log.1.gz", compress=True)
+    path.write_bytes(b"live 1" + NLB)
+    size = (tmp_path / "router.log.1.gz").stat().st_size
+    counter["bytes"] = 0
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    with source:
+        assert source.plan.verified is not None  # the content stage's handle travelled
+        lines = texts(list(source.lines()))
+        context = source.context_before(2)
+    assert lines == ["since 1", "since 2", "live 1"]
+    assert [line.number for line in context] == [4_999, 5_000]
+    assert texts(context)[-1].startswith("line 4999 ")
+    assert counter["bytes"] <= size + 128 * 1024 + 65536  # one pass, plus gzip's read-ahead
+    assert source.plan.verified.handle.closed  # closed with the source
+
+
+def test_a_context_window_wider_than_the_kept_tail_falls_back_to_a_second_read(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    path = tmp_path / "router.log"
+    old = b"".join(b"x" * 39 + NLB for _ in range(10_000))  # 400 KB: past the 256 KiB tail
+    saved = seen(path, old)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(b"live 1" + NLB)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    caplog.set_level(logging.DEBUG, logger="logalert.rotation")
+    with source:
+        assert texts(list(source.lines())) == ["since 1", "live 1"]
+        near = source.context_before(3)  # inside the tail
+        far = source.context_before(500)  # 500 * 2001 + 65536 > the tail: the second read
+    assert [line.number for line in near] == [9_998, 9_999, 10_000]
+    assert len(far) == 500 and far[-1].number == 10_000 and far[0].number == 9_501
+    assert any("wider than the kept tail" in r.getMessage() for r in caplog.records)
+
+
+def test_an_archive_cut_before_the_saved_offset_is_skipped_and_leaks_no_handle(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The confirming read now happens inside the content stage (issue #46): a stream error
+    there -- a .gz truncated before the saved offset, gzip(1) still writing it -- must be the
+    same WARNING as an unreadable archive, no match, and the handle closed (review)."""
+    path = tmp_path / "router.log"
+    old = b"".join(b"line %d %s" % (i, os.urandom(40).hex().encode()) + NLB for i in range(3_000))
+    saved = seen(path, old)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1.gz", compress=True)
+    archive = tmp_path / "router.log.1.gz"
+    archive.write_bytes(archive.read_bytes()[: archive.stat().st_size // 2])  # cut mid-way
+    path.write_bytes(b"live 1" + NLB)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    import gc
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ResourceWarning)
+        source = open_source(SECTION, str(path), saved)
+        assert isinstance(source, CatchUpSource) and source.plan.match is None
+        with source:
+            assert texts(list(source.lines())) == ["live 1"]
+        gc.collect()
+    assert not [w for w in caught if issubclass(w.category, ResourceWarning)], caught
+    assert any("could not be read" in r.getMessage() for r in caplog.records)
+    assert any("no rotated copy holds the saved position" in r.getMessage()
+               for r in caplog.records)

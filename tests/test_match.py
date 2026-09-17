@@ -20,6 +20,7 @@ from logalert.rotation import CatchUpSource, open_source
 from logalert.state import Cursor, State, load_state
 
 E_ACUTE = chr(0xE9)  # spelled from the code point for the ASCII gate
+NLB = chr(10).encode()  # a newline as bytes, for fixtures built in a comprehension
 FILE = "/var/log/router.log"
 
 
@@ -679,7 +680,9 @@ def test_segment_context_before_tolerates_a_vanished_or_renamed_archive(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "router.log"
-    path.write_bytes(b"a\nb\nc\n")
+    # 300 KB before the saved position: more than the tail the catch-up keeps (256 KiB)
+    path.write_bytes(b"".join(b"x" * 29 + NLB for _ in range(10_000)) + b"a" + NLB + b"b" + NLB
+                     + b"c" + NLB)
     source = open_source("s", str(path), None, from_start=True)
     assert source is not None
     with source:
@@ -695,18 +698,20 @@ def test_segment_context_before_tolerates_a_vanished_or_renamed_archive(
         it = again.lines()
         assert next(it).text == "d"
         assert [x.text for x in again.context_before(2)] == ["b", "c"]  # the archive's
-        real_fstat = os.fstat
-        # renamed under us: the name now belongs to another file, whose lines are not ours
+        # the matched archive's context comes from the tail the content stage kept (issue
+        # #46): a rename of the name, or its disappearance, cannot change the answer, since
+        # nothing is opened by name any more
         monkeypatch.setattr("logalert.rotation.os.fstat", lambda fd: os.stat(tmp_path))
-        assert again.context_before(2) == []
-        monkeypatch.setattr("logalert.rotation.os.fstat", real_fstat)
 
         def gone(target: str, **kwargs: object) -> object:
             raise FileNotFoundError(2, "No such file", target)
 
         monkeypatch.setattr("logalert.rotation.open_log", gone)
+        assert [x.text for x in again.context_before(2)] == ["b", "c"]
+        # a window wider than the kept tail falls back to a second open, which tolerates the
+        # vanished name with a warning
         caplog.set_level(logging.WARNING, logger="logalert")
-        assert again.context_before(2) == []
+        assert again.context_before(1000) == []
         assert any("context before the saved position could not be read" in r.getMessage()
                    for r in caplog.records)
 def test_report_priority_is_the_highest_match_not_the_last(tmp_path: Path) -> None:
