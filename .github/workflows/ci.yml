@@ -2,10 +2,10 @@ name: CI
 
 # paths-ignore: a docs-only change spends no CI here. GitHub skips only when EVERY changed file
 # matches, so a mixed change or a version-bump commit still runs. A docs-only PR therefore
-# carries only the Pages build (pages.yml: the changelog renderer's structural check) -- treat
-# that as could-not-check for everything else, not green: the local gate (markdown width,
-# changelog refs and structure) stands in, and `git diff --name-only main..HEAD` must be
-# docs-only before merging.
+# carries only the Pages build (pages.yml: the changelog renderer's structural check, the
+# document pins and the markdown width, issue #45) -- treat that as could-not-check for
+# everything else, not green: the local gate stands in, and `git diff --name-only main..HEAD`
+# must be docs-only before merging.
 on:
   push:
     branches: ["main"]

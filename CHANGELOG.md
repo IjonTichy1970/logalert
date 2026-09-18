@@ -251,6 +251,13 @@ its notes.
   let ruff, mypy, pytest and markdown float, so a drift that reddens an
   unchanged tree is now diagnosable from one line of the log.
 
+- `[internal]` **The Pages build runs the document pins and the markdown width
+  check on every PR, so a docs-only PR is no longer unchecked** (#45).
+  `ci.yml`'s `paths-ignore` keeps its cycle; the 51 pure-text tests over
+  `USAGE.md`, `INSTALL.md`, `README.md` and the real changelog need only
+  `pytest` and the `docs` extra, and run there in seconds. Everything else
+  stays could-not-check for such a PR, as documented.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty
