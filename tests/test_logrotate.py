@@ -11,11 +11,10 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import SECTION, append, run, seen, texts
 
-from logalert.cursor import Line
 from logalert.globs import expand
 from logalert.rotation import CatchUpSource, open_source
-from logalert.state import Cursor
 
 LOGROTATE = shutil.which("logrotate")
 if sys.platform == "win32":
@@ -24,37 +23,9 @@ if LOGROTATE is None:
     pytest.fail("logrotate is not on PATH: these tests are required on POSIX (could-not-check "
                 "is never a pass)", pytrace=False)
 
-SECTION = "router-disk"
 OLD = b"old 1\nold 2\n"
 SINCE = b"since 1\nsince 2\n"
 LIVE = b"live 1\n"
-
-
-def texts(lines: list[Line]) -> list[str]:
-    return [line.text for line in lines]
-
-
-def run(path: Path, saved: Cursor | None, *, archive_dir: Path | None = None,
-        from_start: bool = False) -> tuple[object, list[str], Cursor | None]:
-    source = open_source(SECTION, str(path), saved, from_start=from_start,
-                         archive_dir=str(archive_dir) if archive_dir else None)
-    if source is None:
-        return None, [], None
-    with source:
-        lines = texts(list(source.lines()))
-        return source, lines, source.cursor()
-
-
-def seen(path: Path, content: bytes) -> Cursor:
-    path.write_bytes(content)
-    _, _, cursor = run(path, None, from_start=True)
-    assert cursor is not None
-    return cursor
-
-
-def append(path: Path, data: bytes) -> None:
-    with open(path, "ab") as handle:
-        handle.write(data)
 
 
 def logrotate(tmp_path: Path, path: Path, options: str) -> None:

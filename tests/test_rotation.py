@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import SECTION, append, run, seen, texts, try_symlink
 
 from logalert import rotation
 from logalert.cursor import ANCHOR_CAP, NUL, BinaryStream, Line, LogFile, anchor_of, open_log
@@ -35,38 +36,8 @@ from logalert.rotation import (
 )
 from logalert.state import Cursor, State, load_state, parse_timestamp, timestamp
 
-SECTION = "router-disk"
 NLB = chr(10).encode()  # a newline as bytes, for fixtures built in a comprehension
 NOWHERE = 2**40 + 7  # an inode number no filesystem in a test will hand out
-
-
-def texts(lines: list[Line]) -> list[str]:
-    return [line.text for line in lines]
-
-
-def run(path: Path, saved: Cursor | None, *, archive_dir: Path | None = None,
-        from_start: bool = False) -> tuple[object, list[str], Cursor | None]:
-    """One run over the file: (the source, its lines, the cursor to save)."""
-    source = open_source(SECTION, str(path), saved, from_start=from_start,
-                         archive_dir=str(archive_dir) if archive_dir else None)
-    if source is None:
-        return None, [], None
-    with source:
-        lines = texts(list(source.lines()))
-        return source, lines, source.cursor()
-
-
-def seen(path: Path, content: bytes) -> Cursor:
-    """A cursor that has read ``content`` as the live file: what the previous run saved."""
-    path.write_bytes(content)
-    _, _, cursor = run(path, None, from_start=True)
-    assert cursor is not None
-    return cursor
-
-
-def append(path: Path, data: bytes) -> None:
-    with open(path, "ab") as handle:
-        handle.write(data)
 
 
 def compress_to(target: Path, data: bytes) -> None:
@@ -616,10 +587,7 @@ def test_repointed_symlink_is_logged_and_the_search_follows_the_target(
     real.mkdir()
     target = real / "router.log"
     link = tmp_path / "router.log"
-    try:
-        link.symlink_to(target)
-    except OSError:
-        pytest.skip("creating a symlink needs a privilege here; runs in the sandbox and on CI")
+    try_symlink(link, target)
     saved = seen(link, OLD)
     assert saved.realpath == os.path.realpath(target)
     append(link, SINCE)
@@ -908,10 +876,7 @@ def test_symlinked_entries_are_never_candidates(tmp_path: Path) -> None:
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     (elsewhere / "foreign.log").write_bytes(b"not this log\n")
-    try:
-        (tmp_path / "router.log.1").symlink_to(elsewhere / "foreign.log")
-    except OSError:
-        pytest.skip("creating a symlink needs a privilege here; runs in the sandbox and on CI")
+    try_symlink(tmp_path / "router.log.1", elsewhere / "foreign.log")
     path.write_bytes(LIVE)
     _, lines, _ = run(path, saved)
     assert lines == ["since 1", "since 2", "live 1"]
@@ -1458,10 +1423,7 @@ def test_a_parked_cursor_carries_the_logs_real_path_not_the_archives(
     real.mkdir()
     target = real / "router.log"
     link = tmp_path / "current.log"
-    try:
-        link.symlink_to(target)
-    except OSError:
-        pytest.skip("creating a symlink needs a privilege here; runs in the sandbox and on CI")
+    try_symlink(link, target)
     saved = seen(link, OLD)
     append(link, b"since 1" + NLB)
     rotate(target, real / "router.log.2")

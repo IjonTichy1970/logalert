@@ -6,6 +6,8 @@ import re
 import smtplib
 from pathlib import Path
 
+from conftest import fences
+
 from logalert.__main__ import build_parser
 from logalert.config import GLOBAL_KEYS, WATCH_KEYS, example_config
 
@@ -19,10 +21,9 @@ def _text() -> str:
 
 def test_the_quoted_example_is_the_packages_example_verbatim() -> None:
     text = _text()
-    start = text.index("### The example")
-    match = re.search(r"```ini" + NL + "(.*?)```", text[start:], re.S)
-    assert match, "no ```ini block under 'The example'"
-    assert match.group(1) == example_config()
+    blocks = fences(text[text.index("### The example"):], "ini")
+    assert blocks, "no ```ini block under 'The example'"
+    assert blocks[0] == example_config()
 
 
 def _heads(section: str) -> list[str]:

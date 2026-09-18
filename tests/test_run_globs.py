@@ -1,6 +1,6 @@
 """Globs in ``files`` through the run (issue #18): the expansion keyed per path, rotated copies
 left out, the new-file rule and its record, the failed listing, ``--check-config`` and
-``--reset-state`` over a glob. Real on both platforms; the fixtures are ``tests/test_run.py``'s.
+``--reset-state`` over a glob. Real on both platforms; the fixtures are ``tests/conftest.py``'s.
 """
 
 import json
@@ -14,16 +14,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_run import NL, Site, body_of
+from conftest import NL, Site, body_of, deny_scandir
 
 import logalert.run
 from logalert.__main__ import main
 from logalert.state import Cursor, State, load_state, parse_timestamp, timestamp
-
-
-@pytest.fixture
-def site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Site:
-    return Site(tmp_path, monkeypatch)
 
 
 def daily(site: Site, name: str, *lines: str) -> Path:
@@ -221,14 +216,7 @@ def test_an_unlistable_directory_is_a_failed_item_and_the_rest_runs(
     site.prime()
     site.append(site.router, "kernel: disk failure on sdb")
     locked = (site.root / "daily").as_posix()
-    real_scandir = os.scandir
-
-    def scandir(path: str = ".") -> object:
-        if os.path.normcase(path) == os.path.normcase(locked):
-            raise PermissionError(13, "Permission denied", path)
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
+    deny_scandir(monkeypatch, locked)
     assert site.run() == 1
     assert capsys.readouterr().err == (
         f"logalert: 1 of 1 section sent; failed: [firewall] {glob_of(site)}: cannot list "
@@ -327,14 +315,7 @@ def test_check_config_shows_what_a_glob_matched(
            f"1 passed over (not regular files)" in out
     assert not any("more" in line for line in out if line.startswith("[firewall]   "))
     locked = (site.root / "daily").as_posix()
-    real_scandir = os.scandir
-
-    def scandir(path: str = ".") -> object:
-        if os.path.normcase(path) == os.path.normcase(locked):
-            raise PermissionError(13, "Permission denied", path)
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
+    deny_scandir(monkeypatch, locked)
     assert site.run("--check-config") == 0  # the configuration is valid; the directory is not
     out = capsys.readouterr().out.splitlines()
     assert f"[firewall] files: {everything} -> cannot list {locked} (Permission denied)" in out
@@ -370,18 +351,6 @@ def test_reset_state_takes_the_expanded_path_and_drops_the_record(
 
 
 # -- the review's cases (issue #18) ------------------------------------------------------
-
-
-def deny_scandir(monkeypatch: pytest.MonkeyPatch, locked: str) -> None:
-    """``os.scandir`` refuses one directory: the unlistable-directory device on both platforms."""
-    real_scandir = os.scandir
-
-    def scandir(path: str = ".") -> object:
-        if os.path.normcase(path) == os.path.normcase(locked):
-            raise PermissionError(13, "Permission denied", path)
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
 
 
 def test_a_glob_whose_directory_could_not_be_listed_keeps_its_moment(

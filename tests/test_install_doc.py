@@ -7,6 +7,8 @@ import re
 import tomllib
 from pathlib import Path
 
+from conftest import fences
+
 from logalert.config import example_config, load_config
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -17,29 +19,10 @@ def _text(name: str) -> str:
     return (REPO_ROOT / name).read_text(encoding="utf-8")
 
 
-def _fences(text: str, info: str) -> list[str]:
-    """The bodies of the fenced blocks whose info string is ``info`` (``""`` for a bare fence),
-    scanned line by line: a regex keyed on the opening fence would take a closing one for it."""
-    bodies: list[str] = []
-    inside: str | None = None
-    body: list[str] = []
-    for line in text.split(NL):
-        if line.startswith("```"):
-            if inside is None:
-                inside, body = line[3:].strip(), []
-            else:
-                if inside == info:
-                    bodies.append(NL.join(body) + NL)
-                inside = None
-        elif inside is not None:
-            body.append(line)
-    return bodies
-
-
 def test_the_readme_config_example_loads_and_uses_only_keys_the_example_documents(
     tmp_path: Path,
 ) -> None:
-    (example,) = _fences(_text("README.md"), "ini")
+    (example,) = fences(_text("README.md"), "ini")
     assert example.count(NL) == 10  # ten lines, as the issue asked
     path = tmp_path / "logalert.conf"
     path.write_text(example.replace("/var/log/router.log", (tmp_path / "router.log").as_posix()),
@@ -53,8 +36,8 @@ def test_the_readme_config_example_loads_and_uses_only_keys_the_example_document
 
 
 def test_the_systemd_units_are_one_text_in_install_and_usage() -> None:
-    install = [f for f in _fences(_text("INSTALL.md"), "") if "logalert.service" in f]
-    usage = [f for f in _fences(_text("docs/USAGE.md"), "") if "logalert.service" in f]
+    install = [f for f in fences(_text("INSTALL.md"), "") if "logalert.service" in f]
+    usage = [f for f in fences(_text("docs/USAGE.md"), "") if "logalert.service" in f]
     assert len(install) == 1 and len(usage) == 1
     assert install[0] == usage[0]
     assert "ExecStart=/usr/local/bin/logalert" in install[0]  # absolute, the symlink
@@ -62,7 +45,7 @@ def test_the_systemd_units_are_one_text_in_install_and_usage() -> None:
 
 
 def test_the_cron_line_is_one_text_in_readme_install_and_usage() -> None:
-    lines = {name: [f for f in _fences(_text(name), "") if "MAILTO=" in f]
+    lines = {name: [f for f in fences(_text(name), "") if "MAILTO=" in f]
              for name in ("README.md", "INSTALL.md", "docs/USAGE.md")}
     assert all(len(found) == 1 for found in lines.values()), lines
     assert len({found[0] for found in lines.values()}) == 1

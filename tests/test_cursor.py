@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import SECTION, texts, try_symlink
 
 from logalert.cursor import (
     ANCHOR_CAP,
@@ -37,7 +38,6 @@ from logalert.cursor import (
 )
 from logalert.state import Cursor, State, load_state, timestamp
 
-SECTION = "router-disk"
 E_ACUTE = chr(0xE9).encode("utf-8")  # spelled from the code point for the ASCII gate
 NUL = bytes([0])  # likewise: never a control character in the source
 
@@ -54,10 +54,6 @@ def scan(path: Path, saved: Cursor | None, *, from_start: bool = False,
     with log:
         lines = list(log.lines())
     return log, lines
-
-
-def texts(lines: list[Line]) -> list[str]:
-    return [line.text for line in lines]
 
 
 # -- the identity rules, as a pure function ---------------------------------------------------
@@ -510,12 +506,10 @@ def test_closing_the_handle_closes_the_descriptor(
 
 
 def test_an_archive_that_is_a_symbolic_link_is_refused(tmp_path: Path) -> None:
-    if sys.platform == "win32":
-        pytest.skip("symbolic links need a privilege on Windows; runs in the sandbox and on CI")
     real = tmp_path / "router.log.1"
     real.write_bytes(b"a\n")
     link = tmp_path / "router.log.2"
-    link.symlink_to(real)
+    try_symlink(link, real)
     with pytest.raises(OSError, match="is a symbolic link; an archive is never followed"):
         open_log(str(link))
     with open_log(str(link), follow_links=True) as handle:  # a listed path, our own link
@@ -524,12 +518,10 @@ def test_an_archive_that_is_a_symbolic_link_is_refused(tmp_path: Path) -> None:
 
 def test_a_listed_link_of_our_own_is_followed_and_realpath_is_the_target(
         tmp_path: Path) -> None:
-    if sys.platform == "win32":
-        pytest.skip("symbolic links need a privilege on Windows; runs in the sandbox and on CI")
     real = tmp_path / "today.log"
     real.write_bytes(b"first\nsecond\n")
     link = tmp_path / "current"
-    link.symlink_to("today.log")  # relative: resolved against the link's directory
+    try_symlink(link, Path("today.log"))  # relative: resolved against the link's directory
     log, lines = scan(link, None, from_start=True)
     assert texts(lines) == ["first", "second"]
     assert log.cursor().realpath == os.path.realpath(real)
@@ -684,15 +676,13 @@ def test_compressed_first_sight_boundaries_match_the_plain_files(
 
 def test_a_listed_link_to_an_unchanged_archive_is_never_short_circuited(tmp_path: Path) -> None:
     """The owner rule of #26 lives in open_log; a link must reach it every run (review)."""
-    if sys.platform == "win32":
-        pytest.skip("symbolic links need a privilege on Windows; runs in the sandbox and on CI")
     real = tmp_path / "real.log.gz"
     real.write_bytes(gzip.compress(b"a\nb\n"))
     log, _ = scan(real, None, from_start=True)
     saved = log.cursor()
     assert saved.size is not None
     link = tmp_path / "current.log.gz"
-    link.symlink_to(real)
+    try_symlink(link, real)
     log2, lines = scan(link, saved)
     assert not log2.unchanged and lines == []  # opened through the rule, nothing new
 

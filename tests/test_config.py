@@ -8,11 +8,11 @@ Non-ASCII test data is built from code points (the gated-Python ASCII rule).
 import os
 import re
 import socket
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from conftest import run_logalert
 
 from logalert.__main__ import main
 from logalert.config import (
@@ -62,12 +62,15 @@ def error(tmp_path: Path, text: str) -> str:
 # -- the shipped example -----------------------------------------------------------------
 
 
-def test_example_config_reparses_clean(tmp_path: Path) -> None:
+def test_example_config_reparses_clean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     text = example_config().replace("/var/log/router.log", (tmp_path / "router.log").as_posix())
     config = load_config(write(tmp_path, text))
     assert [w.name for w in config.watches] == ["router-disk"]
     assert config.warnings == ()
     assert config.settings.transport == "auto"
+    # the example leaves from = commented out: a dotted host name keeps describe() off the
+    # resolver (issue #43: getfqdn stalls for the resolver timeout on a runner with dead DNS)
+    monkeypatch.setattr(socket, "gethostname", lambda: "router1.example.net")
     out = describe(config)
     assert "[router-disk] subject: Router disk failure" in out
     assert "priority: off" in out
@@ -590,7 +593,8 @@ def usable(tmp_path: Path, text: str) -> str:
     """A config whose transport can be chosen: the interpreter stands in for sendmail
     (it exists and is executable on both platforms); since #11 --check-config exits 2
     when transport = auto finds nothing."""
-    return f"[logalert]\nsendmail_path = {Path(sys.executable).as_posix()}\n" + text
+    return (f"[logalert]\nsendmail_path = {Path(sys.executable).as_posix()}\n"
+            "from = alerts@example.net\n" + text)  # no resolver asked for a default From
 
 
 def test_cli_check_config_good_and_bad(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -617,10 +621,7 @@ def test_cli_example_config_and_help(capsys: pytest.CaptureFixture[str]) -> None
 
 def test_module_run_check_config(tmp_path: Path) -> None:
     good = write(tmp_path, usable(tmp_path, watch(tmp_path)))
-    result = subprocess.run(
-        [sys.executable, "-m", "logalert", "--check-config", "-f", good],
-        capture_output=True, encoding="utf-8", errors="replace", check=False,
-    )
+    result = run_logalert("--check-config", "-f", good)
     assert result.returncode == 0, result.stderr
     assert "[router-disk] subject: Router disk failure" in result.stdout
 

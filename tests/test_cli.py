@@ -1,11 +1,10 @@
 """Smoke tests for the CLI entry point and version single-sourcing."""
 
-import subprocess
-import sys
 from importlib.metadata import version
 from pathlib import Path
 
 import pytest
+from conftest import run_logalert
 
 from logalert import __version__
 from logalert.__main__ import main
@@ -35,12 +34,6 @@ def test_no_args_is_the_run_and_a_missing_config_is_exit_2(
 
 
 def test_module_is_runnable() -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "logalert", "--version"],
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    result = run_logalert("--version")
     assert result.returncode == 0
     assert result.stdout.strip() == f"logalert {__version__}"

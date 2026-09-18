@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import try_symlink
 
 from logalert.state import (
     STATE_VERSION,
@@ -258,13 +259,11 @@ def test_a_symlinked_state_file_is_refused_and_its_target_untouched(tmp_path: Pa
     """A link at state_file never worked as a redirect: the first save replaced the link
     itself with a regular file (issue #39). It is refused up front, with the log's wording,
     before anything is written -- a link to a valid state and a dangling one alike."""
-    if sys.platform == "win32":
-        pytest.skip("symbolic links need a privilege on Windows; runs in the sandbox and on CI")
     real = tmp_path / "real.json"
     State(str(real)).save()
     before = real.read_bytes()
     link = tmp_path / "state.json"
-    link.symlink_to(real)
+    try_symlink(link, real)
     with pytest.raises(StateError) as exc:
         check_state_dir(str(link))
     assert str(exc.value) == f"state file {link} is a symbolic link -- name the real path"

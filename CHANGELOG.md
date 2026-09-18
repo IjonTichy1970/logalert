@@ -197,6 +197,13 @@ its notes.
   `anchor` (up to 4 KiB before the position, hashed as read), which #66's
   in-run check compares too; a 0.1.0 entry is trusted once.
 
+- `[internal]` **The test helpers every module copied live once, in
+  `tests/conftest.py`** (#43). The `Site` fixture, the scandir denial, the
+  `-m logalert` runner, the tried symlink, the fence scanner and the rotation
+  helpers; the fake MTA's knob list had already drifted by one between two
+  copies. Nine symlink tests now try the link instead of skipping on Windows
+  outright, and no check-config test reaches `getfqdn()` by accident.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

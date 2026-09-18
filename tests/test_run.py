@@ -24,14 +24,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import NL, SENDER, Site, body_of
 from esmtp_stub import StubConfig, run_stub
-from fake_sendmail import install
 
 import logalert.__main__
 import logalert.cursor
 import logalert.run
 import logalert.state
-from logalert.__main__ import main
 from logalert.cursor import LogFile, anchor_of
 from logalert.lock import RunLock
 from logalert.match import scan
@@ -46,95 +45,6 @@ from logalert.state import (
     lock_path,
     timestamp,
 )
-
-NL = chr(10)
-SENDER = "alerts@example.net"
-
-
-class Site:
-    """A config with two sections over two fixture logs, a state directory, the fake."""
-
-    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.root = tmp_path
-        self.router = tmp_path / "router.log"
-        self.firewall = tmp_path / "fw.log"
-        self.router.write_text("boot" + NL + "quiet" + NL, encoding="utf-8", newline=NL)
-        self.firewall.write_text("up" + NL, encoding="utf-8", newline=NL)
-        self.state_dir = tmp_path / "state"
-        self.state_dir.mkdir()
-        self.state_file = self.state_dir / "state.json"
-        self.activity_log = tmp_path / "activity.log"  # not in the state dir: tests remove it
-        self.fake_dir = tmp_path / "fake"
-        monkeypatch.setenv("LOGALERT_FAKE_DIR", str(self.fake_dir))
-        for knob in ("LOGALERT_FAKE_SLEEP", "LOGALERT_FAKE_EXIT", "LOGALERT_FAKE_EXIT_IF_RCPT",
-                     "LOGALERT_FAKE_STDERR_BYTES"):
-            monkeypatch.delenv(knob, raising=False)
-        self.binary = install(tmp_path)
-        self.conf = tmp_path / "logalert.conf"
-        self.write_config()
-
-    def write_config(self, settings: str = "", router: str = "", firewall: str = "",
-                     router_to: str = "noc@example.net", sendmail: str | None = None,
-                     firewall_files: str | None = None, log: str | None = None) -> None:
-        fw_files = firewall_files or self.firewall.as_posix()
-        log = log or f"file:{self.activity_log.as_posix()}"
-        text = (f"[logalert]\nsendmail_path = {sendmail or self.binary.as_posix()}\n"
-                f"state_file = {self.state_file.as_posix()}\nfrom = {SENDER}\n"
-                f"log = {log}\n{settings}\n"
-                f"[router-disk]\nsubject = Router disk failure\nto = {router_to}\n"
-                f"files = {self.router.as_posix()}\npatterns =\n    disk failure\n{router}\n"
-                f"[firewall]\nsubject = Firewall denies\nto = fw@example.net\n"
-                f"files = {fw_files}\npatterns =\n    DENY\n{firewall}\n")
-        self.conf.write_text(text, encoding="utf-8", newline=NL)
-
-    def run(self, *extra: str) -> int:
-        return main(["-f", str(self.conf), *extra])
-
-    def prime(self) -> None:
-        """A first run: first sight of both files, nothing mailed, the state created."""
-        assert self.run() == 0
-        assert self.calls() == []
-
-    def append(self, path: Path, *lines: str) -> None:
-        with open(path, "a", encoding="utf-8", newline=NL) as fh:
-            for line in lines:
-                fh.write(line + NL)
-
-    def calls(self) -> list[tuple[dict[str, Any], bytes]]:
-        if not self.fake_dir.exists():
-            return []
-        out = []
-        for name in sorted(n for n in os.listdir(self.fake_dir) if n.startswith("call-")
-                           and n.endswith("-argv.json")):
-            argv: dict[str, Any] = json.loads((self.fake_dir / name).read_text(encoding="ascii"))
-            stdin = (self.fake_dir / name.replace("-argv.json", "-stdin.bin")).read_bytes()
-            out.append((argv, stdin))
-        return out
-
-    def state(self) -> dict[str, dict[str, dict[str, Any]]]:
-        data: dict[str, Any] = json.loads(self.state_file.read_text(encoding="utf-8"))
-        entries: dict[str, dict[str, dict[str, Any]]] = data["entries"]
-        return entries
-
-    def offset(self, section: str, path: Path) -> int:
-        return int(self.state()[section][path.as_posix()]["offset"])
-
-    def activity(self) -> list[str]:
-        """The activity log so far, each line without its timestamp and ident."""
-        if not self.activity_log.exists():
-            return []
-        lines = self.activity_log.read_text(encoding="utf-8").splitlines()
-        return [line.split("]: ", 1)[1] for line in lines]
-
-
-@pytest.fixture
-def site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Site:
-    return Site(tmp_path, monkeypatch)
-
-
-def body_of(stdin: bytes) -> str:
-    return stdin.decode("utf-8")
-
 
 # -- the clean runs -----------------------------------------------------------------------------
 

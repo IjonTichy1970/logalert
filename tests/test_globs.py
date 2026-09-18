@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import deny_scandir, try_symlink
 
 from logalert.globs import Expansion, expand, is_glob
 from logalert.rotation import archive_suffix
@@ -113,10 +114,8 @@ def test_a_symbolic_link_is_passed_over_wherever_it_points(tmp_path: Path) -> No
     """A link is a name the operator never wrote (a root run following one planted in a
     watched directory would mail a file outside it -- reproduced in review); a link where a
     wildcard directory component would descend is not followed either."""
-    if sys.platform == "win32":
-        pytest.skip("creating a symlink needs a privilege here; runs in the sandbox and on CI")
     make(tmp_path, "real.log", "hosts/r1/messages", "outside/secret")
-    os.symlink(tmp_path / "real.log", tmp_path / "link.log")
+    try_symlink(tmp_path / "link.log", tmp_path / "real.log")
     os.symlink(tmp_path / "gone", tmp_path / "dangling.log")
     os.symlink(tmp_path / "outside" / "secret", tmp_path / "hosts" / "r1" / "planted")
     os.symlink(tmp_path / "outside", tmp_path / "hosts" / "evil")
@@ -187,14 +186,7 @@ def test_unlistable_directory_is_an_error_not_silence(
     """``glob.glob`` returns nothing for it (measured as nobody); this must not."""
     make(tmp_path, "hosts/r1/messages", "hosts/r2/messages")
     locked = (tmp_path / "hosts" / "r1").as_posix()
-    real_scandir = os.scandir
-
-    def scandir(path: str = ".") -> object:
-        if os.path.normcase(path) == os.path.normcase(locked):
-            raise PermissionError(13, "Permission denied", path)
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
+    deny_scandir(monkeypatch, locked)
     found = expand((tmp_path / "hosts" / "*" / "*").as_posix())
     assert relative(tmp_path, found) == ["hosts/r2/messages"]
     assert found.errors == (f"cannot list {locked} (Permission denied)",)
