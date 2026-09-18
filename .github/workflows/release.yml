@@ -12,6 +12,10 @@ name: Release artifacts
 on:
   push:
     tags: ["v*"]
+  # A rehearsal from main (`gh workflow run release.yml`): everything but the upload runs
+  # on a real runner before the first tag ever fires it -- a workflow defect found at the
+  # tag leaves a release with notes and no assets that no re-run can mend.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,7 +40,8 @@ jobs:
       # changelog section); it follows the tag push by seconds, and this job waits up to
       # five minutes for it before attaching the pair. --clobber: a re-run replaces, never
       # duplicates.
-      - env:
+      - if: github.ref_type == 'tag'
+        env:
           GH_TOKEN: ${{ github.token }}
         run: |
           for i in $(seq 1 20); do
