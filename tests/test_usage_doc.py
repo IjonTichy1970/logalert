@@ -222,7 +222,7 @@ def test_the_position_section_and_the_table_carry_the_anchor() -> None:
     assert ("`... the bytes before the saved offset are not the ones read (truncated and "
             "refilled?); truncated`") in row  # the _log shape: note, then the verdict
     assert "rewrites its log in place" in row and "found the saved position by content" in row
-    assert "issue #74" in row  # the older same-banner copy taken as a guess
+    assert "never taken (the anchor refuses it)" in row  # issue #74: no guess by the banner
     source = (DOC.parents[1] / "logalert" / "cursor.py").read_text(encoding="utf-8")
     assert "the bytes before the saved offset are not the ones read " in source  # breaks there
     assert "(truncated and refilled?)" in source

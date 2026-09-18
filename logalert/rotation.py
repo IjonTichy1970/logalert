@@ -31,16 +31,25 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     When ``<x>`` and ``<x>.<ext>`` both exist in one directory (compression in progress) the
     uncompressed one is kept. Compression ALWAYS creates a new inode (measured), so an inode
     alone never finds a compressed copy.
-  * A copy of our file has our first line and is at least as long as our position in it;
-    read through the decompressor, that is what the CONTENT check asks. The archives of this
+  * A copy of our file has our first line, is at least as long as our position in it, and
+    -- when the cursor carries an anchor (issue #34: the last 4 KiB before the position AS
+    READ) -- has those bytes before the position (issue #74); read through the decompressor,
+    that is what the CONTENT check asks, in EVERY stage: a copy with other bytes there is
+    not the file the position was taken in, whatever its stamp or inode. Measured before
+    the anchor was compared: an older copy sharing a banner log's first line, longer than
+    the position, was taken as a guess at every restart of a service whose start script
+    truncates the log -- 166 old lines and a fragment mailed before the new file's. A
+    parked entry (below) records the anchor of the copy it stands in. The archives of this
     log written AFTER the last run are ours or newer, and the oldest of them that fits is ours:
     that is tried first -- unless the cursor is PARKED on a rotated copy (a stop, a consumer
     that stopped mid-chain, an absent live file): such a cursor carries the copy's mtime
     (issue #65), and the archive of this log with that mtime -- to the second: bzip2 by
     hand keeps no more, logrotate restores it exactly with any compressor, gzip and xz keep
-    the nanoseconds (measured) -- that has the saved first line and is long enough is taken
-    before any guess: the copy's own inode first, then an exact stamp, then a named style
-    before a hand-made one (two files can share the second; review). A parked copy is
+    the nanoseconds (measured) -- that has the saved first line, is long enough and holds the
+    anchor's bytes is taken before any guess: the copy's own inode first, then an exact
+    stamp, then a named style before a hand-made one (two files can share the second;
+    review; a twin with the same stamp and first line but other bytes is refused by the
+    anchor, issue #74). A parked copy is
     older than the run that parked on it, and in a
     banner log every newer copy fits the content check: the run resumed inside the wrong
     file, silently (measured). Only then is the saved INODE looked for, among ALL regular
@@ -54,7 +63,10 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     not ours. With no saved first line (the file was empty at the last run) only a file
     NAMED as an archive of this log qualifies by inode: the number alone would accept
     another log's archive. Last, the older archives are tried newest first, and a WARNING
-    says the choice was a guess when an older one shares the first line. A truncation
+    says the choice was a guess when an older one shares the first line and the cursor
+    has no anchor to settle it by -- with one the bytes decide and a copy the anchor
+    refuses is never a guess; a cursor without one (0.1.0's, a parked entry from before
+    #74) is trusted as before. A truncation
     (``copytruncate``) never looks for the inode: it is the live file's.
   * The CHAIN: after the matched archive's tail, every archive NEWER than it, oldest first and in
     full, then the live file from 0. "Newer" is by the style key when every file involved shares
@@ -144,6 +156,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from logalert.cursor import (
+    ANCHOR_CAP,
     COMPRESSED_SUFFIXES,
     STREAM_ERRORS,
     BinaryStream,
@@ -151,6 +164,7 @@ from logalert.cursor import (
     LineReader,
     LogFile,
     Verdict,
+    anchor_of,
     compressed_suffix,
     count_newlines,
     fingerprint,
@@ -439,9 +453,10 @@ DENIED = Denied()
 
 def _content_matches(section: str, path: str, archive: Archive, saved: Cursor, *,
                      by_content: bool) -> "Verified | Renamed | Denied | Literal[False] | None":
-    """The archive's open handle at the saved offset when its first line and length fit the
-    saved cursor (``Verified``); False when it does not fit; ``DENIED`` when a permission
-    refused it, None if unreadable otherwise.
+    """The archive's open handle at the saved offset when its first line, its length and
+    the bytes before the offset (the anchor, issue #74) fit the saved cursor
+    (``Verified``); False when it does not fit; ``DENIED`` when a permission refused it,
+    None if unreadable otherwise.
 
     ``by_content`` (stage 2) demands the first lines be EQUAL: a file with no complete first
     line identifies nothing. The inode stage only asks that the archive not contradict the
@@ -476,14 +491,18 @@ def _content_matches(section: str, path: str, archive: Archive, saved: Cursor, *
             # are read instead -- keeping the tail for the context hook and counting the
             # lines, the two later passes issue #46 measured
             reached, tail, newlines = _forward(handle, saved.offset, TAIL)
-            if not reached:
+            if not reached or not _anchored(tail, saved):
                 handle.close()
                 return False
             return Verified(handle, current, tail, newlines)
         if archive.size < saved.offset:
             handle.close()
             return False
-        return Verified(handle, current, tail_of(handle, saved.offset, TAIL), None)
+        tail = tail_of(handle, saved.offset, TAIL)
+        if not _anchored(tail, saved):
+            handle.close()
+            return False
+        return Verified(handle, current, tail, None)
     except _READ_ERRORS as exc:
         handle.close()
         log.warning("[%s] %s: rotated copy %s could not be read (%s); skipped",
@@ -492,6 +511,14 @@ def _content_matches(section: str, path: str, archive: Archive, saved: Cursor, *
     except BaseException:
         handle.close()
         raise
+
+
+def _anchored(tail: bytes, saved: Cursor) -> bool:
+    """Whether the bytes before the offset are the ones the position was taken in (issue
+    #74): the saved anchor against the last ``ANCHOR_CAP`` of the kept tail -- the same
+    window the live file's cursor hashed. A cursor without an anchor (0.1.0's, a parked
+    entry from before #74) is trusted, as the live verdict trusts it."""
+    return saved.anchor is None or anchor_of(tail[-ANCHOR_CAP:]) == saved.anchor
 
 
 def _forward(handle: BinaryStream, offset: int, keep: int) -> tuple[bool, bytes, int]:
@@ -772,12 +799,14 @@ def _named(target: str, real: str) -> str:
 def _newest_older_fit(section: str, path: str, older: list[Archive], saved: Cursor,
                       fits: Fits) -> Archive | None:
     """The last resort: among the archives written BEFORE the last run, newest first, the
-    first that fits -- a guess when an older one shares the first line, and said so. Every
+    first that fits -- a guess when an older one shares the first line and the cursor has
+    no anchor to settle it by (issue #74: with one, the bytes decided), and said so. Every
     archive tried costs a fingerprint read; a fitting one costs a seek to the saved offset.
     """
     for index, archive in enumerate(older):
         if fits(archive):
-            rivals = [a for a in older[index + 1:] if _same_first_line(a, saved)]
+            rivals = ([] if saved.anchor is not None
+                      else [a for a in older[index + 1:] if _same_first_line(a, saved)])
             if rivals:
                 log.warning("[%s] %s: %d older rotated copies share the saved first line; "
                             "taking the newest that is long enough, %s, which is a guess",
@@ -870,6 +899,7 @@ class Segment:
         self.renamed = False  # renamed or gone at its open: the stream stops here (issue #32)
         self.denied = False  # a permission refused it: the run's failed item (issue #38)
         self.handle: BinaryStream | None = verified.handle if verified else None
+        self.reader: LineReader | None = None  # kept for the anchor a parked cursor records
 
     def lines(self) -> Iterator[Line]:
         self.started = True
@@ -899,8 +929,13 @@ class Segment:
                     self.start_line = (counted if counted is not None
                                        else count_newlines(handle, self.start))
                     self.line = self.start_line
+                # the reader's tail starts as the bytes before the start (issue #74): the
+                # content stage's kept tail for the match, nothing for a member read from 0
+                seed = (self.verified.tail[-ANCHOR_CAP:] if self.verified is not None
+                        else b"" if self.start == 0 else None)
                 reader = LineReader(handle, self.start, start_line=self.start_line,
-                                    path=self.path)
+                                    path=self.path, tail=seed)
+                self.reader = reader
                 for line in reader:
                     self.offset, self.line = reader.offset, reader.line
                     self.yielded = True
@@ -928,11 +963,13 @@ class Segment:
     def cursor(self, now: datetime | None = None) -> Cursor:
         # size and mtime: a rotated copy is immutable, so they identify it at the next
         # run (issue #65); a compressor makes a new inode and keeps the mtime, to the
-        # second at least
+        # second at least; the anchor: the copy's bytes before the offset, as read, so a
+        # twin with the same stamp and first line is told apart (issue #74)
         return Cursor(offset=self.offset, ino=self.ino, dev=self.dev, fingerprint=self.fingerprint,
                       realpath=os.path.realpath(self.path), last_seen=timestamp(now),
                       line=self.line, size=self.size if self.mtime is not None else None,
-                      mtime=self.mtime)
+                      mtime=self.mtime,
+                      anchor=self.reader.anchor if self.reader is not None else None)
 
     def context_before(self, n: int) -> list[Line]:
         """The lines before ``start`` in this archive, numbered; see ``LogFile``. Answered

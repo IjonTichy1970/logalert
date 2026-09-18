@@ -21,8 +21,8 @@ will actually read, and decides how the saved cursor applies:
     not recorded as the file -- and a cursor without one (0.1.0's, a parked copy's) is
     trusted once. What it cannot see: a refill whose last ``ANCHOR_CAP`` bytes before the
     position are the ones read (a file of nothing but identical lines, aligned). The plan
-    behind the verdict is the rotation module's: an older copy sharing the banner is still
-    taken as a guess there (issue #74).
+    behind the verdict is the rotation module's, which compares the anchor too: a copy
+    with other bytes before the position is never taken (issue #74).
   * inode differs -> ROTATED
   * device id differs alone -> continue, with a log line (a remount or a reboot renumbers
     devices; that never declares a rotation by itself)

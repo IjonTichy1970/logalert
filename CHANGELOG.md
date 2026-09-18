@@ -293,6 +293,13 @@ its notes.
   against A's size and cleared A's marker. Each run now honours, sets and
   clears only its own and carries the others along; `--reset-state` likewise.
 
+- `[contract]` **The rotation catch-up compares the anchor: a copy with other
+  bytes before the position is never the file, whatever its stamp or inode,
+  and a parked entry records the copy's anchor** (#74). An older copy sharing
+  a banner log's first line, longer than the position, was taken as a guess
+  at every restart that truncated the log -- 166 old lines and a fragment
+  mailed before the new file. A cursor without an anchor is trusted as before.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty
