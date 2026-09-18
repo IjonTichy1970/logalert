@@ -30,17 +30,16 @@ line is red), `mypy` (strict), `pytest`, `linux stage` (delegated into the
 names every stage that announced a skip. **Read the stage lines, not the
 verdict** -- an announced skip reads as green at a glance.
 
-Expected announced skips on the Windows host: `changelog refs` ("no release
-commit yet", until the first release) and `pytest` (the POSIX-only tests --
-file modes, a FIFO, symlinks, the real-`logrotate` module, the POSIX-only lock
-probe, a rename under an open handle, a signal delivered to a handler, the
-faked uids of the root-owner pin -- all but the lock probe saying "runs in the
-sandbox and on CI"; 70 as of #41). In the root sandbox the
+Expected announced skips on the Windows host: `pytest` only (the POSIX-only
+tests -- file modes, a FIFO, symlinks, the real-`logrotate` module, the
+POSIX-only lock probe, a rename under an open handle, a signal delivered to a
+handler, the faked uids of the root-owner pin -- all but the lock probe saying
+"runs in the sandbox and on CI"; 71 as of #69); `changelog refs` skipped ("no
+release commit yet") only until 0.1.0 was cut. In the root sandbox the
 non-root tests skip instead, saying "expected in the root sandbox; CI runs it"
-(11 as of #64), plus one Windows-only
-test ("the read-only attribute is a Windows shape"); as `nobody` the one
-root-only test skips ("needs root to plant another user's link"), and the Linux
-stage carries that scenario on CI.
+(12 as of #69), plus one Windows-only test ("the read-only attribute is a
+Windows shape"); as `nobody` the one root-only test skips ("needs root to
+plant another user's link"), and the Linux stage carries that scenario on CI.
 Any other announced skip is worth reading. mypy on this host is the
 pure-Python build (`pip install --no-binary mypy mypy`): the compiled wheel's
 DLL is blocked by an Application Control policy. **mypy here checks nothing
@@ -63,7 +62,11 @@ sandbox). Never run two gates against the sandbox at once.
   `.claude/skills/release/SKILL.md` (local, gitignored). Personal skills shadow
   project skills of the same name, so a bare `/release` resolves to the global
   skill, whose first step is to defer to that file. Invoking `/release` here is
-  the owner's approval for exactly the three mutations it lists.
+  the owner's approval for exactly the three mutations it lists. The tag push
+  starts `.github/workflows/release.yml`, which builds the sdist and the wheel
+  on Linux, refuses a bad pair (`tools/check_artifacts.py`: a world-writable
+  member, CRLF metadata, a missing file) and attaches them to the release
+  (#56); nothing is built on this host.
 - Never commit to `main` directly (the `/release` commit is the one exception).
   The commit subject ends in `(#N)`: the PR step gathers `Closes #N` from
   subjects only, and the `changelog refs` stage keys on the same convention;
@@ -81,9 +84,10 @@ sandbox). Never run two gates against the sandbox at once.
   in a skill or script. A new entry goes at the end of `[Unreleased]`, before
   the next version heading or that section.
 - A docs-only PR gets the Pages build only (`pages.yml` renders the changelog
-  and refuses a structural defect); `ci.yml` skips it (`paths-ignore`). That
-  is could-not-check for everything else, not green: the local gate stands in,
-  and `git diff --name-only main..HEAD` must be docs-only before the merge.
+  and refuses a structural defect, runs the document pins and the markdown
+  width, #45); `ci.yml` skips it (`paths-ignore`). That is could-not-check
+  for everything else, not green: the local gate stands in, and `git diff
+  --name-only main..HEAD` must be docs-only before the merge.
 - Before committing non-trivial work, run an adversarial review pass (subagents)
   that hunts for real defects and adds missing tests, with the lenses the change
   needs. After ANY workflow that could have touched the tree, run `git status`:

@@ -73,7 +73,6 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
 
 from logalert.config import (
     RESERVED_SECTION,
@@ -84,11 +83,9 @@ from logalert.config import (
     is_address,
     sendmail_problem,
 )
-from logalert.mail import Mail, clean_header
+from logalert.mail import Mail, Transport, clean_header
 
 log = logging.getLogger("logalert.transport")
-
-Transport = Literal["sendmail", "smtp"]
 
 # sysexits.h, spelled here because os.EX_* is absent on Windows (only EX_OK exists there)
 SYSEXITS: dict[int, str] = {

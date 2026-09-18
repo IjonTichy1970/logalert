@@ -383,9 +383,11 @@ from the file itself and treated as truncated; an entry from 0.1.0 has none
 and is trusted once), and when it
 was last seen. An entry parked on a rotated copy (a rotation during the run, an
 absent live file) also records that copy's size and modification time, and the
-next run takes the copy with that modification time and first line before any
-guess by content -- a rotated copy is not written to again, and logrotate's
-compression keeps the time. Two sections watching the same file have two
+next run takes the copy with that modification time, first line and anchor
+before any guess by content -- a rotated copy is not written to again, and
+logrotate's compression keeps the time; a twin with the same stamp and first
+line but other bytes before the position is refused. Two sections watching the
+same file have two
 entries, so the
 section whose mail failed keeps its place while the other advances. The state is
 saved after each section, atomically; a section whose delivery failed keeps the
@@ -402,12 +404,14 @@ proof that it can be: a full disk or an exhausted quota fails there, with
 nothing sent, where the writable-directory check alone passes (a 0-byte
 probe needs no block). A run whose mail went out and whose state then could
 not be saved (room for the positions as they were, none for what the run
-added) marks the `lock` file beside the state with `unsaved <bytes>`, the
-size that did not fit; the next run's opening save must then reach that
-size plus a block, or the run sends nothing and says so (exit 1). Once the
-proof passes, that run re-sends what the marked run sent -- once per proven
-room -- and clears the mark; `--reset-state` with no path clears it too. Two
-configurations sharing a state directory share the lock and its mark.
+added) marks the `lock` file beside the state with `unsaved <bytes>
+<state file>`, the size that did not fit; the next run's opening save must
+then reach that size plus a block, or the run sends nothing and says so (exit
+1). Once the proof passes, that run re-sends what the marked run sent -- once
+per proven room -- and clears the mark; `--reset-state` with no path clears it
+too. Two configurations sharing a state directory share the lock; each one's
+mark is its own, keyed to its state file's name, and a run of the other
+carries it along untouched.
 
 **Rotation.** When a run finds the live file rotated (a different inode) or
 truncated (smaller than the saved offset, as `copytruncate` leaves it, or
@@ -438,7 +442,8 @@ however many rotations happened in between. It recognises, beside the log or in
   out, with a log line -- so a numbered live sibling such as `worker.1.log`
   beside `worker.log` is never chained as a copy (whether it holds the saved
   position is the content check's decision, as for any candidate: a sibling
-  that shares the log's first line can be mistaken for the copy).
+  that shares the log's first line can be mistaken for the copy by an entry
+  without an anchor, from 0.1.0).
 
 Symbolic links are never candidates. A `.gz` still being written yields what it
 has, with a warning, and the run continues.
@@ -617,17 +622,22 @@ run (a copy restored with its timestamps, a rotated copy under
 original's modification time), and every listed path, whose first sight is
 unchanged. A glob's moment is recorded when the section's positions are saved
 -- never when its delivery failed (the new file it read keeps its position at
-the beginning, and a file the failed run did not reach is still new), and
-never for a glob whose directory was away or could not be listed that run, so
-a file created during the outage is read whole once the directory is back.
-`--reset-state` forgets the section's moments with the positions: a
-file that appears between the reset and the next run is a plain first sight
-at the end, so reset right before a run, or preview with `-n`. One consequence
-to know: a file the glob matched but could not open for a while (a `Permission
-denied` failed item each run) is read from 0 once it can be, since it was never
-matched before; a fresh modification time on old content (`cp` without `-p`)
-reads the same way, at most `max_lines` matching lines in one mail; `-n` first
-shows what that would send.
+the beginning, and a file the failed run did not reach is still new), never
+for a glob whose directory was away or could not be listed that run, and never
+for a glob whose file with no position yet could not be opened that run (a
+failed item, exit 1 -- a `Permission denied`, typically), so a file created
+during the outage is read whole once the directory, or the file, is back:
+everything written before the permission was fixed is mailed then, once. (A
+glob that has no moment yet takes the run's all the same: its unopened file is
+a plain first sight at the end unless it is written to after that run.)
+`--reset-state` forgets the section's moments with the positions: a file that
+appears between the reset and the next run, or is still refused at it, is a
+plain first sight at the end, so reset right before a run, or preview with
+`-n`. One consequence to know: a new file the glob matched but could not open
+for a while is read from 0 once it can be (an older one is a first sight at
+its end), and so is a fresh modification time on old content (`cp` without
+`-p`), at most `max_lines` matching lines in one mail; `-n` first shows what
+that would send.
 
 A glob that matches nothing is nothing to do (a DEBUG line; the directory may
 not exist yet). A directory the glob needs to list but cannot is a failed item
@@ -641,12 +651,12 @@ default) its files fail at the open, one failed item each; where it does not
 mounts) the entries cannot be told apart and the line is `cannot examine 2 of
 the 2 entries of /var/log/hosts (Permission denied); is the directory
 searchable?`, once per directory, counting the entries the pattern names.
-Where the line is the directory's the glob was not looked into, so its
-record's moment stays where it was; where its files failed one by one the
-glob was listed and the moment moves on as after any run, so a host directory
-that appeared during the outage and wrote nothing since is first-sighted at
-its end once the mode is fixed (with a wildcard last component, `hosts/*/*`,
-the refusal is each subdirectory's `cannot list` and the moment stays).
+Either way a host directory that appeared during the outage is read whole
+once the mode is fixed: where the line is the directory's the glob was not
+looked into and its record's moment stays where it was, and where its files
+failed one by one at the open the new host's file has no position yet and the
+moment waits for it (with a wildcard last component, `hosts/*/*`, the refusal
+is each subdirectory's `cannot list`).
 
 ## Running it
 
@@ -884,10 +894,11 @@ configured destination still gets INFO and above.
 | `not delivered via smtp (...): SMTPSenderRefused: 530 ...` from `--test-mail`, or `failed: [section] SMTPSenderRefused: 530 ...` in cron's mail every run (exit 1); or `every recipient refused: ... -- 554 ...` | The relay wants a login before it takes mail (`530 5.7.0 Authentication required` in RFC 4954's words; a hosted relay adds its own text), or takes mail only from hosts it knows (`... Relay access denied`); `transport = smtp` cannot log in | Reach the relay through an MTA that can, as the sendmail transport (`transport = auto`): Postfix and Exim in their smarthost configuration, `msmtp-mta` (`auth on`, the account in its configuration) or `dma`; or a relay of your own that accepts this host without a login |
 | The same lines arrive twice | A delivery whose state could not be saved afterwards (`state not saved` in the log) -- the mail went out, then the next run that could save re-sent it, once | Make the state directory the running user's -- owned by it, and so writable (`state directory ... is not writable`). The run refuses to send when it cannot save: a directory it cannot write, and a full disk or quota, are refused before any mail (the rows below), and a run that sent and could not save marks the `lock` file so the next run refuses too, until the room is proven |
 | `state file ...: cannot write (No space left on device) -- nothing was sent, because a run that cannot save its position would send everything again next time` (exit 1; `Disk quota exceeded` for a quota), or `state directory: No space left on device (.../lock)` on a first run or after the `lock` file was removed | The filesystem holding the state directory is full (or the user's quota is). A run that sent and then could not save would re-send the same lines (once, with the row below's mark; every run before it) -- the other same-message shape, beside a relay's refusal above, by a different mechanism -- so nothing is sent | Free space (or raise the quota); the run resumes where it was, the positions as last saved |
-| `state file ...: cannot write (No space left on device) -- the last run sent mail it could not record; nothing is sent until the state can be saved` (exit 1), every run; `cat` of the `lock` file shows `unsaved <bytes>` after the holder's PID and start time | The disk had room for the positions as they were but not for what a run added (`state not saved` after a delivery in that run's log): the run marked the lock, and every run since finds too little room to save a state of that size plus a block | Free space (or raise the quota); the next run proves the room, re-sends what the marked run sent -- once per proven room -- and clears the mark. `--reset-state` with no path clears it with the positions |
-| `[section] /var/log/x.log: Permission denied` (exit 1) | The running user cannot read that file; the other files of the section were processed | Grant read access (a group, ACLs) or run as a user that has it |
+| `state file ...: cannot write (No space left on device) -- the last run sent mail it could not record; nothing is sent until the state can be saved` (exit 1), every run; `cat` of the `lock` file shows `unsaved <bytes> <state file>` after the holder's PID and start time | The disk had room for the positions as they were but not for what a run added (`state not saved` after a delivery in that run's log): the run marked the lock, and every run since finds too little room to save a state of that size plus a block | Free space (or raise the quota); the next run proves the room, re-sends what the marked run sent -- once per proven room -- and clears the mark. `--reset-state` with no path clears it with the positions |
+| `[section] /var/log/x.log: Permission denied` (exit 1) | The running user cannot read that file; the other files of the section were processed. A glob's new file with no position yet stays new while it cannot be opened (the glob's moment waits for it) and is read whole once it can be | Grant read access (a group, ACLs) or run as a user that has it |
 | `state file ... belongs to <user>; a run as root would leave it root-owned ...` -- or, before the first run, `state directory ... belongs to <user>; ...` (exit 1) | A root run against a cron user's state | Run as that user: `sudo -u <user> logalert ...` |
-| `stale lock: another run (PID N) has held the lock ... for Ns` (exit 1, under cron) | A run still alive and holding the lock for longer than `lock_stale` -- a stuck run, or one that genuinely takes that long. Not a leftover file: the lock is an OS lock, released the moment its holder exits or is killed; the last holder's line stays in the `lock` file by design and turns nobody away | Look at PID N (`ps -o pid,etime,cmd -p N`; `cat` the `lock` file beside the state file shows the holder's PID and start time, and `unsaved <bytes>` after a run that sent mail it could not record) and end it if it is stuck -- the lock is released with it; raise `lock_stale` if runs really take that long. If `ps` shows PID N is not logalert, the PID was reused: `fuser <lock>` as root names the holder. Do not remove the `lock` file while a run is alive: the next run would lock a fresh file and overlap it |
+| `stale lock: another run (PID N) has held the lock ... for Ns` (exit 1, under cron) | A run still alive and holding the lock for longer than `lock_stale` -- a stuck run, or one that genuinely takes that long. Not a leftover file: the lock is an OS lock, released the moment its holder exits or is killed; the last holder's line stays in the `lock` file by design and turns nobody away | Look at PID N (`ps -o pid,etime,cmd -p N`; `cat` the `lock` file beside the state file shows the holder's PID and start time, and `unsaved <bytes> <state file>` after a run that sent mail it could not record -- a configuration that no longer runs leaves its mark there until its own `--reset-state`) and end it if it is stuck -- the lock is released with it; raise `lock_stale` if runs really take that long. If `ps` shows PID N is not logalert, the PID was reused: `fuser <lock>` as root names the holder. Do not remove the `lock` file while a run is alive: the next run would lock a fresh file and overlap it |
+| `the lock line is full (N markers); this run's marker could not be recorded and the next run re-sends without a proof` in the log after a run that sent mail it could not record | Some forty configurations share one state directory and every one of them is marked at once, so this run's mark did not fit on the lock's first line | Give the configurations state directories of their own; this one's next run re-sends its lines once, without the proof of room the mark would have demanded |
 | `stale lock: the recorded holder PID N is gone; another process holds the lock ... (fuser ... names it)` (exit 1, under cron) | The last run that wrote the file has exited (or PID N now belongs to another user's process, which cannot hold a `0600` lock), and something else holds the lock: a run stalled between taking the lock and writing its line, or another process that opened the file and locked it | `fuser <lock>` (or `lsof <lock>`), run as root -- as the running user it cannot see another user's process -- names the holder; end it if it should not be there. The lock is `0600` (one left `0644` by an earlier version is tightened by the next run that takes it), so only the running user and root can open it |
 | `warning: no usable syslog socket (...); logging to stderr` in cron's mail every run | No syslog daemon, or the socket is somewhere else | Start rsyslog / journald, or set `log = file:/var/log/logalert.log` with the file pre-created owned by the running user (`install -o logalert -g logalert -m 640 /dev/null /var/log/logalert.log`; `/var/log` is root's) |
 | `warning: the activity log at syslog (/dev/log) failed (TimeoutError: timed out); logging to stderr from here on` in cron's mail, followed by the run's records | The syslog socket is held open but nobody reads it (journald stopped or wedged while systemd's socket unit keeps `/dev/log`); the run waited 2 s twice and went on | `systemctl status systemd-journald` (or rsyslog) and restart it; the runs in between logged to stderr, which is that mail |
@@ -900,7 +911,7 @@ configured destination still gets INFO and above.
 | A pattern or exclude with an umlaut (any non-ASCII text) never matches, or a `^` regex misses the first line, or a file is `N line(s) read, 0 matched` under an ASCII pattern, with `skipped M NUL bytes` in the log once it has more than one line | Lines are decoded as UTF-8 and nothing else: a latin-1 log, a UTF-8 BOM before line 1 (U+FEFF, which stands between `^` and the text), a UTF-16 export (every other byte is a NUL). Nothing warns at run time; a missed exclude lets the line through with U+FFFD where the byte was | Write the log as UTF-8 (`iconv -f latin1 -t utf-8`, or the exporter's encoding setting); an unanchored literal for a file with a BOM; `--check-config` names a non-ASCII pattern or exclude |
 | A pattern starting with `#` or `;` never matches | The parser drops such a continuation line as a comment | A regex with the escape: `\#`, `\;` |
 | `no rotated copy holds the saved position ...` in the log after every rotation (exit 1 with `a permission kept the rotated copies out of reach (...)` when that is the cause) | The archives are elsewhere, or fewer are kept than rotations happen between runs (the copies rotated since the last run are read; what the missing one held after the position is lost) -- or the running user cannot read the copy or search its directory, and the causes say so | Set `archive_dir`, or run logalert more often than the rotation; grant read on the copies (a group; `olddir`'s mode) |
-| `... the bytes before the saved offset are not the ones read (truncated and refilled?); truncated` in the log after every restart of a service, then either `no rotated copy holds the saved position ...` and the whole file read again, or -- with an older copy of the same banner beside it, long enough -- `found the saved position by content; reading router.log.1 from N` and that copy's tail mailed first | The service rewrites its log in place (`>` in a start script, a fixed banner) or edits lines in place within 4 KiB of the position: the same inode and first line, other bytes before the position -- the run treats the file as truncated and reads the new content from the beginning, so nothing written after the restart is lost; a copy made since the last run is read from the position first, an older one that shares the banner is taken the same way as a guess (a duplicate, never a loss; issue #74) | Expected. Let the service append (`>>`) and rotate the log with a tool instead |
+| `... the bytes before the saved offset are not the ones read (truncated and refilled?); truncated` in the log after every restart of a service, then `no rotated copy holds the saved position ...` and the whole file read again -- or, with a copy that holds the bytes read beside it (a `copytruncate` since the last run), `found the saved position by content; reading router.log.1 from N` and that copy's tail mailed first | The service rewrites its log in place (`>` in a start script, a fixed banner) or edits lines in place within 4 KiB of the position: the same inode and first line, other bytes before the position -- the run treats the file as truncated and reads the new content from the beginning, so nothing written after the restart is lost. An older copy that merely shares the banner is not the file and is never taken (the anchor refuses it) | Expected. Let the service append (`>>`) and rotate the log with a tool instead |
 | `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config (or as `--check-config` lists a glob's match), or the file was never seen; given the glob itself it says `is a glob` | Use the exact path; `--reset-state` with no path forgets everything |
 | A glob mails nothing, or a file it should read is missing from `--check-config` | The glob matches nothing where it looks (`matches nothing`), or the file is left out as a rotated copy (`left out:` -- a name ending in `.N` or a date such as `app.2024`, a `.bak` or `.gz` twin), or it is not a regular file or is a symbolic link (`passed over:`) | `logalert --check-config` names every match and everything left out; list a wanted file by name, or set `include_archives = yes` for a directory of dated live files |
 | `[section] /var/log/app/current: is a symbolic link owned by app to a file owned by root; not followed (...)` (exit 1) | A listed path is a link whose owner is neither root, nor the running user, nor the owner of the file it points to -- in a directory another user owns, what the name resolves to is that user's choice | List the file itself, or make the link root's (`chown -h root <link>`); a link another user planted is the reason the rule exists |

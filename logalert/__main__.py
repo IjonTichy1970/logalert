@@ -22,7 +22,16 @@ from logalert.config import (
 from logalert.globs import expand, is_glob
 from logalert.lock import LockBusy, RunLock
 from logalert.mail import clean_header, compose_test
-from logalert.run import Options, Terminated, ownership_hint, run, terminating
+from logalert.run import (
+    EXIT_ATTENTION,
+    EXIT_OK,
+    EXIT_USAGE,
+    Options,
+    Terminated,
+    ownership_hint,
+    run,
+    terminating,
+)
 from logalert.state import (
     RESET_HINT,
     State,
@@ -35,9 +44,8 @@ from logalert.transport import DeliveryError, choose, deliver, resolve_sender
 
 log = logging.getLogger("logalert.main")
 
-EXIT_OK = 0
-EXIT_ATTENTION = 1  # ran, but something needs a look (a state problem, a stuck run, ...)
-EXIT_USAGE = 2  # usage or configuration error; nothing ran (argparse's own code too)
+# 0, 1 and 2 are logalert.run's (argparse's own 2 for a usage error agrees); these two are
+# the shell's conventions for a signalled run
 EXIT_INTERRUPTED = 130  # the shell's convention for SIGINT
 EXIT_TERMINATED = 143  # and for SIGTERM (issue #33)
 
@@ -267,7 +275,7 @@ def reset_state(config: Config, target: str, path: str) -> int:
         print(f"logalert: state file {path}: cannot stat ({exc.strerror}) -- are you the "
               f"user logalert runs as?", file=sys.stderr)
         return EXIT_ATTENTION
-    lock = RunLock(lock_path(path), settings.lock_stale)
+    lock = RunLock(lock_path(path), settings.lock_stale, key=os.path.basename(path))
     try:
         check_state_dir(path)
         lock.acquire()

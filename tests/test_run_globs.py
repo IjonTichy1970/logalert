@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import NL, Site, body_of, deny_scandir, unsearchable_listing
+from conftest import NL, Site, body_of, deny_scandir, refuse_open, unsearchable_listing
 
 import logalert.run
 from logalert.__main__ import main
@@ -598,3 +598,126 @@ def test_an_unsearchable_directory_under_a_wildcard_is_a_failed_item_and_keeps_t
                    + NL)
     assert at(site, "firewall", pattern) == moment  # not looked into: the moment kept
     assert site.calls() == []
+
+
+# -- a glob's new file that could not be opened this run (issue #69) -----------------------------
+
+
+def test_a_new_file_that_could_not_be_opened_keeps_the_moment_and_is_read_once_it_can_be(
+        site: Site, capsys: pytest.CaptureFixture[str]) -> None:
+    """The issue's scenario: a file another user made unreadable in a watched directory. The
+    record must not move past it -- the outage rule, applied to a permission -- so it is still
+    new when it opens and everything written before the fix is mailed once. MUTANT: `_advance`
+    recording every glob in `seen` (the code before #69) -> the third run first-sights the file
+    at its end and mails nothing."""
+    pattern = glob_of(site)
+    site.write_config(firewall_files=pattern)
+    site.prime()
+    moment = back_date(site, "firewall", 100)
+    new = daily(site, "new.log", "DENY 192.0.2.30 written before the permission was fixed")
+    stamp(new, 50)  # after the recorded run, before the run that could not open it
+    with pytest.MonkeyPatch.context() as outage:
+        refuse_open(outage, new)
+        assert site.run() == 1
+    err = capsys.readouterr().err
+    assert err == (f"logalert: failed: [firewall] {new.as_posix()}: Permission denied; see the log"
+                   + NL)
+    assert at(site, "firewall", pattern) == moment  # the moment waited for the file
+    assert new.as_posix() not in site.state().get("firewall", {})  # no entry invented for it
+    assert site.calls() == []
+    assert site.run() == 0
+    (_, stdin), = site.calls()
+    assert "DENY 192.0.2.30 written before the permission was fixed" in body_of(stdin)
+    assert site.offset("firewall", new) == new.stat().st_size
+    assert at(site, "firewall", pattern) > moment
+
+
+def test_a_glob_without_a_moment_takes_this_runs_although_its_file_could_not_be_opened(
+        site: Site) -> None:
+    """The other half of the rule: a permanently unreadable file must not leave its glob without
+    a moment (`/var/log/*.log` as an unprivileged user meets root's 0640 files), or the
+    new-file rule is off for the whole glob and every later daily file is first-sighted at
+    its end. MUTANT: the `last_run` condition dropped -> no moment, the fresh file at the end."""
+    pattern = glob_of(site)
+    blocked = daily(site, "blocked.log", "DENY 192.0.2.31 in a file that never opens")
+    site.write_config(firewall_files=pattern)
+    with pytest.MonkeyPatch.context() as outage:
+        refuse_open(outage, blocked)
+        assert site.run() == 1  # the glob's first run: its one file refused
+    assert list(runs(site)["firewall"]) == [pattern]  # on record all the same
+    fresh = daily(site, "fresh.log", "DENY 192.0.2.32 in the next new file")
+    with pytest.MonkeyPatch.context() as outage:
+        refuse_open(outage, blocked)
+        assert site.run() == 1  # still refused, and the section had something to send
+    (_, stdin), = site.calls()
+    assert "DENY 192.0.2.32 in the next new file" in body_of(stdin)
+    assert site.offset("firewall", fresh) == fresh.stat().st_size
+
+
+def test_a_file_with_a_position_that_could_not_be_opened_lets_the_moment_move(
+        site: Site) -> None:
+    """A file with a saved position keeps it whatever the open said; its glob's moment moves on
+    as after any run, so a file that pre-dates this run and appears later is a plain first
+    sight at the end. MUTANT: the `saved is None` condition dropped -> the old moment kept and
+    the late file mailed whole."""
+    pattern = glob_of(site)
+    old = daily(site, "old.log", "up")
+    site.write_config(firewall_files=pattern)
+    site.prime()
+    moment = back_date(site, "firewall", 100)
+    with pytest.MonkeyPatch.context() as outage:
+        refuse_open(outage, old)
+        assert site.run() == 1
+    assert at(site, "firewall", pattern) > moment  # the record moved: nothing to protect
+    late = site.root / "late.log"  # made before that run, moved under the glob after it
+    late.write_text("DENY 192.0.2.33 in a file older than the last run" + NL, encoding="utf-8",
+                    newline=NL)
+    stamp(late, 50)
+    moved = late.rename(site.root / "daily" / "late.log")  # a rename keeps the mtime
+    assert site.run() == 0 and site.calls() == []
+    assert site.offset("firewall", moved) == moved.stat().st_size  # at the end: not new
+
+
+def test_a_new_file_with_mode_0000_keeps_the_moment_and_is_read_once_it_is_readable(
+        site: Site, capsys: pytest.CaptureFixture[str]) -> None:
+    """The mode-bit twin of the first case: the refusal is the kernel's, not a monkeypatch."""
+    if sys.platform == "win32":
+        pytest.skip("mode bits are fabricated on Windows; runs in the sandbox and on CI")
+    if os.geteuid() == 0:
+        pytest.skip("expected in the root sandbox; CI runs it")
+    pattern = glob_of(site)
+    site.write_config(firewall_files=pattern)
+    site.prime()
+    moment = back_date(site, "firewall", 100)
+    new = daily(site, "new.log", "DENY 192.0.2.34 behind a 0000 mode")
+    stamp(new, 50)
+    new.chmod(0)
+    try:
+        assert site.run() == 1
+    finally:
+        new.chmod(0o644)
+    assert "Permission denied" in capsys.readouterr().err
+    assert at(site, "firewall", pattern) == moment
+    assert site.run() == 0
+    (_, stdin), = site.calls()
+    assert "DENY 192.0.2.34 behind a 0000 mode" in body_of(stdin)
+
+
+def test_a_refused_listed_path_leaves_the_globs_moment_alone(site: Site) -> None:
+    """The rule is scoped to the globs that matched the refused path (review): a listed file --
+    no globs, however fresh -- that could not be opened moves no moment back, so the glob
+    beside it, looked into and every match of it read, records the run. MUTANT: the drop over
+    every glob of the section instead of the path's -> the glob's moment kept."""
+    pattern = glob_of(site)
+    daily(site, "one.log", "up")
+    site.write_config(firewall_files=pattern)
+    site.prime()
+    moment = back_date(site, "firewall", 100)
+    listed = site.root / "listed.log"
+    listed.write_text("DENY 192.0.2.35 in a listed file" + NL, encoding="utf-8", newline=NL)
+    site.write_config(firewall_files=pattern + NL + f"    {listed.as_posix()}")
+    with pytest.MonkeyPatch.context() as outage:
+        refuse_open(outage, listed)
+        assert site.run() == 1
+    assert at(site, "firewall", pattern) > moment  # the glob's files were all reached
+    assert listed.as_posix() not in site.state().get("firewall", {})

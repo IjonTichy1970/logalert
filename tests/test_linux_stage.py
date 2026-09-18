@@ -348,3 +348,84 @@ def test_every_external_binary_in_the_checks_is_bounded() -> None:
     seen = {name for name, _ in found}
     missing = [name for name in BOUNDED_BINARIES if name not in seen]
     assert not missing, f"never found at a command position (renamed?): {missing}"
+
+
+# -- the native path without root (issue #59) ----------------------------------------------------
+
+
+def _run_native_unprivileged(tmp_path: Path, *, mode: str) -> tuple[str, int]:
+    """The REAL script on its NATIVE path as an ordinary user with no passwordless sudo, on any
+    host: a `uname` shim says Linux, an `id` shim says uid 1000, a `sudo` shim refuses. No wsl
+    stub is installed -- the branch under test must never reach the delegation."""
+    bash = _bash()
+    tmp_path = Path(tempfile.mkdtemp(prefix="native-", dir=tmp_path))
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    _write_exec(shim_dir / "uname", "#!/usr/bin/env bash" + NL + "echo Linux" + NL)
+    _write_exec(shim_dir / "id", "#!/usr/bin/env bash" + NL + "echo 1000" + NL)
+    _write_exec(shim_dir / "sudo", "#!/usr/bin/env bash" + NL + "exit 1" + NL)
+    env = dict(os.environ)
+    env["PATH"] = f"{shim_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["LOGALERT_CHECK_MODE"] = mode
+    env.pop("LOGALERT_SUDO_REEXEC", None)  # the recursion guard of a real sudo re-exec
+    # the belt: were a shim ever not to win over an .exe, the run must skip in a second as
+    # 'no wsl on PATH' rather than delegate into a real distro until the harness kills it
+    env["LOGALERT_WSL_CMD"] = "/nonexistent/wsl"
+    proc = subprocess.run(
+        [bash, str(SCRIPT)],
+        capture_output=True, encoding="utf-8", errors="replace", timeout=90, cwd=REPO, env=env,
+        check=False,
+    )
+    return proc.stdout + proc.stderr, proc.returncode
+
+
+def test_the_native_path_without_root_is_one_named_skip_before_anything_is_built(
+        tmp_path: Path) -> None:
+    """Issue #59: the checks run the installed script through `runuser`, which refuses a non-root
+    caller; without this skip the stage built the venv and the wheel and then FAILED nine checks
+    naming mail, the state, the rotation and the documented unit (measured), where the header
+    promised a named skip. MUTATION: drop the root check -- on this host the run goes on to the
+    preconditions and skips there with a host-dependent reason (a different line); on a
+    Linux runner it builds the wheel and FAILs at runuser."""
+    out, rc = _run_native_unprivileged(tmp_path, mode="auto")
+    # the anti-vacuity half: the native path was reached, not the delegation
+    assert "linux stage: mode=auto" in out and "delegating" not in out, out
+    assert rc == 0, out
+    assert "SKIP  not root and no passwordless sudo" in out
+    assert "LINUX STAGE SKIPPED" in out
+    assert "-- preconditions" not in out and "FAIL" not in out  # nothing built, nothing failed
+
+
+def test_the_native_path_without_root_is_a_failure_under_required(tmp_path: Path) -> None:
+    """The same skip is could-not-check, and `required` (CI) refuses to pass by not looking."""
+    out, rc = _run_native_unprivileged(tmp_path, mode="required")
+    assert rc == 1, out
+    assert "not root and no passwordless sudo" in out and "so this is not a pass" in out
+    assert "LINUX STAGE FAILED" in out and "-- preconditions" not in out
+
+
+def test_root_passes_the_check_and_reaches_the_native_checks_without_building(
+        tmp_path: Path) -> None:
+    """The other side of the check (review): uid 0 goes on to run_native_checks. An `id` shim
+    says 0 and a `mktemp` shim fails, so the native checks stop at their first line with
+    `mktemp -d failed` -- nothing built on this host, the check provably passed. MUTATION:
+    an always-skip check (`if true`) reddens here and nowhere else on this host."""
+    bash = _bash()
+    tmp_path = Path(tempfile.mkdtemp(prefix="root-", dir=tmp_path))
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    _write_exec(shim_dir / "uname", "#!/usr/bin/env bash" + NL + "echo Linux" + NL)
+    _write_exec(shim_dir / "id", "#!/usr/bin/env bash" + NL + "echo 0" + NL)
+    _write_exec(shim_dir / "mktemp", "#!/usr/bin/env bash" + NL + "exit 1" + NL)
+    env = dict(os.environ)
+    env["PATH"] = f"{shim_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["LOGALERT_CHECK_MODE"] = "auto"
+    env["LOGALERT_WSL_CMD"] = "/nonexistent/wsl"
+    proc = subprocess.run(
+        [bash, str(SCRIPT)],
+        capture_output=True, encoding="utf-8", errors="replace", timeout=90, cwd=REPO, env=env,
+        check=False,
+    )
+    out = proc.stdout + proc.stderr
+    assert "not root" not in out and "delegating" not in out, out
+    assert "mktemp -d failed" in out and proc.returncode == 0, out

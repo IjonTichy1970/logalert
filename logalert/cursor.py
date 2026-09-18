@@ -18,11 +18,12 @@ will actually read, and decides how the saved cursor applies:
     the refill's lines before it lost, silently (measured on both platforms). The cursor's
     ``anchor`` is the sha256 of the last ``ANCHOR_CAP`` bytes before the offset AS READ --
     the reader keeps them as it goes, so a refill landing after the read's last check is
-    not recorded as the file -- and a cursor without one (0.1.0's, a parked copy's) is
-    trusted once. What it cannot see: a refill whose last ``ANCHOR_CAP`` bytes before the
-    position are the ones read (a file of nothing but identical lines, aligned). The plan
-    behind the verdict is the rotation module's: an older copy sharing the banner is still
-    taken as a guess there (issue #74).
+    not recorded as the file -- and a cursor without one (0.1.0's, a parked copy's from
+    before #74) is trusted once. What it cannot see: a refill whose last ``ANCHOR_CAP``
+    bytes before the position are the ones read (a file of nothing but identical lines,
+    aligned). The plan
+    behind the verdict is the rotation module's, which compares the anchor too: a copy
+    with other bytes before the position is never taken (issue #74).
   * inode differs -> ROTATED
   * device id differs alone -> continue, with a log line (a remount or a reboot renumbers
     devices; that never declares a rotation by itself)
@@ -805,16 +806,6 @@ class LogFile:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
-
-
-def open_log_file(section: str, path: str, saved: Cursor | None, *,
-                  from_start: bool = False) -> LogFile | None:
-    """``LogFile`` for the path, or None when it is absent this run (the entry is kept)."""
-    try:
-        return LogFile(section, path, saved, from_start=from_start)
-    except FileNotFoundError:
-        log.debug("[%s] %s: absent this run", section, path)
-        return None
 
 
 def count_newlines(handle: BinaryStream, end: int) -> int:

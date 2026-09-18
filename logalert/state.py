@@ -52,10 +52,12 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
     the last SUCCESSFUL run that looked into that glob: what the run's new-file rule
     compares a first sight against. A glob's moment moves when the section's cursors move
     and the glob's directories were listed without error -- never when its delivery
-    failed, and never for a glob whose directory was away or unlistable that run, so a
-    file created during the outage is still newer than the moment when the directory is
-    back; a glob never looked into has none. ``forget`` drops a section's record with its
-    cursors so ``--reset-state``'s promise (the next run starts at the end, or the
+    failed, never for a glob whose directory was away or unlistable that run, and never
+    for a glob whose file with no entry could not be opened (issue #69; a glob with no
+    moment yet takes the run's, the rule is ``run``'s), so a file created during the
+    outage is still newer than the moment when the directory, or the file, is back; a
+    glob never looked into has none. ``forget`` drops a section's record
+    with its cursors so ``--reset-state``'s promise (the next run starts at the end, or the
     beginning per ``start``) stays true; a record whose section left the configuration
     expires after ``state_ttl`` days, a configured section's never (its next saved run
     refreshes it). A file without ``runs`` is from before #18 and reads as if no section
@@ -105,7 +107,8 @@ class Cursor:
     #                             not opened again
     anchor: str | None = None  # sha256 of the (at most 4 KiB of) bytes before offset, as
     #                            read (issue #34); None from 0.1.0, on a compressed file
-    #                            and on a parked copy
+    #                            and on a parked copy from before #74 (since then the
+    #                            copy's bytes, as read)
 
 
 RunRecord = dict[str, str]  # glob, as written in ``files`` -> ISO 8601 UTC seconds, the run START
@@ -141,21 +144,18 @@ class State:
         self.path = path
         self.entries: dict[tuple[str, str], Cursor] = dict(entries or {})
         self.runs: dict[str, RunRecord] = dict(runs or {})
-        self.dirty = False
 
     def get(self, section: str, file: str) -> Cursor | None:
         return self.entries.get((section, file))
 
     def set(self, section: str, file: str, cursor: Cursor) -> None:
         self.entries[(section, file)] = cursor
-        self.dirty = True
 
     def touch(self, section: str, file: str, now: datetime | None = None) -> None:
         """Record that the file was present this run, without moving the cursor."""
         cursor = self.entries.get((section, file))
         if cursor is not None:
             self.entries[(section, file)] = replace(cursor, last_seen=timestamp(now))
-            self.dirty = True
 
     def record_run(self, section: str, files: Iterable[str], seen: Iterable[str],
                    started: datetime | None = None) -> None:
@@ -169,7 +169,6 @@ class State:
             glob: moment if glob in wanted else previous[glob]
             for glob in files if glob in wanted or glob in previous
         }
-        self.dirty = True
 
     def last_run(self, section: str, glob: str) -> str | None:
         """When the last saved run that looked into ``glob`` started, or None."""
@@ -185,8 +184,6 @@ class State:
             self.runs.pop(key[0], None)
         if file is None:
             self.runs.clear()
-        if keys or file is None:
-            self.dirty = True
         return len(keys)
 
     def expire(self, ttl_days: int, now: datetime | None = None) -> list[tuple[str, str]]:
@@ -198,8 +195,6 @@ class State:
             if age.total_seconds() > ttl_days * 86400:
                 del self.entries[key]
                 dropped.append(key)
-        if dropped:
-            self.dirty = True
         return dropped
 
     def expire_runs(self, ttl_days: int, now: datetime | None = None, *,
@@ -217,8 +212,6 @@ class State:
             if (moment - newest).total_seconds() > ttl_days * 86400 or not record:
                 del self.runs[section]
                 dropped.append(section)
-        if dropped:
-            self.dirty = True
         return dropped
 
     def to_json(self) -> dict[str, Any]:
@@ -234,10 +227,11 @@ class State:
         return json.dumps(self.to_json(), indent=2) + "\n"
 
     def save(self, reach: int | None = None) -> None:
-        """Write the file atomically; see the module docstring. Clears ``dirty``. With
-        ``reach``, the write must also have room for a file that long (issue #70)."""
+        """Write the file atomically; see the module docstring -- always, whether or not
+        anything changed (the opening save of issue #30 writes the state as loaded, so a
+        changed-flag could never gate a write). With ``reach``, the
+        write must also have room for a file that long (issue #70)."""
         write_atomically(self.path, self.render(), reach=reach)
-        self.dirty = False
 
 
 def load_state(path: str) -> State:

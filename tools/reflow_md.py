@@ -1,8 +1,9 @@
-"""Reflow markdown prose to a target terminal width, and prove the reflow changed nothing. #206.
+"""Reflow markdown prose to a target terminal width, and prove the reflow changed nothing.
 
-This started as a throwaway for #198 and is now in the tree because it has been needed three times
-(#198, #206, #207). Its own #198 docstring argued that a reflow runs about once, so a general tool
-would be a mechanism nobody exercises. That argument expired.
+From the source project, where it started as a throwaway and was needed three times before it was
+kept: its own first docstring argued that a reflow runs about once, so a general tool would be a
+mechanism nobody exercises. That argument expired. Here it is the gate's `markdown width` stage
+(`--check`) and the tool `/ship` reflows a new changelog block with.
 
 NEVER REWRAPPED, and each for a different reason:
   * fenced code blocks -- wrapping a command breaks copy-paste of things the owner runs on the box
@@ -19,8 +20,8 @@ THREE CHECKS, and each exists because the one before it cannot see what it catch
   CHECK 3  the STRUCTURE: the set of quote depths per paragraph. Owns the one case the other two
            cannot express, which is the reason this file is in the tree.
 
-WARNING: WHY BLOCKQUOTES NEEDED A CHECK OF THEIR OWN. Run without blockquote handling over
-`.claude/skills/list/SKILL.md`, the #198 version of this tool turned an eight-line quote into one
+WARNING: WHY BLOCKQUOTES NEEDED A CHECK OF THEIR OWN. Run without blockquote handling over a
+skill document, the first version of this tool turned an eight-line quote into one
 quoted line followed by seven lines of prose with the old `>` characters sitting mid-sentence, and
 reported OK. Its CHECK 1 compared RAW lines, so it asked whether the same tokens appeared in the
 same order -- and `>` is a token, still present, in the wrong place, meaning something else.
@@ -32,11 +33,13 @@ marker-inclusive CHECK 1 fails on this tool's own correct output. Measured, by w
 way first. Stripping happens to close the stranded-marker half of the blockquote problem as a side
 effect -- but a marker cleanly LOST leaves the words identical, and only CHECK 3 sees that.
 
-WARNING: WIDTH IS COUNTED IN TERMINAL COLUMNS, NOT CHARACTERS. This project's prose is emoji-dense
-and `U+2B50` is East Asian Wide -- `len()` says 1 and the terminal spends 2. Wrapping on `len()`
-puts a star-bearing line at 81 columns in the terminal it was wrapped for.
+WARNING: WIDTH IS COUNTED IN TERMINAL COLUMNS, NOT CHARACTERS. The changelog carries emoji markers
+by doctrine (its About section: the star, the siren, the warning sign, the diamond) and `U+2B50`
+is East Asian Wide -- `len()` says 1 and the terminal spends 2. Wrapping on `len()` puts a
+star-bearing line at 81 columns in the terminal it was wrapped for.
 
-NOTE: comments here stay ASCII. See CLAUDE.md on bandit and cp1252.
+NOTE: this file stays ASCII (the gate's `ascii` stage; a cp1252 console cannot print what it
+would otherwise report). See CLAUDE.md's code register.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ from __future__ import annotations
 import re
 import sys
 import unicodedata
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 WIDTH = 80
@@ -53,11 +57,10 @@ _HEADING = re.compile(r"^#{1,6}(?:\s|$)")
 _LIST = re.compile(r"^(\s*)([-*+]\s+|\d+[.)]\s+)(.*)$")
 _QUOTE = re.compile(r"^(\s*(?:>\s?)+)(.*)$")
 
-# U+FE0F, the emoji variation selector, written as an ESCAPE SEQUENCE so this file stays ASCII
-# while the value is unchanged -- Python resolves it at parse time, and CLAUDE.md requires
-# deliberate non-ASCII data to be spelled this way because bandit dies with UnicodeEncodeError
-# when it prints a finding whose code context is not ASCII.
-_VS16 = "\ufe0f"
+# U+FE0F, the emoji variation selector, built from its code point so this file stays ASCII (the
+# `ascii` stage refuses the character itself: a tool printing a finding around it would die on a
+# cp1252 console; CLAUDE.md's code register asks for chr() over a backslash-u escape).
+_VS16 = chr(0xFE0F)
 
 
 def columns(text: str) -> int:
@@ -76,13 +79,28 @@ def columns(text: str) -> int:
     return total
 
 
+def _fenced(lines: Iterable[str]) -> Iterator[tuple[str, bool]]:
+    """Each line with whether it is a fence or sits inside one: the lines nothing here may
+    rewrap, count as wide or compare loosely. THE one fence walk -- four copies of
+    `fenced = not fenced` once agreed with each other by construction (a quoted fence,
+    `> ` and the backticks, toggles none of them: `_FENCE` wants the fence at the line's
+    start), and one copy cannot drift from itself."""
+    in_fence = False
+    for line in lines:
+        if _FENCE.match(line):
+            in_fence = not in_fence
+            yield line, True
+            continue
+        yield line, in_fence
+
+
 def _is_table(line: str) -> bool:
     """A real table row opens AND closes with a pipe.
 
-    `startswith("|")` alone is wrong and CHECK 2 caught it: this repo's prose wraps
-    `HMAC(install_secret, event_id || question_id)` such that a continuation line begins `||`.
-    Treating that as a table row desynchronised the fence tracker, which is damage the paragraph
-    check cannot see because every word still survives.
+    `startswith("|")` alone is wrong and CHECK 2 caught it: the source project's prose wrapped an
+    expression with `||` in it such that a continuation line began `||`. Treating that as a table
+    row desynchronised the fence tracker, which is damage the paragraph check cannot see because
+    every word still survives.
     """
     stripped = line.strip()
     return stripped.startswith("|") and stripped.endswith("|") and len(stripped) > 1
@@ -91,8 +109,8 @@ def _is_table(line: str) -> bool:
 def _is_heading(line: str) -> bool:
     """A heading is one to six hashes followed by WHITESPACE.
 
-    `startswith("#")` alone is wrong, and it left a 100-column line unwrapped: this project cites
-    issues as `#184`, so `#184's stated rule (...)` opened a paragraph and was emitted verbatim as
+    `startswith("#")` alone is wrong, and it left a 100-column line unwrapped: issues are cited as
+    `#184`, so `#184's stated rule (...)` opened a paragraph and was emitted verbatim as
     though it were a heading. Neither CHECK 1 nor CHECK 2 sees this -- both still pass, because no
     word changed and no table moved. It was found by reading what remained over the target width,
     which is the only reason `main` prints that number rather than trusting the checks alone.
@@ -125,7 +143,6 @@ def _wrap(prefix: str, hang: str, text: str, width: int = WIDTH) -> list[str]:
 def _reflow_block(lines: list[str], width: int) -> list[str]:
     """Reflow one block of markdown that carries no blockquote prefix of its own."""
     out: list[str] = []
-    fenced = False
     pending: tuple[str, str, list[str]] | None = None
 
     def flush() -> None:
@@ -135,14 +152,9 @@ def _reflow_block(lines: list[str], width: int) -> list[str]:
             out.extend(_wrap(prefix, hang, " ".join(words), width))
             pending = None
 
-    for line in lines:
+    for line, in_fence in _fenced(lines):
         stripped = line.strip()
-        if _FENCE.match(line):
-            flush()
-            fenced = not fenced
-            out.append(line)
-            continue
-        if fenced or _is_table(line) or _is_heading(line):
+        if in_fence or _is_table(line) or _is_heading(line):
             flush()
             out.append(line)
             continue
@@ -187,7 +199,6 @@ def reflow(source: str) -> str:
     plain: list[str] = []
     quoted: list[str] = []
     prefix = ""
-    fenced = False
 
     def flush_plain() -> None:
         if plain:
@@ -202,10 +213,8 @@ def reflow(source: str) -> str:
             quoted.clear()
             prefix = ""
 
-    for line in source.splitlines():
-        if _FENCE.match(line) and not _quote_prefix(line):
-            fenced = not fenced
-        here = "" if fenced else _quote_prefix(line)
+    for line, in_fence in _fenced(source.splitlines()):
+        here = "" if in_fence else _quote_prefix(line)
         if here:
             if here != prefix:
                 flush_quote()
@@ -259,16 +268,8 @@ def paragraphs(text: str) -> list[str]:
 
 def protected(text: str) -> list[str]:
     """CHECK 2: every table row and fenced-block line, in order, verbatim."""
-    out: list[str] = []
-    fenced = False
-    for line in text.splitlines():
-        if _FENCE.match(line):
-            fenced = not fenced
-            out.append(line)
-            continue
-        if fenced or _is_table(line):
-            out.append(line)
-    return out
+    return [line for line, in_fence in _fenced(text.splitlines())
+            if in_fence or _is_table(line)]
 
 
 def quote_shape(text: str) -> list[tuple[int, ...]]:
@@ -277,8 +278,8 @@ def quote_shape(text: str) -> list[tuple[int, ...]]:
     THE CASE THIS EXISTS FOR, and the only one neither check above can express: a continuation
     line that cleanly LOSES its `> `. The words are then byte-identical after CHECK 1 strips the
     markers, and no table or fence moved, so CHECK 1 and CHECK 2 both pass -- while the document
-    renders as one quoted line followed by unquoted prose. Measured on `.claude/skills/list/`:
-    eight quoted lines became one.
+    renders as one quoted line followed by unquoted prose. Measured on a skill document: eight
+    quoted lines became one.
 
     Deliberately depths ONLY, with the words left to CHECK 1. Two checks that both compare the
     text would fail together and say nothing about which property broke; this way the failure
@@ -334,29 +335,23 @@ def _wide_lines(text: str) -> list[tuple[int, int]]:
     permanently red on correct files -- and the only way to quiet that is an exemption list, which
     grows until it means nothing.
     """
-    hits: list[tuple[int, int]] = []
-    fenced = False
-    for number, line in enumerate(text.splitlines(), 1):
-        if _FENCE.match(line):
-            fenced = not fenced
-            continue
-        if fenced or _is_table(line) or _is_heading(line):
-            continue
-        if columns(line) > WIDTH:
-            hits.append((number, columns(line)))
-    return hits
+    return [
+        (number, columns(line))
+        for number, (line, in_fence) in enumerate(_fenced(text.splitlines()), 1)
+        if not (in_fence or _is_table(line) or _is_heading(line)) and columns(line) > WIDTH
+    ]
 
 
 def overwide(text: str) -> list[tuple[int, int]]:
-    """Over-width lines that REFLOWING WOULD FIX. The gate stage's rule (#207).
+    """Over-width lines that REFLOWING WOULD FIX. The gate stage's rule.
 
     WARNING: THIS ASKS THE REWRITER RATHER THAN RE-DERIVING ITS RULES, and the first two drafts did
     the latter and were both wrong in the same direction -- reporting "wrappable" on lines the
     rewriter had already done everything it could with:
 
-      * a blockquote: an 85-column pytest node id in `docs/O2-APP-ATTEST.md` is 87 with its `> `,
-        and comparing against the bare body missed the prefix.
-      * a list item: a long markdown link in `CLAUDE.md` is 86 alone and 88 behind its `- `.
+      * a blockquote: an 85-column pytest node id in one of the source project's documents is 87
+        with its `> `, and comparing against the bare body missed the prefix.
+      * a list item: a long markdown link is 86 alone and 88 behind its `- `.
 
     Both are the same defect -- a second copy of the prefix rules, disagreeing with the first. A
     check that contradicts the tool it fronts is worse than no check: it is a standing red nobody
@@ -377,14 +372,14 @@ def overwide(text: str) -> list[tuple[int, int]]:
 _FLOOR = 1
 
 # Files this stage deliberately does NOT police, by repo-relative POSIX path. Empty until a
-# reason exists: the precedent was a contract document hashed by a lock, where reflowing it
-# would have been a spurious contract change. Whatever goes here is printed as NOT POLICED on
-# every run -- a silent exclusion reads as coverage.
+# reason exists: the source project's precedent was a contract document whose hash was pinned,
+# where reflowing it would have been a spurious contract change. Whatever goes here is printed
+# as NOT POLICED on every run -- a silent exclusion reads as coverage.
 _NOT_POLICED: tuple[str, ...] = ()
 
 
 def _check_widths(paths: list[Path]) -> int:
-    """The gate stage (#207): refuse markdown that has drifted wide again.
+    """The gate stage: refuse markdown that has drifted wide again.
 
     WARNING: THE FLOOR IS NOT DECORATION. A stage handed a bad glob reads nothing and reports a
     clean sweep with total confidence -- every tree-walking check needs the same guard. The kit
@@ -403,7 +398,7 @@ def _check_widths(paths: list[Path]) -> int:
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            # WARNING: this used to be a bare `continue` (#303). The count stayed honest, because
+            # WARNING: this used to be a bare `continue`. The count stayed honest, because
             # `scanned` is incremented below rather than above -- but the DROP was silent, and the
             # rule against that is stated eleven lines down for the deliberate exclusion. The
             # deliberate hole was announced and the accidental one was not, in this same function.

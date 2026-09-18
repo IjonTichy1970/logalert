@@ -59,7 +59,10 @@ line-length = 100
 extend-exclude = [".claude", ".venv"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "PLW1510", "S"]
+# RUF100 (an unused `# noqa`) and RUF102 (a code ruff does not know): a stale suppression is
+# one nobody can account for, and a planted `# noqa: XYZ999` passed the gate in silence
+# before they were selected (issue #48)
+select = ["E", "F", "W", "I", "B", "UP", "PLW1510", "S", "RUF100", "RUF102"]
 ignore = ["S603", "S607"]  # subprocess with a fixed argv and a resolved executable is the point
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]  # asserts are what tests are made of

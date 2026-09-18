@@ -40,7 +40,7 @@ def cursor(offset: int = 10, *, seen: datetime = NOW, fp: str | None = "ab" * 32
 
 def test_missing_file_is_an_empty_first_run_state(tmp_path: Path) -> None:
     state = load_state(str(tmp_path / "state.json"))
-    assert state.entries == {} and state.dirty is False
+    assert state.entries == {}
     assert state.get("router-disk", "/var/log/router.log") is None
     assert not (tmp_path / "state.json").exists()  # loading never creates it
 
@@ -50,9 +50,7 @@ def test_round_trip_and_the_on_disk_shape(tmp_path: Path) -> None:
     state = State(path)
     state.set("router-disk", "/var/log/router.log", cursor(10))
     state.set("firewall", "/var/log/router.log", cursor(20, fp=None))
-    assert state.dirty
     state.save()
-    assert state.dirty is False
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     assert data["version"] == STATE_VERSION
     entry = data["entries"]["router-disk"]["/var/log/router.log"]
@@ -79,9 +77,7 @@ def test_touch_refreshes_last_seen_without_moving_the_cursor(tmp_path: Path) -> 
     state = State(str(tmp_path / "state.json"))
     old = NOW - timedelta(days=40)
     state.set("a", "/var/log/x.log", cursor(10, seen=old))
-    state.dirty = False
     state.touch("a", "/var/log/x.log", NOW)
-    assert state.dirty
     got = state.get("a", "/var/log/x.log")
     assert got is not None and got.offset == 10 and got.last_seen == timestamp(NOW)
     state.touch("a", "/var/log/absent.log", NOW)  # no entry: no entry is invented
@@ -93,12 +89,9 @@ def test_expire_drops_only_entries_older_than_the_ttl(tmp_path: Path) -> None:
     state.set("a", "/old", cursor(seen=NOW - timedelta(days=31)))
     state.set("a", "/edge", cursor(seen=NOW - timedelta(days=30)))
     state.set("b", "/new", cursor(seen=NOW - timedelta(hours=1)))
-    state.dirty = False
     assert state.expire(30, NOW) == [("a", "/old")]
     assert sorted(state.entries) == [("a", "/edge"), ("b", "/new")]
-    assert state.dirty
-    state.dirty = False
-    assert state.expire(30, NOW) == [] and state.dirty is False
+    assert state.expire(30, NOW) == []
 
 
 def test_forget_one_file_or_everything(tmp_path: Path) -> None:
@@ -320,7 +313,7 @@ def test_save_goes_through_the_atomic_writer(
     state.set("a", "/x", cursor())
     with pytest.raises(StateError, match=r"cannot write \(No space left on device\)"):
         state.save()
-    assert path.read_bytes() == before and state.dirty
+    assert path.read_bytes() == before
     assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
 
 
@@ -479,7 +472,6 @@ def test_run_records_round_trip_and_an_older_file_has_none(tmp_path: Path) -> No
     state = State(path)
     state.set("web", "/var/log/web/a.log", cursor())
     state.record_run("web", (GLOB, "/var/log/other.log"), {GLOB}, NOW)
-    assert state.dirty
     state.save()
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     assert data["runs"] == {"web": {GLOB: "2026-09-14T12:00:00Z"}}  # listed paths: no moment
@@ -512,8 +504,7 @@ def test_forget_drops_the_records_of_the_sections_that_lost_an_entry(tmp_path: P
         state.record_run(section, (GLOB,), {GLOB}, NOW)
     state.record_run("empty", (GLOB,), {GLOB}, NOW)  # a record without entries
     assert state.forget("/x") == 2 and sorted(state.runs) == ["c", "empty"]
-    state.dirty = False
-    assert state.forget() == 1 and state.runs == {} and state.entries == {} and state.dirty
+    assert state.forget() == 1 and state.runs == {} and state.entries == {}
 
 
 def test_run_records_of_unconfigured_sections_expire_configured_ones_never(
@@ -524,11 +515,9 @@ def test_run_records_of_unconfigured_sections_expire_configured_ones_never(
     state.record_run("edge", (GLOB,), {GLOB}, NOW - timedelta(days=30))
     state.record_run("kept", (GLOB,), {GLOB}, NOW - timedelta(days=400))
     state.record_run("empty", (GLOB,), set(), NOW)  # never looked into: nothing to keep
-    state.dirty = False
     assert state.expire_runs(30, NOW, configured=["kept"]) == ["old", "empty"]
-    assert sorted(state.runs) == ["edge", "kept"] and state.dirty
-    state.dirty = False
-    assert state.expire_runs(30, NOW, configured=["kept"]) == [] and not state.dirty
+    assert sorted(state.runs) == ["edge", "kept"]
+    assert state.expire_runs(30, NOW, configured=["kept"]) == []
 
 
 @pytest.mark.parametrize(

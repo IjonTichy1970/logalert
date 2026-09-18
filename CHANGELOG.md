@@ -188,7 +188,7 @@ its notes.
   reaches that size plus a block proves the room** (#70). The #30 refusal left
   a band -- room for the positions as they were, none for what a run adds --
   where the same lines went out on every run; now they go out once more, when
-  the room is back. `cat` of the lock shows `unsaved <bytes>`.
+  the room is back. `cat` of the lock shows `unsaved <bytes> <state file>`.
 
 - `[contract]` **A file truncated and refilled past the saved position with
   the same first line is caught as a truncation, not read on from the stale
@@ -236,6 +236,69 @@ its notes.
   `python` exited 127 and Claude Code let every command through, announced but
   inert, with the guard's gate stage green. Three checks now run the string
   itself: the venv off PATH, a `python3`-only PATH, an empty one.
+
+- `[internal]` **The gate refuses a stale or unknown `# noqa` (RUF100, RUF102),
+  and the two ported tools tell this repository's story** (#48). Eight
+  directives suppressed nothing (`S603` is ignored tree-wide) and a planted
+  `# noqa: XYZ999` passed in silence; the docstrings cited another project's
+  issues, commits and files. `reflow_md.py`'s four fence walks are one
+  generator, byte-identical over every document in the tree.
+
+- `[internal]` **The workflows use `checkout@v7` and `setup-python@v7`, and the
+  gate prints its tools' versions once at the top** (#52). The v4 and v5
+  majors declare Node 20, which every job was annotated as forced onto Node
+  24; nothing in the newer majors' notes reaches these workflows. The extras
+  let ruff, mypy, pytest and markdown float, so a drift that reddens an
+  unchanged tree is now diagnosable from one line of the log.
+
+- `[internal]` **The Pages build runs the document pins and the markdown width
+  check on every PR, so a docs-only PR is no longer unchecked** (#45).
+  `ci.yml`'s `paths-ignore` keeps its cycle; the 51 pure-text tests over
+  `USAGE.md`, `INSTALL.md`, `README.md` and the real changelog need only
+  `pytest` and the `docs` extra, and run there in seconds. Everything else
+  stays could-not-check for such a PR, as documented.
+
+- `[internal]` **The Linux stage skips, named, when it is not root and has no
+  passwordless sudo, before it builds anything** (#59). Measured as an
+  ordinary user: the wheel built and nine checks FAILED naming mail, the
+  state, the rotation and the documented unit, for faults no non-root caller
+  can avoid. The native path also finds `runuser` and `logrotate` under a PATH
+  without `/usr/sbin`, and the header is this stage's, not the template's.
+
+- `[contract]` **A glob's new file that could not be opened this run keeps the
+  glob's moment, so it is read whole once it can be** (#69). The record moved
+  past a file a permission kept shut, and the next run first-sighted it at its
+  end -- everything written before the fix never mailed. The outage rule now
+  covers a permission; a glob with no moment yet takes the run's all the same,
+  so one file that never opens cannot switch the new-file rule off.
+
+- `[internal]` **The four values that lived twice live once, `State.dirty` is
+  gone, and the test-only file opener left the package** (#49). The exit
+  codes, the `Transport` literal, the lock path and the compression suffixes
+  are imported where they were copied (a fifth suffix would have split the
+  last pair); `dirty` was set in seven places and read in none; `open_log_file`
+  was a door around the rotation catch-up that only the tests used.
+
+- `[internal]` **The release artifacts are built on Linux at the tag, and a
+  check refuses a pair with a world-writable member, CRLF metadata or a
+  missing file before it is attached** (#56). Built on the Windows host, the
+  sdist's members were 0666 and root's `tar xzf` left a world-writable tree
+  (35 of 36 entries, measured); `release.yml` builds, runs
+  `tools/check_artifacts.py` and attaches the pair to the release.
+
+- `[contract]` **The full-disk marker in the lock file is keyed to the state
+  file: `unsaved <bytes> <state file>`, one per configuration sharing the
+  directory** (#73). The lock is the directory's, so configuration B's run
+  read A's marker as its own: refused with A's message, proved the room
+  against A's size and cleared A's marker. Each run now honours, sets and
+  clears only its own and carries the others along; `--reset-state` likewise.
+
+- `[contract]` **The rotation catch-up compares the anchor: a copy with other
+  bytes before the position is never the file, whatever its stamp or inode,
+  and a parked entry records the copy's anchor** (#74). An older copy sharing
+  a banner log's first line, longer than the position, was taken as a guess
+  at every restart that truncated the log -- 166 old lines and a fragment
+  mailed before the new file. A cursor without an anchor is trusted as before.
 
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 

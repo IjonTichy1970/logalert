@@ -3,9 +3,12 @@ name: Pages
 # The changelog site: CHANGELOG.md rendered by tools/render_changelog.py to site/index.html and
 # published with GitHub Pages (Settings -> Pages -> Source = "GitHub Actions"). The `build` job
 # ALWAYS runs -- no paths filter: every batch PR touches CHANGELOG.md, and a docs-only PR (which
-# ci.yml skips) then still carries one check, the renderer's structural gate (an untagged entry,
-# a second "### Nitty Gritty", a malformed version heading each fail it). `deploy` runs only for
-# a push to main.
+# ci.yml skips) then still carries the checks that read the documents: the renderer's structural
+# gate (an untagged entry, a second "### Nitty Gritty", a malformed version heading each fail
+# it), the document pins (issue #45: the example config byte-for-byte, the unit block, the cron
+# line, the links, the real changelog) and the markdown width. The gate proper stays ci.yml's:
+# for everything else a docs-only PR is could-not-check, not green. `deploy` runs only for a
+# push to main.
 on:
   push:
     branches: ["main"]
@@ -18,13 +21,19 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: |
           python -m pip install --upgrade pip
           pip install -e ".[docs]"
+      # The three test files that pin the documents are pure text and need only the package,
+      # pytest and the docs extra (markdown, for the two render tests over the real changelog);
+      # the width check is the gate's `markdown width` stage, the same call.
+      - run: pip install pytest
+      - run: python -m pytest -q -p no:cacheprovider tests/test_usage_doc.py tests/test_install_doc.py tests/test_render_changelog.py
+      - run: python tools/reflow_md.py --check $(git ls-files '*.md')
       # The renderer exits 1 on a structural defect and 2 when it could not read the file;
       # both fail the job. The same parse runs in the gate (`changelog structure` stage).
       - run: python tools/render_changelog.py

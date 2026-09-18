@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import SECTION, texts, try_symlink
+from conftest import SECTION, open_log_file, texts, try_symlink
 
 from logalert.cursor import (
     ANCHOR_CAP,
@@ -34,9 +34,9 @@ from logalert.cursor import (
     fingerprint,
     identify,
     open_log,
-    open_log_file,
     tail_of,
 )
+from logalert.rotation import open_source
 from logalert.state import Cursor, State, load_state, timestamp
 
 E_ACUTE = chr(0xE9).encode("utf-8")  # spelled from the code point for the ASCII gate
@@ -397,8 +397,9 @@ def test_device_change_alone_continues_with_one_log_line(
 def test_missing_file_is_none_and_logged_at_debug(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """The run's door (``open_source``) says so at DEBUG; the test seam says nothing."""
     caplog.set_level(logging.DEBUG, logger="logalert")
-    assert open_log_file(SECTION, str(tmp_path / "gone.log"), None) is None
+    assert open_source(SECTION, str(tmp_path / "gone.log"), None) is None
     record = caplog.records[-1]
     assert record.levelno == logging.DEBUG
     assert record.getMessage() == f"[{SECTION}] {tmp_path / 'gone.log'}: absent this run"

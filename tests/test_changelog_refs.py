@@ -1,4 +1,4 @@
-"""Guards over `tools/check_changelog_refs.py` (#177).
+"""Guards over `tools/check_changelog_refs.py`.
 
 WARNING: the load-bearing case is `test_a_MERGE_commit_ref_is_not_treated_as_an_issue`. Every other
 test here passes on a version that scans all commits including merges -- and that version is
@@ -35,7 +35,7 @@ def _repo(
     the machine's git configuration.
     """
     def run(*args: str) -> None:
-        subprocess.run(  # noqa: S603  # nosec - fixed argv, no shell
+        subprocess.run(  # nosec - fixed argv, no shell
             [GIT, "-C", str(root), *args],
             check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
@@ -63,7 +63,7 @@ def _repo(
 
 
 def _run(root: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603  # nosec - our interpreter, our script
+    return subprocess.run(  # nosec - our interpreter, our script
         [sys.executable, str(root / "tools" / "check_changelog_refs.py")],
         capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
     )
@@ -153,7 +153,7 @@ def test_a_MERGE_commit_ref_is_not_treated_as_an_issue(tmp_path: Path) -> None:
     root = _repo(tmp_path / "r", "# Changelog\n\n- nothing\n", [], release="Release 0.1.0 -- x")
 
     def run(*args: str) -> None:
-        subprocess.run(  # noqa: S603  # nosec - fixed argv, no shell
+        subprocess.run(  # nosec - fixed argv, no shell
             [GIT, "-C", str(root), *args], check=True, capture_output=True,
                        text=True, encoding="utf-8", errors="replace")
 
@@ -197,7 +197,7 @@ def test_a_BODY_reference_is_not_demanded(tmp_path: Path) -> None:
     root = _repo(tmp_path / "r", "# Changelog\n\n- nothing\n", [])
 
     def run(*args: str) -> None:
-        subprocess.run(  # noqa: S603  # nosec - fixed argv, no shell
+        subprocess.run(  # nosec - fixed argv, no shell
             [GIT, "-C", str(root), *args], check=True, capture_output=True,
                        text=True, encoding="utf-8", errors="replace")
 
@@ -209,12 +209,14 @@ def test_a_BODY_reference_is_not_demanded(tmp_path: Path) -> None:
 
 
 def test_a_SHALLOW_clone_is_COULD_NOT_CHECK_not_a_skip(tmp_path: Path) -> None:
-    """#302. THE DEFECT THIS STAGE SHIPPED WITH, and it was live in CI from the day it was added.
+    """THE DEFECT THIS STAGE SHIPPED WITH in the source project, live in its CI from the day it was
+    added.
 
-    `.github/workflows/ci.yml` had no `fetch-depth`, so `actions/checkout` made a ONE-COMMIT clone.
+    The source project's `ci.yml` had no `fetch-depth`, so `actions/checkout` made a ONE-COMMIT
+    clone (this repo's sets `fetch-depth: 0`).
     `baseline()` then found no `Release x.y.z` subject -- correctly, there was only one commit --
     and reported `skipped: no Release x.y.z commit in the last 500`, exit 0. Confirmed against the
-    real CI log for run 33931929159 before this was written.
+    source project's real CI log before this was written.
 
     WARNING: THE MUTATION IS THE CLONE, NOT A CODE EDIT. A test on a full clone passes under the old
     code and the new one alike, because the old code was correct whenever the history was actually
@@ -222,12 +224,12 @@ def test_a_SHALLOW_clone_is_COULD_NOT_CHECK_not_a_skip(tmp_path: Path) -> None:
     thing and makes one.
 
     WARNING: assert on the EXIT CODE. Both the old and the new code can print the word "skipped"
-    somewhere, so asserting on the message does not discriminate -- the same lesson #301 recorded
-    about a check that only read stdout.
+    somewhere, so asserting on the message does not discriminate -- the same lesson the source
+    project recorded about a check that only read stdout.
     """
     source = _repo(tmp_path / "origin", "# Changelog\n\n- #7\n", ["work (#7)"])
     shallow = tmp_path / "shallow"
-    subprocess.run(  # noqa: S603  # nosec - fixed argv, no shell
+    subprocess.run(  # nosec - fixed argv, no shell
         [GIT, "clone", "-q", "--depth", "1", source.as_uri(), str(shallow)],
         check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
@@ -246,11 +248,11 @@ def test_a_FULL_clone_of_the_same_repo_still_checks(tmp_path: Path) -> None:
     """Detection leg for the test above, and it is load-bearing rather than decorative.
 
     Without it, "exits 2" is equally satisfied by a tool that has simply stopped working -- and the
-    fix for #302 is one `git rev-parse` away from refusing every run.
+    shallow-clone fix is one `git rev-parse` away from refusing every run.
     """
     source = _repo(tmp_path / "origin", "# Changelog\n\n- #7\n", ["work (#7)"])
     full = tmp_path / "full"
-    subprocess.run(  # noqa: S603  # nosec - fixed argv, no shell
+    subprocess.run(  # nosec - fixed argv, no shell
         [GIT, "clone", "-q", source.as_uri(), str(full)],
         check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
@@ -267,7 +269,8 @@ def test_a_FULL_search_window_is_COULD_NOT_CHECK_not_a_skip(tmp_path: Path) -> N
     """The fourth cause, and the subtlest: the release commit exists but sits beyond `_LOG_LIMIT`.
 
     A full window means the search was TRUNCATED, not that the history was exhausted -- the same
-    conflation the shallow case makes, one layer along. Before #302 this reported a skip.
+    conflation the shallow case makes, one layer along. The source project's first version
+    reported a skip.
 
     WARNING: the limit is shrunk IN THE FIXTURE'S COPY of the tool, not in the tool. The fixture
     already copies the file, so this is a fixture technique rather than a production seam added for
@@ -296,7 +299,8 @@ def test_a_GIT_FAILURE_is_COULD_NOT_CHECK_not_a_skip(tmp_path: Path) -> None:
     """The third cause that used to collapse into EXIT_OK: `_git` returning `(False, ...)`.
 
     A directory that is not a git repository at all stands in for "git could not answer" -- no
-    `.git`, so `rev-parse` exits non-zero. Before #302 this printed a skip and exited 0.
+    `.git`, so `rev-parse` exits non-zero. The source project's first version printed a skip and
+    exited 0.
     """
     root = tmp_path / "not-a-repo"
     (root / "tools").mkdir(parents=True)

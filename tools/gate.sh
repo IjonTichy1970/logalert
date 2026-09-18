@@ -33,6 +33,13 @@ export PYTHONDONTWRITEBYTECODE=1
 # CDPATH in the caller's environment cannot silently send us to a different directory.
 cd -- "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)" || exit 1
 
+# The tools' versions, once, before the first stage: the extras let them float (`ruff>=0.5`,
+# `mypy>=1.10`, `pytest>=8`, `markdown>=3.5`), so a tool release can redden an unchanged tree once
+# or twice a year, and this line is what makes that diagnosable from the log (issue #52). A
+# distributions() scan rather than four version() calls: a missing extra reads MISSING here
+# instead of failing three stages further down without a name.
+python -c 'import sys, importlib.metadata as m; have = {str(d.metadata.get("Name", "")).lower(): str(d.version) for d in m.distributions()}; print("tools: python %d.%d.%d, " % sys.version_info[:3] + ", ".join(n + " " + have.get(n, "MISSING") for n in ("ruff", "mypy", "pytest", "markdown")))'
+
 FAILED=""
 SKIPPED=""
 stage() {
@@ -70,8 +77,10 @@ skip_stage() {
 
 # ruff prints `warning: Invalid # noqa directive ...` for a malformed suppression and still
 # EXITS 0 (measured) -- and prints nothing at all for a blanket `# noqa <prose>` unless RUF100
-# is selected. A warning is not a pass. `--no-cache` is deliberate: a cached run does not re-emit
-# the warning, and a guard that only fires on a cold cache is not a guard.
+# is selected, which pyproject.toml does (with RUF102 for a code ruff does not know: a planted
+# `# noqa: XYZ999` passed here before, issue #48). A warning is not a pass. `--no-cache` is
+# deliberate: a cached run does not re-emit the warning, and a guard that only fires on a cold
+# cache is not a guard.
 ruff_strict() {
   local out rc
   out="$(python -m ruff check --no-cache . 2>&1)"; rc=$?

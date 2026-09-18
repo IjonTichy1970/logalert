@@ -45,6 +45,7 @@ from typing import Literal, cast
 
 from logalert.globs import Expansion, expand, is_glob
 from logalert.rotation import classify
+from logalert.state import lock_path
 
 if sys.platform != "win32":
     import pwd
@@ -315,7 +316,7 @@ def check_log_target(label: str, log: str, *, state_file: str, config_path: str)
     if not log.startswith("file:"):
         return
     target = log[len("file:"):]
-    lock = ospath.join(ospath.dirname(state_file), "lock")  # state.lock_path, sans import
+    lock = lock_path(state_file)
     for other, what in ((state_file, "the state file"), (lock, "the run lock"),
                         (config_path, "the config file")):
         if _same_path(target, other):

@@ -5,6 +5,7 @@ helpers -- each one rule, written once. pytest loads this module before any test
 rootdir import the tree has always used between test modules (no ``__init__.py``; pytest's
 default import mode puts ``tests/`` on ``sys.path``). Gated Python: ASCII, ruff, mypy strict."""
 
+import errno
 import json
 import os
 import subprocess
@@ -15,8 +16,9 @@ from typing import Any
 import pytest
 from fake_sendmail import install
 
+import logalert.cursor
 from logalert.__main__ import main
-from logalert.cursor import Line
+from logalert.cursor import Line, LogFile
 from logalert.rotation import open_source
 from logalert.state import Cursor
 
@@ -235,6 +237,18 @@ def texts(lines: list[Line]) -> list[str]:
     return [line.text for line in lines]
 
 
+def open_log_file(section: str, path: str, saved: Cursor | None, *,
+                  from_start: bool = False) -> LogFile | None:
+    """A ``LogFile`` for the path, or None when it is absent: a TEST seam over the reader
+    alone (issue #49: it lived in the package with no caller there). Never the run's
+    door -- ``open_source`` is, and it reads a rotated file's copies first, where a
+    ``LogFile`` opened here reads a rotated file from 0."""
+    try:
+        return LogFile(section, path, saved, from_start=from_start)
+    except FileNotFoundError:
+        return None
+
+
 def run(path: Path, saved: Cursor | None, *, archive_dir: Path | None = None,
         from_start: bool = False) -> tuple[object, list[str], Cursor | None]:
     """One run over the file: (the source, its lines, the cursor to save)."""
@@ -258,3 +272,16 @@ def seen(path: Path, content: bytes) -> Cursor:
 def append(path: Path, data: bytes) -> None:
     with open(path, "ab") as handle:
         handle.write(data)
+
+
+def refuse_open(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    """``open_log`` refuses one path with EACCES: the unreadable-file device on both platforms
+    (a ``0000`` mode is its POSIX twin, real in the sandbox and on CI)."""
+    real_open = logalert.cursor.open_log
+
+    def refuse(target: str, **kwargs: Any) -> Any:
+        if Path(target) == path:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), target)
+        return real_open(target, **kwargs)
+
+    monkeypatch.setattr(logalert.cursor, "open_log", refuse)
