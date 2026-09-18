@@ -223,6 +223,13 @@ its notes.
   FUSE and network mounts), and each was dropped without a word, the glob's
   moment moving on. The line is #38's: `cannot examine N of the M entries`.
 
+- `[contract]` **The documented systemd unit carries `TimeoutStartSec=3600`, and
+  the docs say which hardening lines break the mail path** (#36). A oneshot
+  has no start timeout of its own and the timer never starts an activating
+  unit: a wedged run silenced the schedule for good, and the two lock verdicts
+  are cron's. `NoNewPrivileges=` and its kin make a setgid `sendmail` keep the
+  caller's group (measured); the Linux stage verifies the documented text.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

@@ -42,6 +42,7 @@ def test_the_systemd_units_are_one_text_in_install_and_usage() -> None:
     assert install[0] == usage[0]
     assert "ExecStart=/usr/local/bin/logalert" in install[0]  # absolute, the symlink
     assert "Type=oneshot" in install[0] and "User=logalert" in install[0]
+    assert "TimeoutStartSec=3600" in install[0]  # issue #36: a wedged run ends, the timer resumes
 
 
 def test_the_cron_line_is_one_text_in_readme_install_and_usage() -> None:
@@ -226,3 +227,23 @@ def test_the_dev_venv_extras_are_spelled_alike_everywhere() -> None:
         assert found, f"{name} does not spell the editable install"
         seen[name] = found
     assert all(found == {".[dev,docs]"} for found in seen.values()), seen
+
+
+def test_install_says_what_the_timeout_is_for_and_which_hardening_breaks_the_mail_path() -> None:
+    """Issue #36: the paragraph after the unit names the timer's shape (no start timeout of
+    its own, the timer never starting an activating unit), the timeout's effect in the
+    program's and systemd's words, and the three hardening lines that break a setgid
+    sendmail -- measured, so the doc must keep saying so."""
+    text = _text("INSTALL.md")
+    after = text[text.index("TimeoutStartSec=3600"):text.index("### 8. Where the log is")]
+    joined = after.replace(NL, " ")
+    for shape in ("`TimeoutStartUSec=infinity`", "the timer never starts a unit that is still "
+                  "activating", "`Failed with result 'timeout'`", "`logalert: terminated`",
+                  "exit 143", "`NoNewPrivileges=yes`", "`SystemCallFilter=~@privileged`",
+                  "`DynamicUser=yes`", "`PrivateUsers=yes`",
+                  "`sendmail exit 75 (EX_TEMPFAIL): postdrop: ... Permission denied`",
+                  "`ProtectSystem=strict`", "`ReadWritePaths=`", "`StateDirectoryMode=0750`",
+                  "`state directory ... is not writable (Read-only file system)`",
+                  "`RestrictAddressFamilies=AF_UNIX`", "`StateDirectory=logalert`"):
+        assert shape in joined, shape
+    assert "measured with systemd 255" in joined and "not measured with a real MTA" in joined

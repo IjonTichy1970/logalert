@@ -149,7 +149,7 @@ The file's rules:
 | `smtp_port` | `25` | The relay's port. |
 | `smtp_starttls` | `no` | Ask for STARTTLS with the platform's default certificate verification; a relay that cannot is a delivery failure, never a silent downgrade. |
 | `mail_timeout` | `60` | Seconds to wait for the mail system. For sendmail the whole child; for SMTP each socket operation (a slow relay can hold a run for a few multiples of it and still succeed). At most 3600. |
-| `lock_stale` | `3600` | A run that finds another run holding the lock exits 0 quietly -- cron overlap is normal -- unless the holder is older than this many seconds, which is exit 1: `stale lock: another run (PID N) has held the lock <path> for Ns`. |
+| `lock_stale` | `3600` | A run that finds another run holding the lock exits 0 quietly -- cron overlap is normal -- unless the holder is older than this many seconds, which is exit 1: `stale lock: another run (PID N) has held the lock <path> for Ns`. Cron's: under the systemd timer the lock is never contended, and the unit's `TimeoutStartSec=` plays this role. |
 | `scan_timeout` | `300` | Seconds one file's scan may take before it is given up as a failed item naming the line and the pattern being tried (`scanning exceeded scan_timeout (300 s) at line N while trying regex '...'`); its position stays, the section's other files are processed. `0` turns the bound off. A scan that is legitimately long -- a first read of a multi-GB file on a slow machine -- needs a higher value, or `0` for that run; the message names the key. Enforced on Linux and the BSDs (an interval timer); on Windows `--check-config` says `not enforced on this platform`. |
 | `state_ttl` | `30` | Days after which the saved position of a file that has not been seen is forgotten (logged as `forgotten`). A file that is back after that is a first sight again. |
 | `subject_suffix` | `yes` | Append ` -- N match(es)` to every Subject, a literal a mail filter can key on. `no` for the bare subject. |
@@ -665,10 +665,20 @@ include `/usr/local/bin`, and the symlink is what carries the venv's interpreter
 run goes; a run that finds nothing prints nothing and cron sends nothing. A run
 that starts while the previous one is still delivering finds the lock held and
 exits 0 quietly, so a slow relay never produces a pile-up; a holder older than
-`lock_stale` is reported as exit 1 instead.
+`lock_stale` is reported as exit 1 instead. Both verdicts are cron's: under the
+timer nothing scheduled starts a run while the last one is alive (a run started
+by hand still meets the lock).
 
-**systemd timer.** The same as a oneshot service and a timer, with an absolute
-`ExecStart` and the service user:
+**systemd timer.** A oneshot service and a timer, with an absolute `ExecStart`,
+the service user, and a start timeout -- the timer never starts a unit that is
+still activating, so the lock is never contended under it and neither lock
+verdict can fire; a run that never ends holds the unit `activating` and the
+schedule silent until `TimeoutStartSec=` ends it with SIGTERM (`Failed with
+result 'timeout'` in `systemctl status logalert.service`, exit 143, the timer
+firing again at once). An hour, `lock_stale`'s role; it caps a legitimately long
+run too,
+and the next run re-sends the section in flight. [INSTALL.md](../INSTALL.md)
+says which hardening directives break the mail path:
 
 ```
 # /etc/systemd/system/logalert.service
@@ -679,6 +689,8 @@ Description=logalert run
 Type=oneshot
 User=logalert
 ExecStart=/usr/local/bin/logalert
+# a run that never ends would hold the unit activating and the timer waiting
+TimeoutStartSec=3600
 
 # /etc/systemd/system/logalert.timer
 [Unit]
@@ -875,8 +887,8 @@ configured destination still gets INFO and above.
 | `state file ...: cannot write (No space left on device) -- the last run sent mail it could not record; nothing is sent until the state can be saved` (exit 1), every run; `cat` of the `lock` file shows `unsaved <bytes>` after the holder's PID and start time | The disk had room for the positions as they were but not for what a run added (`state not saved` after a delivery in that run's log): the run marked the lock, and every run since finds too little room to save a state of that size plus a block | Free space (or raise the quota); the next run proves the room, re-sends what the marked run sent -- once per proven room -- and clears the mark. `--reset-state` with no path clears it with the positions |
 | `[section] /var/log/x.log: Permission denied` (exit 1) | The running user cannot read that file; the other files of the section were processed | Grant read access (a group, ACLs) or run as a user that has it |
 | `state file ... belongs to <user>; a run as root would leave it root-owned ...` -- or, before the first run, `state directory ... belongs to <user>; ...` (exit 1) | A root run against a cron user's state | Run as that user: `sudo -u <user> logalert ...` |
-| `stale lock: another run (PID N) has held the lock ... for Ns` (exit 1) | A run still alive and holding the lock for longer than `lock_stale` -- a stuck run, or one that genuinely takes that long. Not a leftover file: the lock is an OS lock, released the moment its holder exits or is killed; the last holder's line stays in the `lock` file by design and turns nobody away | Look at PID N (`ps -o pid,etime,cmd -p N`; `cat` the `lock` file beside the state file shows the holder's PID and start time, and `unsaved <bytes>` after a run that sent mail it could not record) and end it if it is stuck -- the lock is released with it; raise `lock_stale` if runs really take that long. If `ps` shows PID N is not logalert, the PID was reused: `fuser <lock>` as root names the holder. Do not remove the `lock` file while a run is alive: the next run would lock a fresh file and overlap it |
-| `stale lock: the recorded holder PID N is gone; another process holds the lock ... (fuser ... names it)` (exit 1) | The last run that wrote the file has exited (or PID N now belongs to another user's process, which cannot hold a `0600` lock), and something else holds the lock: a run stalled between taking the lock and writing its line, or another process that opened the file and locked it | `fuser <lock>` (or `lsof <lock>`), run as root -- as the running user it cannot see another user's process -- names the holder; end it if it should not be there. The lock is `0600` (one left `0644` by an earlier version is tightened by the next run that takes it), so only the running user and root can open it |
+| `stale lock: another run (PID N) has held the lock ... for Ns` (exit 1, under cron) | A run still alive and holding the lock for longer than `lock_stale` -- a stuck run, or one that genuinely takes that long. Not a leftover file: the lock is an OS lock, released the moment its holder exits or is killed; the last holder's line stays in the `lock` file by design and turns nobody away | Look at PID N (`ps -o pid,etime,cmd -p N`; `cat` the `lock` file beside the state file shows the holder's PID and start time, and `unsaved <bytes>` after a run that sent mail it could not record) and end it if it is stuck -- the lock is released with it; raise `lock_stale` if runs really take that long. If `ps` shows PID N is not logalert, the PID was reused: `fuser <lock>` as root names the holder. Do not remove the `lock` file while a run is alive: the next run would lock a fresh file and overlap it |
+| `stale lock: the recorded holder PID N is gone; another process holds the lock ... (fuser ... names it)` (exit 1, under cron) | The last run that wrote the file has exited (or PID N now belongs to another user's process, which cannot hold a `0600` lock), and something else holds the lock: a run stalled between taking the lock and writing its line, or another process that opened the file and locked it | `fuser <lock>` (or `lsof <lock>`), run as root -- as the running user it cannot see another user's process -- names the holder; end it if it should not be there. The lock is `0600` (one left `0644` by an earlier version is tightened by the next run that takes it), so only the running user and root can open it |
 | `warning: no usable syslog socket (...); logging to stderr` in cron's mail every run | No syslog daemon, or the socket is somewhere else | Start rsyslog / journald, or set `log = file:/var/log/logalert.log` with the file pre-created owned by the running user (`install -o logalert -g logalert -m 640 /dev/null /var/log/logalert.log`; `/var/log` is root's) |
 | `warning: the activity log at syslog (/dev/log) failed (TimeoutError: timed out); logging to stderr from here on` in cron's mail, followed by the run's records | The syslog socket is held open but nobody reads it (journald stopped or wedged while systemd's socket unit keeps `/dev/log`); the run waited 2 s twice and went on | `systemctl status systemd-journald` (or rsyslog) and restart it; the runs in between logged to stderr, which is that mail |
 | `warning: cannot open the activity log /var/log/logalert.log (Permission denied); logging to stderr` in cron's mail every run -- every record of a quiet run, four or five lines | `log = file:` names a file the service user cannot create (`/var/log` is root's), or a root run created it root-owned | Pre-create it owned by the service user; an existing one: `sudo chown logalert:logalert /var/log/logalert.log` |

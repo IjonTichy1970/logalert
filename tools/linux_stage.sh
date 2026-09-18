@@ -328,6 +328,11 @@ cleanup() {
   if [ -n "${NOFT_MOUNTED:-}" ]; then  # the no-d_type check's ext4 image (issue #71)
     bounded "$BOUND_CMD" umount "$T/noft" 2>/dev/null && NOFT_MOUNTED=""
   fi
+  if [ -n "${STAGE_UNITS:-}" ]; then  # the documented unit's copies (issue #36)
+    rm -f /run/systemd/system/logalert-stage.service /run/systemd/system/logalert-stage.timer
+    bounded "$BOUND_CMD" systemctl daemon-reload > /dev/null 2>&1
+    STAGE_UNITS=""
+  fi
   [ -n "${T:-}" ] && rm -rf "$T"
 }
 trap cleanup EXIT
@@ -981,6 +986,50 @@ EOF
       ok "no d_type: one failed item naming the unsearchable directory; with d_type: one per file; exit 1, no mail"
     fi
     bounded "$BOUND_CMD" umount "$T/noft" && NOFT_MOUNTED=""
+  fi
+
+  echo "-- the documented unit: the text INSTALL.md shows is a unit systemd accepts, with the timeout it claims (issue #36)"
+  # The fenced block INSTALL.md and USAGE.md share (pinned one text by the doc tests) is
+  # written under /run/systemd/system as logalert-stage.{service,timer} -- ExecStart pointed
+  # at this tree, the user as documented (verify checks the executable, not the user; the
+  # stage's `nobody` would draw its "special user" warning) -- and systemd-analyze verify is
+  # asked about it, its
+  # TEXT scoped to the units' names (its exit code cannot gate a unit); then the start
+  # timeout the doc claims must be what systemd reports (measured: without the line a
+  # oneshot has TimeoutStartUSec=infinity, and a wedged run held the unit activating and
+  # the timer waiting for good). Where systemd is not PID 1 the check is skipped.
+  if ! [ -d /run/systemd/system ] || ! bounded "$BOUND_CMD" systemctl show -p Version --value > /dev/null 2>&1; then
+    skip "systemd is not PID 1 here -- the documented unit cannot be verified"
+  elif ! command -v systemd-analyze > /dev/null 2>&1; then
+    skip "systemd-analyze is not on PATH -- the documented unit cannot be verified"
+  else
+    # the bare-fenced block whose first line names the service (a fence with an info
+    # string, ```bash, opens the other blocks: every ``` line toggles, only a bare one keeps)
+    awk '/^```/ { if (fence) { if (keep) { exit } ; fence = 0 } else { fence = 1; bare = ($0 == "```") } ; next } fence && bare && /^# \/etc\/systemd\/system\/logalert\.service$/ { keep = 1 } fence && keep { print }' "$REPO_ROOT/INSTALL.md" > "$T/units.txt"
+    awk '/^# \/etc\/systemd\/system\/logalert\.timer/ { part = 2 } part != 2 { print }' "$T/units.txt" \
+      | sed -e "s|^ExecStart=.*|ExecStart=$T/bin/logalert -f $T/logalert.conf|" \
+      > /run/systemd/system/logalert-stage.service
+    awk '/^# \/etc\/systemd\/system\/logalert\.timer/ { part = 2 } part == 2 { print }' "$T/units.txt" \
+      > /run/systemd/system/logalert-stage.timer
+    STAGE_UNITS=1
+    bounded "$BOUND_CMD" systemctl daemon-reload > /dev/null 2>&1
+    out="$(bounded "$BOUND_CMD" systemd-analyze verify /run/systemd/system/logalert-stage.service /run/systemd/system/logalert-stage.timer 2>&1 | tr -d '\r')"
+    timeout_now="$(bounded "$BOUND_CMD" systemctl show -p TimeoutStartUSec --value logalert-stage.service 2>/dev/null)"; rc=$?  # rc read before any pipe
+    timeout_now="$(printf '%s' "$timeout_now" | tr -d '\r')"
+    if [ "$rc" -eq 124 ]; then
+      skip "systemctl show did not answer within ${BOUND_CMD}s -- the documented unit's timeout was not read"
+    elif ! grep -q '^TimeoutStartSec=' /run/systemd/system/logalert-stage.service; then
+      fail "the documented unit carries no TimeoutStartSec= line" "unit-timeout"
+    elif printf '%s\n' "$out" | grep -q 'logalert-stage'; then
+      fail "systemd-analyze verify on the documented unit: $(printf '%s\n' "$out" | grep 'logalert-stage' | head -1)" "unit-verify"
+    elif [ "$timeout_now" != "1h" ]; then
+      fail "the documented unit's start timeout is '${timeout_now:-unknown}', not the hour the doc claims" "unit-timeout"
+    else
+      ok "the documented unit verifies clean and reports TimeoutStartUSec=1h"
+    fi
+    rm -f /run/systemd/system/logalert-stage.service /run/systemd/system/logalert-stage.timer
+    bounded "$BOUND_CMD" systemctl daemon-reload > /dev/null 2>&1
+    STAGE_UNITS=""
   fi
 }
 

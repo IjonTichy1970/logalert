@@ -243,3 +243,21 @@ def test_the_globs_section_and_the_table_carry_the_unsearchable_directory_line()
     source = (DOC.parents[1] / "logalert" / "globs.py").read_text(encoding="utf-8")
     assert 'f"cannot examine {denied} of the {examined} entries of {path} ({reason}); "' in source
     assert 'f"is the directory searchable?"' in source
+
+
+def test_the_lock_verdicts_are_crons_and_the_timer_paragraph_names_the_timeout() -> None:
+    """Issue #36: under the timer the lock is never contended, so the two lock verdicts and
+    the `lock_stale` row say cron, and the timer paragraph names `TimeoutStartSec=` and
+    systemd's own words for its expiry."""
+    text = _text()
+    running = text[text.index("## Running it"):text.index("## Mail")].replace(NL, " ")
+    assert "Both verdicts are cron's" in running
+    assert "the timer never starts a unit that is still activating" in running
+    assert "`TimeoutStartSec=` ends it with SIGTERM" in running
+    assert "`Failed with result 'timeout'`" in running and "exit 143" in running
+    reference = text[text.index("### The `[logalert]` section"):text.index("### The example")]
+    row = next(r for r in reference.splitlines() if r.startswith("| `lock_stale`"))
+    assert "Cron's: under the systemd timer the lock is never contended" in row
+    table = text[text.index("## Troubleshooting"):]
+    rows = [r for r in table.splitlines() if r.startswith("| `stale lock:")]
+    assert len(rows) == 2 and all("(exit 1, under cron)" in r for r in rows)
