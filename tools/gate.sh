@@ -70,8 +70,10 @@ skip_stage() {
 
 # ruff prints `warning: Invalid # noqa directive ...` for a malformed suppression and still
 # EXITS 0 (measured) -- and prints nothing at all for a blanket `# noqa <prose>` unless RUF100
-# is selected. A warning is not a pass. `--no-cache` is deliberate: a cached run does not re-emit
-# the warning, and a guard that only fires on a cold cache is not a guard.
+# is selected, which pyproject.toml does (with RUF102 for a code ruff does not know: a planted
+# `# noqa: XYZ999` passed here before, issue #48). A warning is not a pass. `--no-cache` is
+# deliberate: a cached run does not re-emit the warning, and a guard that only fires on a cold
+# cache is not a guard.
 ruff_strict() {
   local out rc
   out="$(python -m ruff check --no-cache . 2>&1)"; rc=$?

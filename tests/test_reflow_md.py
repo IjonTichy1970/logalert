@@ -1,4 +1,4 @@
-"""Guards over `tools/reflow_md.py` (#206).
+"""Guards over `tools/reflow_md.py`.
 
 WARNING: THE LOAD-BEARING TEST IN THIS FILE IS `test_CHECK_3_catches_what_CHECK_1_and_2_pass`.
 The tool's two original checks were measured reporting OK while an eight-line blockquote collapsed
@@ -6,8 +6,8 @@ into one quoted line plus seven lines of stray `>` characters. That is the case 
 and it is the case on which CHECK 3 and the two checks that preceded it disagree. If this file is
 ever trimmed, that is the test to keep.
 
-WARNING: the tool is IMPORTED here, not invoked as a subprocess, and that differs from the other
-tool test in this kit. The reason the other one shells out: `from tools.reflow_md import ...`
+WARNING: the tool is IMPORTED here, not invoked as a subprocess, and that differs from the
+changelog-refs tool test. The reason that one shells out: `from tools.reflow_md import ...`
 puts one source under two module names (`tools.reflow_md` and the script run as `__main__`) and
 `mypy --strict` exits 2. This file imports nothing -- `_load()` reads the source and executes it
 under a private module name, so mypy never sees a second import path for it, and the pure
@@ -44,7 +44,7 @@ def _load() -> ModuleType:
 reflow_md = _load()
 
 
-# -- the reason the tool is in the tree (#206) -----------------------------------------------------
+# -- the reason the tool is in the tree -----------------------------------------------------
 
 _QUOTE = (
     "> **A quoted warning that runs well past the target width and therefore has to wrap "
@@ -94,10 +94,11 @@ def test_CHECK_3_catches_what_CHECK_1_and_2_pass() -> None:
 def test_CHECK_1_catches_a_marker_stranded_MID_SENTENCE() -> None:
     """The other half of the blockquote damage, and CHECK 1 owns it once markers are stripped.
 
-    This is what the #198 tool actually produced: the first line keeps its marker and the rest of
-    the quote is emitted as prose carrying the old `>` characters inline. A marker-INCLUSIVE
-    CHECK 1 passed on exactly this, because the tokens all survive in order. Stripping the markers
-    first is what makes the stray one visible as a word that appears on one side only.
+    This is what the tool's first version actually produced: the first line keeps its marker and
+    the rest of the quote is emitted as prose carrying the old `>` characters inline. A
+    marker-INCLUSIVE CHECK 1 passed on exactly this, because the tokens all survive in order.
+    Stripping the markers first is what makes the stray one visible as a word that appears on one
+    side only.
     """
     honest = "> alpha beta\n> gamma delta\n"
     littered = "> alpha beta > gamma delta\n"
@@ -158,7 +159,7 @@ def test_fences_tables_and_headings_survive_byte_identical() -> None:
 
 def test_a_long_single_token_is_left_long_rather_than_severed() -> None:
     """A URL or a pytest node id must survive; a severed token is a broken link or a wrong id."""
-    node = "tests/test_write_path.py::test_a_refused_attestation_never_reaches_the_sealing_key"
+    node = "tests/test_globs.py::test_last_component_wildcard_matches_regular_files_in_name_order"
     out = reflow_md.reflow(f"See `{node}` for the case that matters here.\n")
     assert node in out
 
@@ -166,9 +167,9 @@ def test_a_long_single_token_is_left_long_rather_than_severed() -> None:
 def test_a_continuation_line_beginning_with_a_double_pipe_is_not_a_table_row() -> None:
     """The `||` case CHECK 2 caught once already.
 
-    This repo's prose wraps `HMAC(install_secret, event_id || question_id)` such that a
-    continuation can begin `||`. Treating it as a table row desynchronises the fence tracker, and
-    the paragraph check cannot see that because every word survives.
+    The source project's prose wrapped an expression with `||` in it such that a continuation
+    could begin `||`. Treating it as a table row desynchronises the fence tracker, and the
+    paragraph check cannot see that because every word survives.
     """
     assert not reflow_md._is_table("|| question_id)` is derived on the device.")
     assert reflow_md._is_table("| a | b |")
@@ -180,7 +181,7 @@ def test_an_issue_reference_opening_a_paragraph_is_not_a_heading() -> None:
     assert reflow_md._is_heading("## A real heading")
 
 
-# -- the gate stage (#207) -------------------------------------------------------------------------
+# -- the gate stage -------------------------------------------------------------------------
 
 
 def test_the_width_check_fires_on_a_line_that_DRIFTED_wide() -> None:
@@ -199,7 +200,7 @@ def test_the_width_check_SPARES_what_wrapping_cannot_fix() -> None:
     Without this the stage is permanently red on correct files, and the only way to quiet it is an
     exemption list -- which is how a gate stops gating without anyone deciding it should.
     """
-    node = "tests/test_write_path.py::test_a_refused_attestation_never_reaches_the_sealing_key"
+    node = "tests/test_globs.py::test_last_component_wildcard_matches_regular_files_in_name_order"
     for label, text in (
         ("table", "| a very wide column heading | " + "x" * 60 + " |\n"),
         ("fence", "```sh\n" + "echo " + "y" * 90 + "\n```\n"),
@@ -230,7 +231,7 @@ def test_the_width_check_REFUSES_a_scan_that_read_almost_nothing(tmp_path: Path)
 
 
 def test_the_width_check_NAMES_a_file_it_could_not_READ(tmp_path: Path, capsys: object) -> None:
-    """#303. The DELIBERATE exclusion has always been announced, with a comment in the tool saying
+    """The DELIBERATE exclusion has always been announced, with a comment in the tool saying
     that a silent exclusion reads as coverage. The ACCIDENTAL one -- a file that fails to decode --
     was a bare `continue` eleven lines above that comment, in the same function.
 

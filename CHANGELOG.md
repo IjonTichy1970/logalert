@@ -237,6 +237,13 @@ its notes.
   inert, with the guard's gate stage green. Three checks now run the string
   itself: the venv off PATH, a `python3`-only PATH, an empty one.
 
+- `[internal]` **The gate refuses a stale or unknown `# noqa` (RUF100, RUF102),
+  and the two ported tools tell this repository's story** (#48). Eight
+  directives suppressed nothing (`S603` is ignored tree-wide) and a planted
+  `# noqa: XYZ999` passed in silence; the docstrings cited another project's
+  issues, commits and files. `reflow_md.py`'s four fence walks are one
+  generator, byte-identical over every document in the tree.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

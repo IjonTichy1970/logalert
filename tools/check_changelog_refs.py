@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
-"""Does every issue merged since the last release have a CHANGELOG entry? (#177)
+"""Does every issue merged since the last release have a CHANGELOG entry?
 
 ## Why this exists
 
 `CHANGELOG.md`'s About section says "everything gets an entry", and `/ship` writes one per
-issue.
-Both are conventions, and on 2026-08-21 -- cutting 0.6.6 -- **seven merged issues had no entry**:
-#147, #149, #150, #161, #164, #169 and #174.
-
-Four of the seven were WRITTEN AND THEN REVERTED by `/ship`'s own multi-commit split: the procedure
-snapshots the tree before the entry is written, commits issue 1, then restores the rest of the tree
-from that snapshot -- rolling `CHANGELOG.md` back and deleting the entry committed one step earlier.
-Only the last commit's entry survived. `4aaa1e8` added #174's; `1bd458a` removed it.
+issue. Both are conventions, and in the source project a release was once cut with **seven
+merged issues and no entry for any of them**. Four of the seven had been WRITTEN AND THEN
+REVERTED by `/ship`'s own multi-commit split: the procedure snapshots the tree before the entry
+is written, commits issue 1, then restores the rest of the tree from that snapshot -- rolling
+`CHANGELOG.md` back and deleting the entry committed one step earlier. Only the last commit's
+entry survived, and nothing said so.
 
 ## Why a missing entry is not a documentation problem
 
-`/release` step 8 scans the entries for a `[contract]` tag and emits a worklist for the two client
-repos. **#164 changed `wire/WIRE.sha256` and `wire/v1/wire_v1_contract.md`** -- a wire change all
-three repos co-own -- and with its entry absent the scan reported "no contract changes, nothing for
-the apps to mirror". This daemon and its clients deploy on completely independent schedules, so
-nothing else would ever have said otherwise.
+The About section's tags are load-bearing: the release step scans the entries for `[contract]`
+and writes the upgrade notes from them, and an entry that is absent has no tag to find -- the
+step reports "no contract changes -- nothing to do on upgrade", and is believed, on the one
+change an operator had to know about before upgrading. Operators upgrade on their own schedule,
+so nothing else would ever have said otherwise.
 
-That is the failure this gate stage closes: not tidiness, but a silent false negative in the one
-step that warns the apps.
+That is the failure this gate stage closes: not tidiness, but a silent false negative in the
+only warning an operator gets.
 
 ## What it checks
 
@@ -32,7 +30,7 @@ somewhere in `CHANGELOG.md`.
 WARNING: SUBJECTS ONLY, matching `/close` and `list.py`. A body reference names an issue the commit
 commit did not finish; requiring an entry would be a false alarm nobody could clear.
 
-WARNING: MERGE COMMITS ARE EXCLUDED, and that is not tidiness either. `Merge pull request #176 from
+WARNING: MERGE COMMITS ARE EXCLUDED, and that is not tidiness either. `Merge pull request #75 from
 ...` carries a PULL REQUEST number, which never has a changelog entry -- treating it as an issue ref
 would make this stage permanently and unfixably red.
 
@@ -45,7 +43,7 @@ withhold.
 
 import re
 import shutil
-import subprocess  # noqa: S404  # nosec - git is invoked with a fixed argv, never a shell string
+import subprocess  # nosec - git is invoked with a fixed argv, never a shell string
 import sys
 from pathlib import Path
 
@@ -75,14 +73,15 @@ def _git(*args: str) -> tuple[bool, str]:
     three characters), and a byte cp1252 does not define would raise under strict decoding. The
     `(#N)` match itself is ASCII and unaffected either way.
 
-    The executable is RESOLVED with `shutil.which` rather than passed as a bare name, which is how
-    `check_issue_titles.py` closes S607/B607 by construction rather than by suppression.
+    The executable is RESOLVED with `shutil.which` rather than passed as a bare name: what S607
+    (a partial executable path) asks for, done by construction -- the tree ignores that rule for
+    a resolved argv, so nothing here rests on the suppression.
     """
     git = shutil.which("git")
     if git is None:
         return False, "the `git` executable is not on PATH"
     try:
-        proc = subprocess.run(  # noqa: S603  # nosec - fixed argv, no shell, no caller input
+        proc = subprocess.run(  # nosec - fixed argv, no shell, no caller input
             [git, "-C", str(REPO_ROOT), *args],
             capture_output=True,
             text=True,
@@ -111,18 +110,19 @@ UNREACHABLE = "unreachable"
 def baseline() -> tuple[str, str | None, str]:
     """The most recent `Release x.y.z` commit, as `(state, sha, detail)`.
 
-    WARNING: THE STATE IS THREE-VALUED, AND THAT IS THE POINT (#302). This used to return
-    `(None, reason)` for four different situations, and `main` treated all four as EXIT_OK: a repo
-    before its first release, a SHALLOW CLONE, a full window, and a git failure were one answer.
+    WARNING: THE STATE IS THREE-VALUED, AND THAT IS THE POINT. The source project's first version
+    returned `(None, reason)` for four different situations, and `main` treated all four as
+    EXIT_OK: a repo before its first release, a SHALLOW CLONE, a full window, and a git failure
+    were one answer.
     Only the first of those is "nothing to compare against". The other three are could-not-check --
     which the module docstring above has always said is exit 2, distinct from 0, for exactly this
     reason.
 
-    WARNING: THE SHALLOW CASE IS NOT HYPOTHETICAL. `.github/workflows/ci.yml` carried no
+    WARNING: THE SHALLOW CASE IS NOT HYPOTHETICAL. The source project's `ci.yml` carried no
     `fetch-depth`, so every CI run searched a one-commit clone, found no release commit, and
-    reported a skip. The stage measured nothing from the day it was added until #302, while working
-    correctly on every developer clone -- the combination that keeps a vacuous check alive, because
-    local runs keep confirming it.
+    reported a skip. The stage measured nothing from the day it was added, while working correctly
+    on every developer clone -- the combination that keeps a vacuous check alive, because local
+    runs keep confirming it. This repo's `ci.yml` sets `fetch-depth: 0` and says why.
     """
     ok, shallow = _git("rev-parse", "--is-shallow-repository")
     if not ok:
@@ -170,8 +170,9 @@ def main() -> int:
 
     state, sha, detail = baseline()
     if state == UNREACHABLE:
-        # The baseline could not be established. Reporting a skip here -- which is what this did
-        # until #302 -- manufactures the confidence the module docstring says to withhold.
+        # The baseline could not be established. Reporting a skip here -- which is what the source
+        # project's first version did -- manufactures the confidence the module docstring says to
+        # withhold.
         print(f"COULD NOT CHECK -- {detail}", file=sys.stderr)
         return EXIT_COULD_NOT_CHECK
     if sha is None:
