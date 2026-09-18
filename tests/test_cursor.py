@@ -21,16 +21,19 @@ from typing import Any
 import pytest
 
 from logalert.cursor import (
+    ANCHOR_CAP,
     FINGERPRINT_CAP,
     LINE_CAP,
     Line,
     LineReader,
     LogFile,
+    anchor_of,
     compressed_suffix,
     fingerprint,
     identify,
     open_log,
     open_log_file,
+    tail_of,
 )
 from logalert.state import Cursor, State, load_state, timestamp
 
@@ -1006,3 +1009,221 @@ def test_half_written_or_corrupt_archives_are_oserrors(tmp_path: Path) -> None:
     path.write_bytes(b"not an xz stream at all\n")
     with pytest.raises(OSError, match="incomplete or corrupt compressed stream"):
         open_log_file(SECTION, str(path), None)
+
+# -- the anchor: the bytes before the position, as read (issue #34) ------------------------------
+
+
+def _window(data: bytes, offset: int, cap: int = ANCHOR_CAP) -> bytes:
+    """What the reader's tail must be at ``offset`` into ``data``: the invariant."""
+    return data[:offset][-cap:]
+
+
+def test_identify_other_bytes_before_the_offset_are_a_truncation() -> None:
+    """The fourth rule: the same inode, first line and a size past the offset, but not the
+    bytes the last run read before it -- a file truncated and refilled with the same first
+    line past the position (the mutant continued into the refill: a fragment, the refill's
+    lines before it lost)."""
+    saved = saved_cursor(anchor=sha(b"read"))
+    verdict, note = identify(saved, 7, 3, 5000, sha(b"first"), sha(b"refill"))
+    assert verdict == "truncated"
+    assert note == ("the bytes before the saved offset are not the ones read (truncated and "
+                    "refilled?)")
+    assert identify(saved, 7, 3, 5000, sha(b"first"), sha(b"read")) == ("continue", None)
+
+
+def test_identify_never_compares_a_missing_anchor_and_ranks_it_after_the_size() -> None:
+    """A cursor from 0.1.0 (no anchor) or a compressed file (none read) is trusted; a size
+    below the offset is the truncation named first; the rule outranks the device note."""
+    assert identify(saved_cursor(), 7, 3, 5000, sha(b"first"), sha(b"refill")) == ("continue", None)
+    assert identify(saved_cursor(anchor=sha(b"read")), 7, 3, 5000, sha(b"first"), None) == (
+        "continue", None)
+    verdict, note = identify(saved_cursor(anchor=sha(b"read")), 7, 3, 99, sha(b"first"),
+                             sha(b"refill"))
+    assert verdict == "truncated" and note == "size 99 < saved offset 100"
+    verdict, note = identify(saved_cursor(anchor=sha(b"read")), 7, 4, 5000, sha(b"first"),
+                             sha(b"refill"))
+    assert verdict == "truncated" and note is not None and "refilled" in note
+
+
+def test_a_file_refilled_with_the_same_first_line_past_the_position_is_read_from_the_top(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The measured bug: a banner log read to its end, then rewritten whole (`>` and a
+    fixed banner) longer than the position; the mutant continued at the stale offset --
+    a fragment, then 168 of the 401 new lines never read."""
+    path = tmp_path / "router.log"
+    old = b"BANNER\n" + b"".join(b"old line %d heartbeat OK\n" % n for n in range(200))
+    path.write_bytes(old)
+    log, lines = scan(path, None, from_start=True)
+    saved = log.cursor()
+    assert len(lines) == 201 and saved.offset == len(old)
+    assert saved.anchor == sha(_window(old, len(old)))
+    new = b"BANNER\n" + b"".join(b"new line %d after the restart\n" % n for n in range(400))
+    path.write_bytes(new)  # the same inode, the same first line, longer than the position
+    assert path.stat().st_ino == saved.ino and len(new) > saved.offset
+    caplog.set_level(logging.INFO, logger="logalert.cursor")
+    again, lines = scan(path, saved)
+    assert again.verdict == "truncated" and again.start == 0
+    assert texts(lines) == ["BANNER"] + [f"new line {n} after the restart" for n in range(400)]
+    assert again.cursor().anchor == sha(_window(new, len(new)))
+    assert (f"[{SECTION}] {path}: the bytes before the saved offset are not the ones read "
+            f"(truncated and refilled?); truncated") in caplog.text
+
+
+def test_the_anchor_is_the_window_of_bytes_not_the_last_line(tmp_path: Path) -> None:
+    """The alternative the rule disagrees with: a one-line anchor passes a refill whose
+    last line before the position is byte-identical (a fixed READY line) while the lines
+    before it differ; the window of bytes fails it."""
+    path = tmp_path / "router.log"
+    old = b"BANNER\n" + b"".join(b"old %03d\n" % n for n in range(100)) + b"READY\n"
+    new = b"BANNER\n" + b"".join(b"new %03d\n" % n for n in range(100)) + b"READY\n" + b"more\n"
+    assert len(new) > len(old) and new[:7] == old[:7] and old[-6:] == new[-11:-5]
+    path.write_bytes(old)
+    log, _ = scan(path, None, from_start=True)
+    saved = log.cursor()
+    path.write_bytes(new)
+    again, lines = scan(path, saved)
+    assert again.verdict == "truncated" and len(lines) == 103
+
+
+def test_a_short_read_after_a_continue_records_the_whole_window(tmp_path: Path) -> None:
+    """A run that reads 100 bytes must still record an anchor over the last 4 KiB: the
+    reader is seeded with the bytes before its start (the mutant hashed the 100 bytes
+    alone, and the next run called every file refilled)."""
+    path = tmp_path / "router.log"
+    data = b"".join(b"line %05d %s\n" % (n, os.urandom(20).hex().encode()) for n in range(200))
+    assert len(data) > 2 * ANCHOR_CAP
+    path.write_bytes(data)
+    log, _ = scan(path, None, from_start=True)
+    saved = log.cursor()
+    assert saved.anchor == sha(_window(data, len(data)))
+    extra = b"one more line, the run reads this alone\n"
+    with open(path, "ab") as handle:
+        handle.write(extra)
+    again, lines = scan(path, saved)
+    assert again.verdict == "continue" and len(lines) == 1
+    cursor = again.cursor()
+    assert cursor.anchor == sha(_window(data + extra, len(data) + len(extra)))
+    third, lines = scan(path, cursor)  # and the window is what the next run compares
+    assert third.verdict == "continue" and lines == []
+    assert third.cursor().anchor == cursor.anchor  # nothing read: carried forward
+
+
+def test_the_anchor_is_what_was_read_not_what_is_on_disk_at_the_save(tmp_path: Path) -> None:
+    """A refill landing after the read's last check and before the cursor is taken: the
+    reader's tail is from the read, so the next run sees the refill as a truncation (the
+    mutant re-read the window from disk at the save and continued into the refill)."""
+    path = tmp_path / "router.log"
+    old = b"BANNER\n" + b"".join(b"old %03d\n" % n for n in range(300))
+    path.write_bytes(old)
+    log = open_log_file(SECTION, str(path), None, from_start=True)
+    assert log is not None
+    with log:
+        lines = list(log.lines())
+        new = b"BANNER\n" + b"".join(b"new %03d\n" % n for n in range(400))
+        path.write_bytes(new)  # under the handle, after the read ended
+        cursor = log.cursor()
+    assert len(lines) == 301 and not log.reader.truncated
+    assert len(new) > cursor.offset  # past the position: the size rule alone passes it
+    assert cursor.anchor == sha(_window(old, len(old)))
+    again, lines = scan(path, cursor)
+    assert again.verdict == "truncated" and len(lines) == 401
+
+
+def test_a_first_sight_at_the_end_seeds_the_anchor_from_the_bytes_before_it(
+        tmp_path: Path) -> None:
+    path = tmp_path / "router.log"
+    data = b"".join(b"old news %03d\n" % n for n in range(500)) + b"partial"
+    path.write_bytes(data)
+    log, lines = scan(path, None)
+    assert lines == [] and log.start == len(data) - len(b"partial")
+    expected = sha(_window(data, log.start))
+    assert log.start_cursor().anchor == expected and log.cursor().anchor == expected
+    assert log.seed == _window(data, log.start)
+
+
+def test_a_compressed_file_and_a_read_from_zero_of_nothing_have_no_anchor(
+        tmp_path: Path) -> None:
+    path = tmp_path / "router.log.gz"
+    path.write_bytes(gzip.compress(b"first\nsecond\n"))
+    log, _ = scan(path, None, from_start=True)
+    assert log.seed is None and log.reader.tail is None and log.cursor().anchor is None
+    plain = tmp_path / "empty.log"
+    plain.write_bytes(b"")
+    log, _ = scan(plain, None)
+    assert log.seed == b"" and log.reader.tail == b"" and log.cursor().anchor is None
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 5, 7, 11, 64])
+def test_the_readers_tail_is_the_bytes_before_its_offset_at_every_line(
+        monkeypatch: pytest.MonkeyPatch, chunk: int) -> None:
+    """The fold's invariant, at every chunk size that puts a boundary somewhere awkward:
+    inside a NUL hole (carried as a count), inside a hole longer than the cap, inside a
+    cut line, at a CRLF, before an unterminated NUL run at the end (not in the offset,
+    so not in the tail) -- and between folds, on demand from the buffer."""
+    monkeypatch.setattr("logalert.cursor._CHUNK", chunk)
+    monkeypatch.setattr("logalert.cursor.ANCHOR_CAP", 16)
+    data = (b"first line\r\n" + b"two\n" + NUL * 5 + b"after a hole\n" + NUL * 40
+            + b"after a long hole\n" + NUL * 3 + b"\n" + b"x" * 30 + b"\n" + b"last\n"
+            + NUL * 40 + b"ok\n"  # a hole longer than the cap, then a line shorter than it:
+            #                       the carried count itself is inside the window (review)
+            + NUL * 12)
+    seed = b"seeded"
+    reader = LineReader(io.BytesIO(seed + data), len(seed), 12, tail=seed)
+    for _ in reader:
+        assert reader.tail == _window(seed + data, reader.offset, 16)
+    assert reader.at_end and reader.offset == len(seed) + len(data) - 12
+    assert reader.tail == _window(seed + data, reader.offset, 16)
+    assert reader.anchor == sha(reader.tail or b"")
+
+
+def test_a_pass_stopped_early_folds_its_lines_before_the_next_pass(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A consumer that stops between chunks leaves consumed lines unfolded; the next pass
+    folds them first, the hole its first line began with included (the mutant's second
+    pass lost them: an anchor behind the offset). The window is asserted at every line
+    of the second pass, before fresh lines can push the error out of it (review)."""
+    monkeypatch.setattr("logalert.cursor._CHUNK", 4)
+    monkeypatch.setattr("logalert.cursor.ANCHOR_CAP", 10)
+    data = b"aa\n" + NUL * 5 + b"bb\ncc\ndd\nee\n"
+    reader = LineReader(io.BytesIO(data), 0, tail=b"")
+    for line in reader:
+        assert reader.tail == _window(data, reader.offset, 10)
+        if line.text == "bb":
+            break  # stopped, part-way into a chunk
+    assert reader.offset == len(b"aa\n" + NUL * 5 + b"bb\n")
+    second = []
+    for line in reader:
+        second.append(line.text)
+        assert reader.tail == _window(data, reader.offset, 10)
+    assert second == ["cc", "dd", "ee"]
+    assert reader.tail == _window(data, reader.offset, 10)
+
+
+def test_context_before_is_empty_after_a_refill_with_the_same_first_line(
+        tmp_path: Path) -> None:
+    """The second handle's read of the context checks the window too (issue #66 checked
+    the size and the first line): a refill past the start with the same first line has
+    other lines there, and they are not this file's context."""
+    path = tmp_path / "router.log"
+    old = b"BANNER\n" + b"".join(b"old %03d\n" % n for n in range(50))
+    path.write_bytes(old)
+    log, _ = scan(path, None, from_start=True)
+    saved = log.cursor()
+    live = open_log_file(SECTION, str(path), saved)
+    assert live is not None
+    with live:
+        assert live.verdict == "continue"
+        assert texts(live.context_before(2)) == ["old 048", "old 049"]
+        new = b"BANNER\n" + b"".join(b"new %03d\n" % n for n in range(60))
+        assert len(new) > live.start  # past the start: the size rule alone passes it
+        path.write_bytes(new)
+        assert live.context_before(2) == []
+
+
+def test_tail_of_reads_the_bytes_before_the_offset_and_leaves_the_position_there() -> None:
+    handle = io.BytesIO(b"0123456789")
+    assert tail_of(handle, 7, 3) == b"456" and handle.tell() == 7
+    assert tail_of(handle, 2, 5) == b"01" and handle.tell() == 2
+    assert tail_of(handle, 0, 5) == b"" and handle.tell() == 0
+    assert tail_of(handle, 15, 4) == b"" and anchor_of(b"") is None  # past the end
+    assert anchor_of(b"abc") == sha(b"abc")

@@ -32,7 +32,7 @@ import logalert.cursor
 import logalert.run
 import logalert.state
 from logalert.__main__ import main
-from logalert.cursor import LogFile
+from logalert.cursor import LogFile, anchor_of
 from logalert.lock import RunLock
 from logalert.match import scan
 from logalert.rotation import open_source
@@ -1871,3 +1871,56 @@ def test_a_marking_that_fails_is_one_log_line_not_a_traceback(
     assert len(site.calls()) == 1 and " unsaved" not in _lock_line(site)
     assert any("[router-disk] the lock could not be marked either (No space left on device); "
                "the next run re-sends" in line for line in site.activity())
+
+# -- a log rewritten in place with its banner (issue #34) ---------------------------------------
+
+
+def test_a_log_rewritten_with_its_banner_past_the_position_is_read_from_the_top(
+        site: Site) -> None:
+    """Issue #34 end to end, through the state file: a service restart truncates its log
+    and rewrites the fixed banner and more than was there; the old rules continued at the
+    stale offset (a fragment mailed, the lines before it never). The anchor persists
+    between runs, so the third run reads the rewritten file from its beginning."""
+    site.prime()
+    site.append(site.router, "kernel: disk failure on sda")
+    assert site.run() == 0 and len(site.calls()) == 1
+    entry = site.state()["router-disk"][site.router.as_posix()]
+    assert entry["anchor"] == anchor_of(site.router.read_bytes()[-4096:])
+    # the restart: the same file (inode), the same first line, longer than the position
+    rewritten = (["boot", "disk failure early in the new log"]
+                 + [f"quiet {n}" for n in range(40)] + ["disk failure late"])
+    site.router.write_text(NL.join(rewritten) + NL, encoding="utf-8", newline=NL)
+    assert site.router.stat().st_size > entry["offset"]
+    assert site.run() == 0
+    calls = site.calls()
+    assert len(calls) == 2
+    body = body_of(calls[1][1])
+    assert "2: disk failure early in the new log" in body and "43: disk failure late" in body
+    assert site.offset("router-disk", site.router) == site.router.stat().st_size
+    assert any("the bytes before the saved offset are not the ones read (truncated and "
+               "refilled?); truncated" in line for line in site.activity())
+    assert site.run() == 0 and len(site.calls()) == 2  # and nothing twice
+
+
+def test_an_entry_from_0_1_0_is_trusted_once_and_gains_the_anchor_on_the_next_save(
+        site: Site) -> None:
+    """The upgrade path, through the state file (review: the docstring's "gains it on the
+    next save" was pinned by the pure rule only): an entry without an anchor continues,
+    the run that continued records one over the bytes it found, and the rewrite after
+    that is a truncation."""
+    site.prime()
+    site.append(site.router, "kernel: disk failure on sda")
+    assert site.run() == 0 and len(site.calls()) == 1
+    data = json.loads(site.state_file.read_text(encoding="utf-8"))
+    entry = data["entries"]["router-disk"][site.router.as_posix()]
+    assert entry.pop("anchor") is not None  # what 0.1.0 never wrote
+    site.state_file.write_text(json.dumps(data), encoding="utf-8", newline=NL)
+    assert site.run() == 0 and len(site.calls()) == 1  # nothing new; trusted once
+    entry = site.state()["router-disk"][site.router.as_posix()]
+    assert entry["anchor"] == anchor_of(site.router.read_bytes()[-4096:])
+    rewritten = ["boot", "quiet", "kernel: disk failure on sdb"] + [f"quiet {n}" for n in range(9)]
+    site.router.write_text(NL.join(rewritten) + NL, encoding="utf-8", newline=NL)
+    assert site.router.stat().st_size > entry["offset"]
+    assert site.run() == 0
+    calls = site.calls()
+    assert len(calls) == 2 and "3: kernel: disk failure on sdb" in body_of(calls[1][1])

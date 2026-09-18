@@ -369,3 +369,22 @@ def test_copytruncate_landing_after_the_plan_loses_nothing(tmp_path: Path) -> No
     _, third, cursor = run(path, parked)
     _, fourth, _ = run(path, cursor)
     assert third == ["middle 1", "live 1"] and fourth == []
+
+
+def test_copytruncate_then_a_writer_restarting_with_its_banner_is_read_from_the_top(
+        tmp_path: Path) -> None:
+    """Issue #34 with real logrotate: copytruncate, then a writer that restarts with its
+    fixed banner and writes past the saved position -- the same inode, the same first line
+    and a size past the offset, which the old rules read on from the stale offset. The copy
+    holds the position; the live file is read from its top."""
+    path = tmp_path / "router.log"
+    banner = b"BANNER\n"
+    saved = seen(path, banner + OLD)
+    append(path, SINCE)
+    logrotate(tmp_path, path, "    copytruncate\n")
+    assert path.stat().st_ino == saved.ino and path.stat().st_size == 0
+    append(path, banner + b"".join(b"restart %03d\n" % n for n in range(40)))
+    assert path.stat().st_size > saved.offset
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.verdict == "truncated"
+    assert lines == ["since 1", "since 2", "BANNER"] + [f"restart {n:03d}" for n in range(40)]

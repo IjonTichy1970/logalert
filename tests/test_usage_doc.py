@@ -199,3 +199,30 @@ def test_the_rotation_during_the_run_paragraph_quotes_the_two_stop_lines() -> No
                   "the live file was rotated and compressed during the run (router.log.1.gz); "
                   "its lines were read from there"):
         assert shape in text, shape
+
+
+def test_the_position_section_and_the_table_carry_the_anchor() -> None:
+    """Issue #34: the anchor is named where the state file's fields are, the truncation
+    rule says what it adds, the in-run check's paragraph names its one blind spot in
+    place of the limit it confessed to, and the table has the rewrite row -- in the
+    program's own words, wrapped or not."""
+    text = _text()
+    section = text[text.index("## Position tracking"):text.index("## Globs")].replace(NL, " ")
+    assert "as the run read them (the `anchor`:" in section
+    assert "an entry from 0.1.0 has none and is trusted once" in section
+    assert "or holding other bytes before the position than the ones read" in section
+    assert "the bytes before the position the ones it read" in section
+    assert "caught within the chunk that read it, by the bytes before the position" in section
+    assert "a file of nothing but identical lines, aligned" in section
+    assert "is invisible to that check, as it is to the next run" in section
+    assert "invisible to that check, as it is to the next run's truncation rule" not in section
+    table = text[text.index("## Troubleshooting"):]
+    row = next(r for r in table.splitlines() if "truncated and refilled?" in r)
+    assert ("`... the bytes before the saved offset are not the ones read (truncated and "
+            "refilled?); truncated`") in row  # the _log shape: note, then the verdict
+    assert "rewrites its log in place" in row and "found the saved position by content" in row
+    assert "issue #74" in row  # the older same-banner copy taken as a guess
+    source = (DOC.parents[1] / "logalert" / "cursor.py").read_text(encoding="utf-8")
+    assert "the bytes before the saved offset are not the ones read " in source  # breaks there
+    assert "(truncated and refilled?)" in source
+    assert 'log.info("%s: %s; %s", where, self.note, self.verdict)' in source

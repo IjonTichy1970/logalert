@@ -57,7 +57,8 @@ def test_round_trip_and_the_on_disk_shape(tmp_path: Path) -> None:
     entry = data["entries"]["router-disk"]["/var/log/router.log"]
     assert entry == {"offset": 10, "ino": 1234, "dev": 56, "fingerprint": "ab" * 32,
                      "realpath": "/var/log/r.log", "last_seen": "2026-09-14T12:00:00Z",
-                     "line": None, "size": None, "mtime": None}  # size/mtime: issue #44
+                     "line": None, "size": None, "mtime": None,  # size/mtime: issue #44
+                     "anchor": None}  # the bytes before the offset, hashed (issue #34)
     assert data["entries"]["firewall"]["/var/log/router.log"]["fingerprint"] is None
     again = load_state(path)
     assert again.entries == state.entries
@@ -633,3 +634,38 @@ def test_a_short_write_is_completed_not_taken_for_the_whole(
     write_atomically(str(path), text, reach=len(text) + 100)
     assert path.read_text(encoding="utf-8") == text
     assert sizes == [len(text) + 100, len(text)]
+
+# -- the anchor (issue #34) ------------------------------------------------------------------
+
+
+def test_the_anchor_round_trips_and_a_file_without_it_loads(tmp_path: Path) -> None:
+    """What the bytes before the offset hashed to as the run read them; optional, so
+    0.1.0's state loads (trusted once) and 0.1.0 drops it on save."""
+    path = str(tmp_path / "state.json")
+    state = State(path)
+    cursor = Cursor(offset=10, ino=1, dev=2, fingerprint="ab" * 32, realpath="/var/log/r.log",
+                    last_seen="2026-09-14T12:00:00Z", line=7, anchor="cd" * 32)
+    state.set("s", "/var/log/r.log", cursor)
+    state.save()
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert data["entries"]["s"]["/var/log/r.log"]["anchor"] == "cd" * 32
+    assert load_state(path).get("s", "/var/log/r.log") == cursor
+    Path(path).write_text(
+        '{"version": 1, "entries": {"a": {"/x": {"offset": 1, "ino": 2, "dev": 3, '
+        '"fingerprint": null, "realpath": "/x", "last_seen": "2026-09-14T12:00:00Z"}}}}',
+        encoding="utf-8", newline="\n")
+    loaded = load_state(path).get("a", "/x")
+    assert loaded is not None and loaded.anchor is None
+    state.touch("s", "/var/log/r.log")  # a sighting keeps it
+    assert state.entries[("s", "/var/log/r.log")].anchor == "cd" * 32
+
+
+@pytest.mark.parametrize("bad", ["7", "true", "[]"])
+def test_a_bad_anchor_is_a_hard_error(tmp_path: Path, bad: str) -> None:
+    path = tmp_path / "state.json"
+    text = ('{"version": 1, "entries": {"a": {"/x": {"offset": 1, "ino": 2, "dev": 3, '
+            '"fingerprint": null, "realpath": "/x", "last_seen": "2026-09-14T12:00:00Z", '
+            '"anchor": BAD}}}}').replace("BAD", bad)
+    path.write_text(text, encoding="utf-8", newline="\n")
+    with pytest.raises(StateError, match="'anchor' is not a string"):
+        load_state(str(path))

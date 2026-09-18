@@ -375,7 +375,12 @@ from the beginning instead.
 
 **The state file** (`state_file`, JSON) holds one entry per section and file:
 the byte offset just after the last complete line read, the file's identity
-(inode and device, plus a hash of its first line as a fingerprint), and when it
+(inode and device, plus a hash of its first line as a fingerprint), a hash of
+up to 4 KiB before the position as the run read them (the `anchor`: a file
+truncated and refilled past the position with the same first line -- a restart
+script's `>` with a fixed banner, a report rewritten whole -- is told apart
+from the file itself and treated as truncated; an entry from 0.1.0 has none
+and is trusted once), and when it
 was last seen. An entry parked on a rotated copy (a rotation during the run, an
 absent live file) also records that copy's size and modification time, and the
 next run takes the copy with that modification time and first line before any
@@ -405,7 +410,8 @@ room -- and clears the mark; `--reset-state` with no path clears it too. Two
 configurations sharing a state directory share the lock and its mark.
 
 **Rotation.** When a run finds the live file rotated (a different inode) or
-truncated (smaller than the saved offset, as `copytruncate` leaves it), it looks
+truncated (smaller than the saved offset, as `copytruncate` leaves it, or
+holding other bytes before the position than the ones read), it looks
 for the rotated copy that holds the saved position and reads it first -- the
 copy's tail from the saved offset, then every newer copy in full, then the live
 file from the beginning -- so nothing written between two runs is missed,
@@ -462,7 +468,8 @@ its lines were read from there`).
 A `copytruncate` that lands while the live file is being read truncates it
 under the run's open handle. The reader asks after every read (a chunk of 64
 KiB at most, and the empty read at the end) whether the file is still the one
-it opened (its size not below the position, its first line unchanged) and
+it opened (its size not below the position, its first line unchanged, the
+bytes before the position the ones it read) and
 drops what it read from a truncated file, so nothing of
 the new content is mailed as old lines and the position it keeps is one from
 before the truncation, which the next run finds in the copy by content:
@@ -471,8 +478,11 @@ before the truncation, which the next run finds in the copy by content:
 [router-disk] /var/log/router.log: truncated under us during the read (a copytruncate during the run?); stopping at offset 48211
 ```
 
-A truncation refilled with the same first line past the position is invisible
-to that check, as it is to the next run's truncation rule.
+A truncation refilled with the same first line past the position is caught
+within the chunk that read it, by the bytes before the position; one whose
+last 4 KiB before the position are the ones read (a file of nothing but
+identical lines, aligned) is invisible to that check, as it is to the next
+run.
 
 **The "no rotated copy" warning.** When no copy holds the saved position the log
 says so:
@@ -865,6 +875,7 @@ configured destination still gets INFO and above.
 | A pattern or exclude with an umlaut (any non-ASCII text) never matches, or a `^` regex misses the first line, or a file is `N line(s) read, 0 matched` under an ASCII pattern, with `skipped M NUL bytes` in the log once it has more than one line | Lines are decoded as UTF-8 and nothing else: a latin-1 log, a UTF-8 BOM before line 1 (U+FEFF, which stands between `^` and the text), a UTF-16 export (every other byte is a NUL). Nothing warns at run time; a missed exclude lets the line through with U+FFFD where the byte was | Write the log as UTF-8 (`iconv -f latin1 -t utf-8`, or the exporter's encoding setting); an unanchored literal for a file with a BOM; `--check-config` names a non-ASCII pattern or exclude |
 | A pattern starting with `#` or `;` never matches | The parser drops such a continuation line as a comment | A regex with the escape: `\#`, `\;` |
 | `no rotated copy holds the saved position ...` in the log after every rotation (exit 1 with `a permission kept the rotated copies out of reach (...)` when that is the cause) | The archives are elsewhere, or fewer are kept than rotations happen between runs (the copies rotated since the last run are read; what the missing one held after the position is lost) -- or the running user cannot read the copy or search its directory, and the causes say so | Set `archive_dir`, or run logalert more often than the rotation; grant read on the copies (a group; `olddir`'s mode) |
+| `... the bytes before the saved offset are not the ones read (truncated and refilled?); truncated` in the log after every restart of a service, then either `no rotated copy holds the saved position ...` and the whole file read again, or -- with an older copy of the same banner beside it, long enough -- `found the saved position by content; reading router.log.1 from N` and that copy's tail mailed first | The service rewrites its log in place (`>` in a start script, a fixed banner) or edits lines in place within 4 KiB of the position: the same inode and first line, other bytes before the position -- the run treats the file as truncated and reads the new content from the beginning, so nothing written after the restart is lost; a copy made since the last run is read from the position first, an older one that shares the banner is taken the same way as a guess (a duplicate, never a loss; issue #74) | Expected. Let the service append (`>>`) and rotate the log with a tool instead |
 | `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config (or as `--check-config` lists a glob's match), or the file was never seen; given the glob itself it says `is a glob` | Use the exact path; `--reset-state` with no path forgets everything |
 | A glob mails nothing, or a file it should read is missing from `--check-config` | The glob matches nothing where it looks (`matches nothing`), or the file is left out as a rotated copy (`left out:` -- a name ending in `.N` or a date such as `app.2024`, a `.bak` or `.gz` twin), or it is not a regular file or is a symbolic link (`passed over:`) | `logalert --check-config` names every match and everything left out; list a wanted file by name, or set `include_archives = yes` for a directory of dated live files |
 | `[section] /var/log/app/current: is a symbolic link owned by app to a file owned by root; not followed (...)` (exit 1) | A listed path is a link whose owner is neither root, nor the running user, nor the owner of the file it points to -- in a directory another user owns, what the name resolves to is that user's choice | List the file itself, or make the link root's (`chown -h root <link>`); a link another user planted is the reason the rule exists |

@@ -190,6 +190,13 @@ its notes.
   where the same lines went out on every run; now they go out once more, when
   the room is back. `cat` of the lock shows `unsaved <bytes>`.
 
+- `[contract]` **A file truncated and refilled past the saved position with
+  the same first line is caught as a truncation, not read on from the stale
+  offset** (#34). The old rules -- inode, first line, size -- read a fragment
+  and lost the refill's lines before it, silently. The entry gains an optional
+  `anchor` (up to 4 KiB before the position, hashed as read), which #66's
+  in-run check compares too; a 0.1.0 entry is trusted once.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

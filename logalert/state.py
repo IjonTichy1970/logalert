@@ -35,7 +35,10 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
     was last read, so an unchanged archive is not decompressed again; issue #65: what the
     rotated copy a cursor is parked on looked like, so the next run finds that copy by
     its mtime before guessing by content) are optional too;
-    0.1.0's reader drops them on save and the schema version stays 1.
+    0.1.0's reader drops them on save and the schema version stays 1. So is ``anchor``
+    (issue #34: what the bytes before ``offset`` hashed to as the run read them, so a
+    file truncated and refilled past the position with the same first line is not
+    continued into); a cursor without one is trusted once and gains it on the next save.
     A cursor's ``line`` (the complete lines before ``offset``, so a report can number lines
     as the file does) is optional: a file without it is read, counted once, and updated.
   * A run as root against a state file another user owns is refused up front: ``mkstemp``
@@ -100,6 +103,9 @@ class Cursor:
     size: int | None = None  # the file's st_size at the read (issue #44); None before it
     mtime: float | None = None  # its st_mtime; a compressed file with both unchanged is
     #                             not opened again
+    anchor: str | None = None  # sha256 of the (at most 4 KiB of) bytes before offset, as
+    #                            read (issue #34); None from 0.1.0, on a compressed file
+    #                            and on a parked copy
 
 
 RunRecord = dict[str, str]  # glob, as written in ``files`` -> ISO 8601 UTC seconds, the run START
@@ -336,7 +342,8 @@ def _cursor(fields: dict[str, Any], corrupt: Any, where: str) -> Cursor:
         raise corrupt(f"entries{where}: 'last_seen' is not a UTC timestamp") from None
     return Cursor(offset=offset, ino=ino, dev=dev, fingerprint=fp, realpath=realpath,
                   last_seen=last_seen, line=line, size=size,
-                  mtime=None if mtime is None else float(mtime))
+                  mtime=None if mtime is None else float(mtime),
+                  anchor=text("anchor", optional=True))
 
 
 def check_state_dir(state_file: str) -> None:

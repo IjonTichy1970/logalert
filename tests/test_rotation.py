@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 
 from logalert import rotation
-from logalert.cursor import NUL, BinaryStream, Line, LogFile, open_log
+from logalert.cursor import ANCHOR_CAP, NUL, BinaryStream, Line, LogFile, anchor_of, open_log
 from logalert.rotation import (
     Archive,
     CatchUpSource,
@@ -3029,3 +3029,93 @@ def test_context_before_after_a_truncation_under_the_handle_is_empty(tmp_path: P
                                           Line("old 2", False, 2, str(path))]
         _copytruncate(tmp_path, b"new A" + NLB + b"new B" + NLB + b"new C" + NLB)
         assert live.context_before(2) == []
+
+# -- the anchor: a refill with the same first line past the position (issue #34) ---------------
+
+
+def _banner(prefix: bytes, n: int) -> bytes:
+    return b"BANNER" + NLB + b"".join(prefix + b" %03d" % k + NLB for k in range(n))
+
+
+def test_a_refill_with_the_same_first_line_reads_the_copy_then_the_new_file(
+        tmp_path: Path) -> None:
+    """The measured bug with a copytruncate copy beside the file: the run continued at the
+    stale offset (the copy's tail lines and the refill's first 168 lost, a fragment sent).
+    The anchor calls it truncated, the copy holds the position by content, and the new
+    file is read from its top."""
+    path = tmp_path / "router.log"
+    saved = seen(path, _banner(b"old", 200))
+    append(path, b"".join(b"old %03d" % k + NLB for k in range(200, 230)))
+    (tmp_path / "router.log.1").write_bytes(path.read_bytes())  # the copytruncate copy
+    refill = _banner(b"new", 400)
+    path.write_bytes(refill)  # truncated and refilled: the same inode, the same banner
+    assert path.stat().st_ino == saved.ino and len(refill) > saved.offset
+    source, lines, cursor = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.verdict == "truncated"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.1")
+    assert lines == [f"old {k:03d}" for k in range(200, 230)] + ["BANNER"] + [
+        f"new {k:03d}" for k in range(400)]
+    assert cursor is not None and cursor.offset == len(refill)
+    assert cursor.anchor == anchor_of(refill[-ANCHOR_CAP:])
+    _, again, _ = run(path, cursor)
+    assert again == []  # and the anchor it recorded is the new file's
+
+
+def test_a_refill_under_the_handle_with_the_same_first_line_is_caught_by_the_tail(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """#66's in-run check with the one refill it could not see: the copytruncate lands
+    while the reader is chunks in and the writer refills past the position with the
+    same first line. The size and the first line pass; the bytes before the position
+    do not (the mutant yielded the refill's lines as old ones), and the next run finds
+    the rest in the copy by content, then reads the new file from its top."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    body = b"".join(b"line %05d" % n + NLB for n in range(8000))  # ~80 KiB: two chunks
+    append(path, body)
+    caplog.set_level(logging.WARNING, logger="logalert.cursor")
+    with LogFile(SECTION, str(path), saved) as live:
+        stream = live.lines()
+        first = [next(stream).text for _ in range(100)]
+        refill = OLD + b"".join(b"new %05d" % n + NLB for n in range(8000))  # past it
+        _copytruncate(tmp_path, refill)  # under the handle, the first line kept
+        rest = texts(list(stream))
+        assert live.reader.truncated
+        cursor = live.cursor()
+    assert first == [f"line {n:05d}" for n in range(100)]
+    assert rest and all(line.startswith("line ") for line in rest)  # nothing of the refill
+    assert cursor.fingerprint == saved.fingerprint and cursor.offset < len(OLD) + len(body)
+    assert len(refill) > cursor.offset  # past the position at the check: the size rule passed
+    assert cursor.anchor == anchor_of((OLD + body)[:cursor.offset][-ANCHOR_CAP:])
+    assert [r.getMessage() for r in caplog.records] == [
+        f"[{SECTION}] {path}: truncated under us during the read (a copytruncate during "
+        f"the run?); stopping at offset {cursor.offset}"]
+    source, lines, _ = run(path, cursor)
+    assert isinstance(source, CatchUpSource) and source.verdict == "truncated"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.1")
+    assert lines == [f"line {n:05d}" for n in range(len(first) + len(rest), 8000)] + [
+        "old 1", "old 2"] + [f"new {n:05d}" for n in range(8000)]
+
+
+def test_a_cursor_parked_on_a_copy_has_no_anchor_and_resolves_as_before(
+        tmp_path: Path) -> None:
+    """The copy is immutable and is found by its mtime, inode or content (issue #65); the
+    anchor describes a live file's bytes and a parked entry carries none. The live file's
+    entry gains one as soon as it is read."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    assert saved.anchor == anchor_of(OLD)
+    append(path, SINCE)
+    rotate(path, tmp_path / "router.log.1")  # nocreate: the live file is absent
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    with source:
+        stream = source.lines()
+        assert next(stream).text == "since 1"  # a consumer that stops part-way
+        parked = source.cursor()
+    assert parked.anchor is None and parked.mtime is not None
+    assert parked.ino == (tmp_path / "router.log.1").stat().st_ino
+    path.write_bytes(LIVE)
+    again, lines, cursor = run(path, parked)
+    assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
+    assert lines == ["since 2", "live 1"]
+    assert cursor is not None and cursor.anchor == anchor_of(LIVE)

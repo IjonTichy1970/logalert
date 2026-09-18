@@ -156,6 +156,7 @@ from logalert.cursor import (
     lines_before,
     lines_from_window,
     open_log,
+    tail_of,
     window_for,
 )
 from logalert.state import Cursor, parse_timestamp, timestamp
@@ -479,7 +480,7 @@ def _content_matches(section: str, path: str, archive: Archive, saved: Cursor, *
         if archive.size < saved.offset:
             handle.close()
             return False
-        return Verified(handle, current, _tail_of(handle, saved.offset, TAIL), None)
+        return Verified(handle, current, tail_of(handle, saved.offset, TAIL), None)
     except _READ_ERRORS as exc:
         handle.close()
         log.warning("[%s] %s: rotated copy %s could not be read (%s); skipped",
@@ -506,23 +507,6 @@ def _forward(handle: BinaryStream, offset: int, keep: int) -> tuple[bool, bytes,
         position += len(chunk)
         tail = (tail + chunk)[-keep:] if keep else b""
     return True, tail, newlines
-
-
-def _tail_of(handle: BinaryStream, offset: int, keep: int) -> bytes:
-    """The last ``keep`` bytes before ``offset`` of a plain file (a seek is free there), the
-    position left at the offset."""
-    start = max(0, offset - keep)
-    handle.seek(start)
-    parts: list[bytes] = []
-    remaining = offset - start
-    while remaining > 0:
-        chunk = handle.read1(remaining)
-        if not chunk:
-            break
-        parts.append(chunk)
-        remaining -= len(chunk)
-    handle.seek(offset)
-    return b"".join(parts)
 
 
 @dataclass
