@@ -33,6 +33,13 @@ export PYTHONDONTWRITEBYTECODE=1
 # CDPATH in the caller's environment cannot silently send us to a different directory.
 cd -- "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)" || exit 1
 
+# The tools' versions, once, before the first stage: the extras let them float (`ruff>=0.5`,
+# `mypy>=1.10`, `pytest>=8`, `markdown>=3.5`), so a tool release can redden an unchanged tree once
+# or twice a year, and this line is what makes that diagnosable from the log (issue #52). A
+# distributions() scan rather than four version() calls: a missing extra reads MISSING here
+# instead of failing three stages further down without a name.
+python -c 'import sys, importlib.metadata as m; have = {str(d.metadata.get("Name", "")).lower(): str(d.version) for d in m.distributions()}; print("tools: python %d.%d.%d, " % sys.version_info[:3] + ", ".join(n + " " + have.get(n, "MISSING") for n in ("ruff", "mypy", "pytest", "markdown")))'
+
 FAILED=""
 SKIPPED=""
 stage() {

@@ -32,13 +32,13 @@ jobs:
         # (tests/test_install_doc.py pins the two together with requires-python); 3.11 is the floor
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The changelog-refs stage reads history back to the last release commit. On the
           # default one-commit shallow clone it measures nothing and exits 2 (could not check),
           # which the gate reports as red.
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - run: |

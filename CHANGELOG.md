@@ -244,6 +244,13 @@ its notes.
   issues, commits and files. `reflow_md.py`'s four fence walks are one
   generator, byte-identical over every document in the tree.
 
+- `[internal]` **The workflows use `checkout@v7` and `setup-python@v7`, and the
+  gate prints its tools' versions once at the top** (#52). The v4 and v5
+  majors declare Node 20, which every job was annotated as forced onto Node
+  24; nothing in the newer majors' notes reaches these workflows. The extras
+  let ruff, mypy, pytest and markdown float, so a drift that reddens an
+  unchanged tree is now diagnosable from one line of the log.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty
