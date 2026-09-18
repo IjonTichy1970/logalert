@@ -155,6 +155,88 @@ its notes.
   a numbered live sibling is never chained as a copy; the epoch suffix no
   longer goes through `fromtimestamp`, which overflows on a 32-bit `time_t`.
 
+- `[contract]` **A position parked on a rotated copy records that copy's
+  modification time, and the next run takes the copy with that time and first
+  line before any guess by content** (#65). A banner log's newer copy fit the
+  content check and the run resumed inside the wrong file, silently; a reused
+  inode with the same first line was taken too. The state gains two optional
+  fields on such an entry.
+
+- `[contract]` **When no rotated copy holds the saved position, the copies
+  written since are read before the live file instead of being skipped** (#64).
+  After a rotation gap deeper than `rotate` keeps -- routine after a stop under
+  a tight `rotate` -- every line of those copies was lost with the copies in
+  the directory. A refused delivery now keeps the entry's sighting too (touched
+  once halfway to `state_ttl`), so the gap's bound stays at the position.
+
+- `[contract]` **A live file rotated and compressed while the plan was made
+  is read once, from the copy** (#67). gzip finishing inside that window made
+  the `.gz` a chain member beside the handle it was made from, and the file's
+  lines were mailed twice. The handle is skipped when the last copy read has
+  its first line, its modification time and at least its length; any of the
+  three failing keeps the read.
+
+- `[contract]` **A `copytruncate` that lands under the open handle is caught
+  by the reader, chunk by chunk: what it read from the truncated file is
+  dropped and the position kept is from before** (#66). The old cursor paired
+  the old first line with an offset into the new content: lines lost, then a
+  fragment and a duplicate (measured with real logrotate). One WARNING line;
+  the next run finds the copy by content.
+
+- `[contract]` **A run whose mail went out and whose state then could not be
+  saved marks the lock file, and the next run sends nothing until a save that
+  reaches that size plus a block proves the room** (#70). The #30 refusal left
+  a band -- room for the positions as they were, none for what a run adds --
+  where the same lines went out on every run; now they go out once more, when
+  the room is back. `cat` of the lock shows `unsaved <bytes>`.
+
+- `[contract]` **A file truncated and refilled past the saved position with
+  the same first line is caught as a truncation, not read on from the stale
+  offset** (#34). The old rules -- inode, first line, size -- read a fragment
+  and lost the refill's lines before it, silently. The entry gains an optional
+  `anchor` (up to 4 KiB before the position, hashed as read), which #66's
+  in-run check compares too; a 0.1.0 entry is trusted once.
+
+- `[internal]` **The test helpers every module copied live once, in
+  `tests/conftest.py`** (#43). The `Site` fixture, the scandir denial, the
+  `-m logalert` runner, the tried symlink, the fence scanner and the rotation
+  helpers; the fake MTA's knob list had already drifted by one between two
+  copies. Nine symlink tests now try the link instead of skipping on Windows
+  outright, and no check-config test reaches `getfqdn()` by accident.
+
+- `[internal]` **A 3.14 build without `compression.zstd` fails the one `.zst`
+  read test instead of skipping it** (#42). The skip was announced only, and
+  the gate's verdict counts an announced skip as green by design; the read
+  path would have been measured nowhere. Below 3.14 nothing changes.
+
+- `[internal]` **Seven behaviours the audit's mutation run found unpinned are
+  pinned, each red under its mutant on the platform where it is real** (#41).
+  The glob record's moment is the run's start (a frozen clock could not tell);
+  a configured section's record survives an outage longer than `state_ttl`;
+  root's own state is not foreign (faked uids, so CI sees it); the dry run's
+  console guard; an empty state file is corrupt; three boundaries.
+
+- `[contract]` **A glob's wildcard directory component over a directory the
+  user can list but not search is a failed item (exit 1) where the listing
+  carries no `d_type`, not silence** (#71). Every candidate's `is_dir` is an
+  `lstat` the parent refuses (ext4 without `filetype`, XFS `ftype=0`, some
+  FUSE and network mounts), and each was dropped without a word, the glob's
+  moment moving on. The line is #38's: `cannot examine N of the M entries`.
+
+- `[contract]` **The documented systemd unit carries `TimeoutStartSec=3600`, and
+  the docs say which hardening lines break the mail path** (#36). A oneshot
+  has no start timeout of its own and the timer never starts an activating
+  unit: a wedged run silenced the schedule for good, and the two lock verdicts
+  are cron's. `NoNewPrivileges=` and its kin make a setgid `sendmail` keep the
+  caller's group (measured); the Linux stage verifies the documented text.
+
+- `[internal]` **The PreToolUse guard is launched through `python`, then
+  `python3`, and refuses every Bash command when neither is on PATH; the gate
+  runs the command as spelled** (#55). On a stock Debian or Ubuntu the bare
+  `python` exited 127 and Claude Code let every command through, announced but
+  inert, with the guard's gate stage green. Three checks now run the string
+  itself: the venv off PATH, a `python3`-only PATH, an empty one.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

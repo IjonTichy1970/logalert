@@ -101,7 +101,12 @@ bash tools/gate.sh > gate.out 2>&1; rc=$?
 ```
 
 On the Windows dev host the Linux-only stage runs inside a WSL sandbox; see
-`CLAUDE.md` for the sandbox rules. Changes are tracked in
+`CLAUDE.md` for the sandbox rules. The Claude Code hook in
+`.claude/settings.json` runs the shell-text guard through `python`, then
+`python3`, and refuses every Bash command when neither is on the PATH of the
+shell Claude Code runs in (a stock Debian or Ubuntu has `python3` only);
+the gate's `shell guard tests` stage runs that command as spelled, with the
+venv off PATH, so an inert guard is a red gate. Changes are tracked in
 [CHANGELOG.md](CHANGELOG.md).
 
 ## License

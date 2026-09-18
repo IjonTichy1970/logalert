@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_run import Site
+from conftest import Site, try_symlink
 
 import logalert.activity as activity
 from logalert.activity import OneLine, attach
@@ -28,11 +28,6 @@ from logalert.config import ConfigError, load_config, udp_address
 
 NL = chr(10)
 STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} logalert\[\d+\]: ")
-
-
-@pytest.fixture
-def site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Site:
-    return Site(tmp_path, monkeypatch)
 
 
 def raw_lines(path: Path) -> list[str]:
@@ -563,12 +558,10 @@ def test_a_fifo_as_the_log_destination_is_refused_not_opened(
 
 def test_a_symlink_at_the_log_path_is_refused_and_the_target_untouched(
         site: Site, capsys: pytest.CaptureFixture[str]) -> None:
-    if sys.platform == "win32":
-        pytest.skip("creating a symlink needs a privilege here; runs in the sandbox and on CI")
     victim = site.root / "victim"
     victim.write_text("VICTIM LINE" + NL, encoding="utf-8")
     planted = site.root / "planted.log"
-    os.symlink(victim, planted)
+    try_symlink(planted, victim)
     assert site.run("--log", f"file:{planted.as_posix()}") == 0
     lines = capsys.readouterr().err.splitlines()
     assert lines[0] == (f"logalert: warning: cannot open the activity log {planted.as_posix()} "

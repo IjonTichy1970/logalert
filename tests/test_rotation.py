@@ -16,14 +16,15 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import SECTION, append, run, seen, texts, try_symlink
 
 from logalert import rotation
-from logalert.cursor import BinaryStream, Line, LogFile, open_log
+from logalert.cursor import ANCHOR_CAP, NUL, BinaryStream, Line, LogFile, anchor_of, open_log
 from logalert.rotation import (
     Archive,
     CatchUpSource,
@@ -33,40 +34,10 @@ from logalert.rotation import (
     plan_catch_up,
     scan_directories,
 )
-from logalert.state import Cursor
+from logalert.state import Cursor, State, load_state, parse_timestamp, timestamp
 
-SECTION = "router-disk"
 NLB = chr(10).encode()  # a newline as bytes, for fixtures built in a comprehension
 NOWHERE = 2**40 + 7  # an inode number no filesystem in a test will hand out
-
-
-def texts(lines: list[Line]) -> list[str]:
-    return [line.text for line in lines]
-
-
-def run(path: Path, saved: Cursor | None, *, archive_dir: Path | None = None,
-        from_start: bool = False) -> tuple[object, list[str], Cursor | None]:
-    """One run over the file: (the source, its lines, the cursor to save)."""
-    source = open_source(SECTION, str(path), saved, from_start=from_start,
-                         archive_dir=str(archive_dir) if archive_dir else None)
-    if source is None:
-        return None, [], None
-    with source:
-        lines = texts(list(source.lines()))
-        return source, lines, source.cursor()
-
-
-def seen(path: Path, content: bytes) -> Cursor:
-    """A cursor that has read ``content`` as the live file: what the previous run saved."""
-    path.write_bytes(content)
-    _, _, cursor = run(path, None, from_start=True)
-    assert cursor is not None
-    return cursor
-
-
-def append(path: Path, data: bytes) -> None:
-    with open(path, "ab") as handle:
-        handle.write(data)
 
 
 def compress_to(target: Path, data: bytes) -> None:
@@ -533,7 +504,10 @@ def test_archive_shorter_than_the_offset_is_not_ours(
     caplog.set_level(logging.WARNING, logger="logalert")
     source, lines, _ = run(path, replace(saved, ino=NOWHERE))
     assert isinstance(source, CatchUpSource) and source.plan.match is None
-    assert lines == ["live 1"]
+    # not the holder -- but written since the last run, so read whole (issue #64): new
+    # content where every file opens with the same line, a duplicate where it is a
+    # restored backup with a fresh mtime; never a loss
+    assert lines == ["old 1", "old 2", "live 1"]
     assert any("no rotated copy holds the saved position" in r.getMessage()
                for r in caplog.records)
 
@@ -572,22 +546,26 @@ def test_nocreate_absent_live_file_reads_the_archive_now(tmp_path: Path) -> None
     assert cursor is not None
     assert cursor.ino == (tmp_path / "router.log.1").stat().st_ino
     assert cursor.offset == len(OLD + SINCE)
-    # the writer comes back; the next run resolves the archive by inode and reads it no further
+    # the writer comes back; the next run resolves the archive by its mtime (issue #65;
+    # by inode before) and reads it no further
     path.write_bytes(LIVE)
     source, lines, cursor2 = run(path, cursor)
     assert isinstance(source, CatchUpSource) and lines == ["live 1"]
-    assert source.plan.stage == "inode"  # the parked cursor resolves; no false warning
+    assert source.plan.stage == "mtime"  # the parked cursor resolves; no false warning
     assert cursor2 is not None and cursor2.ino == path.stat().st_ino
-    # and when the archive was compressed in between: resolved by content, nothing twice
+    # and when the archive was compressed in between: a new inode, the mtime kept as gzip
+    # keeps it -- resolved by mtime (by content before #65), nothing twice
     saved = seen(path, OLD)
     append(path, SINCE)
     rotate(path, tmp_path / "router.log.1")
     _, lines, parked = run(path, saved)
     assert lines == ["since 1", "since 2"] and parked is not None
     rotate(tmp_path / "router.log.1", tmp_path / "router.log.1.gz", compress=True)
+    assert parked.mtime is not None
+    os.utime(tmp_path / "router.log.1.gz", (parked.mtime, parked.mtime))
     path.write_bytes(LIVE)
     source, lines, _ = run(path, parked)
-    assert isinstance(source, CatchUpSource) and source.plan.stage == "content"
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
     assert lines == ["live 1"]
 
 
@@ -609,10 +587,7 @@ def test_repointed_symlink_is_logged_and_the_search_follows_the_target(
     real.mkdir()
     target = real / "router.log"
     link = tmp_path / "router.log"
-    try:
-        link.symlink_to(target)
-    except OSError:
-        pytest.skip("creating a symlink needs a privilege here; runs in the sandbox and on CI")
+    try_symlink(link, target)
     saved = seen(link, OLD)
     assert saved.realpath == os.path.realpath(target)
     append(link, SINCE)
@@ -901,10 +876,7 @@ def test_symlinked_entries_are_never_candidates(tmp_path: Path) -> None:
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     (elsewhere / "foreign.log").write_bytes(b"not this log\n")
-    try:
-        (tmp_path / "router.log.1").symlink_to(elsewhere / "foreign.log")
-    except OSError:
-        pytest.skip("creating a symlink needs a privilege here; runs in the sandbox and on CI")
+    try_symlink(tmp_path / "router.log.1", elsewhere / "foreign.log")
     path.write_bytes(LIVE)
     _, lines, _ = run(path, saved)
     assert lines == ["since 1", "since 2", "live 1"]
@@ -1224,8 +1196,12 @@ def test_a_rotation_between_the_scan_and_the_content_stage_is_found_by_a_rescan(
 def test_a_second_rename_inside_one_plan_reaches_the_warning_with_its_cause(
         tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The rescan is once: renamed under again, the plan gives up as before, and the
-    warning's first cause says why (the old text named four causes, none of them this)."""
+    """The rescan is once: renamed under again, the plan gives up, and the warning's first
+    cause says why (the old text named four causes, none of them this). The copies the
+    stale listing names are then tried (issue #64) and the first is renamed under too:
+    the stop, nothing read, the saved position kept -- and the next run, under the
+    settled names, reads every line once (the old answer read the live handle from 0
+    and lost the archives for good)."""
     if sys.platform == "win32":
         pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
                     "the sandbox and on CI")
@@ -1242,13 +1218,18 @@ def test_a_second_rename_inside_one_plan_reaches_the_warning_with_its_cause(
 
     monkeypatch.setattr(rotation, "scan_directories", scan_then_rotate)
     caplog.set_level(logging.WARNING, logger="logalert.rotation")
-    _, lines, _ = run(path, saved)
+    source, lines, cursor = run(path, saved)
     assert calls["n"] == 2  # once more, never a third time
-    assert lines == ["live 1"]  # the live file the run opened, from 0; the archives are lost
+    assert isinstance(source, CatchUpSource) and source.stopped
+    assert lines == [] and cursor == saved  # nothing read: the names had moved on again
     warned = [r.getMessage() for r in caplog.records if "no rotated copy" in r.getMessage()]
     assert len(warned) == 1
     assert "likely causes: a second rotation during this run (a copy was renamed twice), " \
         "rotate 0, " in warned[0]  # first, before the four old causes
+    assert any("stopping here, the next run resumes after the saved position"
+               in r.getMessage() for r in caplog.records)
+    _, rest, _ = run(path, saved)  # the names settled: the holder is found, then the rest
+    assert rest == ["since 1", "middle 1", "live 1", "live 2", "live 3"]
 
 
 def test_the_holder_gone_at_the_content_stage_is_found_again_under_its_new_name(
@@ -1371,10 +1352,16 @@ def test_one_rename_then_the_copy_gone_names_no_second_rotation(
     caplog.set_level(logging.WARNING, logger="logalert.rotation")
     _, lines, _ = run(path, saved)
     assert calls["n"] == 2
-    assert lines == ["live 1"]  # the live file the run opened, from 0
+    # the copy rotated meanwhile (.2 = middle 1; the live handle's file is .1 by now and
+    # excluded), then the live file the run opened, from 0 (issue #64: "live 1" alone
+    # before, middle 1 lost)
+    assert lines == ["middle 1", "live 1"]
     warned = [r.getMessage() for r in caplog.records if "no rotated copy" in r.getMessage()]
     assert len(warned) == 1 and "the archive aged out" in warned[0]
     assert "a second rotation" not in warned[0]
+    assert warned[0].endswith("reading the 1 rotated copy written since the last run from "
+                              "the beginning (router.log.2), then the live file; what was "
+                              "written between the last run and the oldest of them is lost")
 
 
 def test_an_unreadable_chain_member_is_skipped_not_a_stop(
@@ -1436,10 +1423,7 @@ def test_a_parked_cursor_carries_the_logs_real_path_not_the_archives(
     real.mkdir()
     target = real / "router.log"
     link = tmp_path / "current.log"
-    try:
-        link.symlink_to(target)
-    except OSError:
-        pytest.skip("creating a symlink needs a privilege here; runs in the sandbox and on CI")
+    try_symlink(link, target)
     saved = seen(link, OLD)
     append(link, b"since 1" + NLB)
     rotate(target, real / "router.log.2")
@@ -1484,9 +1468,12 @@ def test_an_unreadable_copy_is_warned_about_once_in_the_errnos_words_and_named_a
     monkeypatch.setattr("logalert.rotation.open_log", refuse)
     caplog.set_level(logging.WARNING, logger="logalert.rotation")
     _, lines, cursor = run(path, saved)
-    assert lines == ["live 1"]
+    assert lines == ["middle 1", "live 1"]  # the readable copy written since (#64)
     assert cursor is not None and cursor.ino == path.stat().st_ino
     warned = _warnings(caplog)
+    assert warned[-1].endswith("reading the 1 rotated copy written since the last run from "
+                               "the beginning (router.log.1), then the live file; what was "
+                               "written between the last run and the oldest of them is lost")
     assert warned == [
         f"[{SECTION}] {path}: rotated copy {holder} could not be read (Permission denied); "
         f"skipped",
@@ -1509,7 +1496,7 @@ def test_a_copy_the_mode_refuses_is_one_warning_and_the_cause(
         _, lines, _ = run(path, saved)
     finally:
         (tmp_path / "router.log.2").chmod(0o644)
-    assert lines == ["live 1"]
+    assert lines == ["middle 1", "live 1"]  # the readable copy written since (issue #64)
     warned = _warnings(caplog)
     assert len(warned) == 2 and warned[0].endswith("could not be read (Permission denied); skipped")
     assert "(named above), rotate 0" in warned[1]
@@ -1860,7 +1847,7 @@ def test_a_permission_names_the_failed_item_a_corrupt_copy_does_not(
 
     monkeypatch.setattr("logalert.rotation.open_log", refuse)
     source, lines, _ = run(path, saved)
-    assert isinstance(source, CatchUpSource) and lines == ["live 1"]
+    assert isinstance(source, CatchUpSource) and lines == ["middle 1", "live 1"]
     assert source.plan.denied == ("a permission kept the rotated copies out of reach "
                                   "(router.log.2); the lines before the rotation are lost")
     monkeypatch.setattr("logalert.rotation.open_log", real_open)
@@ -1928,3 +1915,1169 @@ def test_a_chain_member_a_permission_refuses_is_the_item_too(
     assert source.failed_item() == ("a permission kept a rotated copy out of reach "
                                     "(router.log.1); its lines are lost")
     assert cursor is not None and cursor.ino == path.stat().st_ino  # moved on
+
+
+# -- a parked cursor's identity: the copy's mtime (issue #65) -----------------------------------
+
+
+BANNER = b"=== router boot log ===" + NLB
+
+
+def _banner_stop(tmp_path: Path) -> tuple[Path, Cursor]:
+    """S8 (the #32 review): a banner log. .2 = BANNER + OLD + 'since 1' (the holder), .1 =
+    BANNER + middle 1..3 (longer than the saved offset), live = BANNER + live 1. The run stops
+    at .1 (compressed away between the plan and its open, real on every platform) and parks
+    on .2 after 'since 1'; the cursor carries .2's mtime."""
+    path = tmp_path / "router.log"
+    saved = seen(path, BANNER + OLD)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(BANNER + b"middle 1" + NLB + b"middle 2" + NLB + b"middle 3" + NLB)
+    (tmp_path / "router.log.1").replace(tmp_path / "router.log.2")
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(BANNER + b"live 1" + NLB)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    (tmp_path / "router.log.1").unlink()
+    with source:
+        assert texts(list(source.lines())) == ["since 1"]
+        parked = source.cursor()
+    assert parked.ino == (tmp_path / "router.log.2").stat().st_ino
+    assert parked.mtime == (tmp_path / "router.log.2").stat().st_mtime
+    assert parked.size == (tmp_path / "router.log.2").stat().st_size
+    return path, parked
+
+
+def _a_minute_later(cursor: Cursor) -> Cursor:
+    """The next run, a minute on: the copies rotated meanwhile carry later mtimes (set by the
+    caller), the parked copy is older than last_seen - 2 s."""
+    return replace(cursor, last_seen=timestamp(datetime.now(UTC) + timedelta(seconds=60)))
+
+
+def _later(*paths: Path) -> None:
+    """Written after the stop: two minutes on, so they are `recent` at the next run."""
+    stamp = time.time() + 120
+    for path in paths:
+        os.utime(path, (stamp, stamp))
+
+
+def _shift_after_the_stop(tmp_path: Path, fresh: bytes) -> None:
+    """logrotate's shift over the stop's layout (.2 plain, .1 compressed away):
+    .2 -> .3, .1.gz -> .2.gz, the live file -> .1, a fresh live file."""
+    (tmp_path / "router.log.2").replace(tmp_path / "router.log.3")
+    (tmp_path / "router.log.1.gz").replace(tmp_path / "router.log.2.gz")
+    (tmp_path / "router.log").replace(tmp_path / "router.log.1")
+    (tmp_path / "router.log").write_bytes(fresh + NLB)
+
+
+def test_a_parked_cursor_is_found_by_its_mtime_before_a_banner_guess(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Measured (the #32 review, S8): the content stage took the oldest recent copy that was
+    long enough -- the newer banner copy -- and the run resumed inside the wrong file, at
+    INFO. The parked copy's mtime names it, and it is taken first."""
+    path, parked = _banner_stop(tmp_path)
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")  # .3 is the parked copy
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    caplog.set_level(logging.INFO, logger="logalert.rotation")
+    source, rest, cursor = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.3")
+    assert rest == ["=== router boot log ===", "middle 1", "middle 2", "middle 3",
+                    "=== router boot log ===", "live 1", "=== router boot log ===", "live 2"]
+    assert any("found the saved position by mtime; reading router.log.3 from" in r.getMessage()
+               for r in caplog.records)
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+    assert cursor.mtime is None and cursor.size is None  # the live file's cursor carries none
+
+
+def test_the_mtime_stage_beats_a_reused_inode_with_the_same_first_line(tmp_path: Path) -> None:
+    """Measured natively (the #32 review, S3): the parked copy compressed away, a same-first-line
+    impostor got its freed inode number and the inode stage took it; its chain then mailed
+    the parked copy whole again. The reuse is fabricated here by pointing the parked cursor
+    at the impostor's inode; the copy's mtime, kept by the compressor, wins."""
+    path, saved = _two_rotations(tmp_path)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    (tmp_path / "router.log.1").unlink()
+    with source:
+        assert texts(list(source.lines())) == ["since 1"]
+        parked = source.cursor()  # on .2, at its end
+    _shift_after_the_stop(tmp_path, b"live 2")
+    kept = (tmp_path / "router.log.3").stat().st_mtime
+    rotate(tmp_path / "router.log.3", tmp_path / "router.log.3.gz", compress=True)
+    os.utime(tmp_path / "router.log.3.gz", (kept, kept))  # gzip keeps the mtime (measured)
+    compress_to(tmp_path / "router.log.4.gz", OLD + b"ancient" + NLB)  # the same first line
+    ancient = kept - 600
+    os.utime(tmp_path / "router.log.4.gz", (ancient, ancient))
+    impostor = (tmp_path / "router.log.4.gz").stat()
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    reused = replace(_a_minute_later(parked), ino=impostor.st_ino, dev=impostor.st_dev)
+    again, rest, _ = run(path, reused)
+    assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
+    assert again.plan.match is not None and again.plan.match.path.endswith("router.log.3.gz")
+    assert rest == ["middle 1", "live 1", "live 2"]  # nothing of the parked copy again
+
+
+def test_a_compressor_that_kept_whole_seconds_still_names_the_parked_copy(
+        tmp_path: Path) -> None:
+    """bzip2 by hand TRUNCATES the mtime to the second (measured: .9 -> .0; gzip and xz keep
+    it); the stage compares whole seconds, so a fraction above .5 must still hit."""
+    path, parked = _banner_stop(tmp_path)
+    whole = float(int(parked.mtime or 0))
+    parked = replace(parked, mtime=whole + 0.75)  # as the copy would have been stamped
+    os.utime(tmp_path / "router.log.2", (whole + 0.75, whole + 0.75))
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")
+    rotate(tmp_path / "router.log.3", tmp_path / "router.log.3.bz2", compress=True)
+    os.utime(tmp_path / "router.log.3.bz2", (whole, whole))
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    source, rest, _ = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert rest[:4] == ["=== router boot log ===", "middle 1", "middle 2", "middle 3"]
+
+
+def test_a_parked_cursor_round_trips_its_copys_size_and_mtime_through_the_state(
+        tmp_path: Path) -> None:
+    path, parked = _banner_stop(tmp_path)
+    state = State(str(tmp_path / "state.json"))
+    state.set(SECTION, str(path), parked)
+    state.save()
+    loaded = load_state(str(tmp_path / "state.json")).get(SECTION, str(path))
+    assert loaded == parked and loaded.mtime == parked.mtime and loaded.size == parked.size
+
+
+def test_a_parked_cursor_with_no_first_line_is_confirmed_by_its_inode(tmp_path: Path) -> None:
+    """A copy with no complete first line cannot be confirmed by content; with the saved inode
+    under the recorded mtime it is the copy, else the stage passes."""
+    path = tmp_path / "router.log"
+    saved = seen(path, b"")
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(b"middle 1" + NLB)
+    (tmp_path / "router.log.1").replace(tmp_path / "router.log.2")
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(b"live 1" + NLB)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    (tmp_path / "router.log.1").unlink()
+    with source:
+        assert texts(list(source.lines())) == ["since 1"]
+        parked = source.cursor()
+    assert parked.fingerprint is not None and parked.mtime is not None
+    # a FABRICATED shape (a stop never parks on a copy without a first line; a listed
+    # compressed file's settled cursor is the one with a mtime and no hash): the
+    # inode confirms it
+    empty = replace(parked, fingerprint=None, offset=0, line=0)
+    _shift_after_the_stop(tmp_path, b"live 2")
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    again, rest, _ = run(path, _a_minute_later(empty))
+    assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
+    assert rest == ["since 1", "middle 1", "live 1", "live 2"]
+    # another inode under that mtime is not it: the stage passes
+    elsewhere = replace(empty, ino=NOWHERE)
+    third, _, _ = run(path, _a_minute_later(elsewhere))
+    assert isinstance(third, CatchUpSource) and third.plan.stage != "mtime"
+
+
+def test_the_recorded_mtime_is_the_opened_copys_not_the_names(tmp_path: Path) -> None:
+    """The stop's own shape: by the time the cursor is taken, the name the segment opened can
+    hold a different file (a shift landed); the fstat at the open is what is recorded, and a
+    stat of the name would record the shifted file's -- and take it by mtime next run."""
+    path, saved = _two_rotations(tmp_path)
+    original = (tmp_path / "router.log.2").stat()
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    (tmp_path / "router.log.1").unlink()
+    with source:
+        assert texts(list(source.lines())) == ["since 1"]
+        # the parked copy's handle is closed now: a shift lands before the cursor is taken
+        (tmp_path / "router.log.2").replace(tmp_path / "router.log.3")
+        (tmp_path / "router.log.1.gz").replace(tmp_path / "router.log.2.gz")
+        later = tmp_path / "router.log.2"
+        later.write_bytes(b"another" + NLB)
+        os.utime(later, (original.st_mtime + 120, original.st_mtime + 120))
+        parked = source.cursor()
+    assert parked.mtime == original.st_mtime and parked.size == original.st_size
+
+
+def test_the_mtime_stage_takes_named_archives_only(tmp_path: Path) -> None:
+    """A same-content copy under a hand-made name (cp -p) with the copy's mtime is not the
+    copy: it would bring other-style files into the chain."""
+    path, parked = _banner_stop(tmp_path)
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")
+    stray = tmp_path / "aaa-keep.log"  # listed before router.log.3 on every filesystem
+    stray.write_bytes((tmp_path / "router.log.3").read_bytes())
+    assert parked.mtime is not None
+    os.utime(stray, (parked.mtime, parked.mtime))
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    source, _, _ = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.3")
+
+
+def test_the_saved_identity_wins_a_same_second_tie_in_the_mtime_stage(tmp_path: Path) -> None:
+    """A numbered live sibling in the extension form (router.3.log, issue #51) with the banner
+    and the same second: the key tie goes to the saved identity, and the first hit ends the
+    search (NTFS lists the sibling first; ext4 either way)."""
+    path, parked = _banner_stop(tmp_path)
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")
+    sibling = tmp_path / "router.3.log"
+    sibling.write_bytes(BANNER + b"sibling 1" + NLB + b"sibling 2" + NLB + b"sibling 3" + NLB)
+    assert parked.mtime is not None
+    os.utime(sibling, (parked.mtime, parked.mtime))
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    source, rest, _ = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.3")
+    assert "sibling 1" not in rest
+
+
+def test_a_same_second_older_neighbour_does_not_beat_the_parked_copys_inode(
+        tmp_path: Path) -> None:
+    """Review of #65: numeric keys differ, so the order's tie-break never saw the inode, and
+    .3 -- an older generation with the banner, stamped in the same second, long enough --
+    was taken by mtime with the parked .2 read whole behind it (every line mailed again).
+    The copy's own inode comes first."""
+    path, parked = _banner_stop(tmp_path)  # parked on .2, its inode intact
+    assert parked.mtime is not None
+    older = tmp_path / "router.log.3"
+    older.write_bytes(BANNER + b"".join(b"ancient %d" % n + NLB for n in range(1, 5)))
+    os.utime(older, (parked.mtime, parked.mtime))
+    _later(tmp_path / "router.log.1.gz", path)
+    source, rest, _ = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.2")
+    assert rest == ["=== router boot log ===", "middle 1", "middle 2", "middle 3",
+                    "=== router boot log ===", "live 1"]
+
+
+def test_a_cp_p_twin_under_a_hand_made_name_does_not_beat_the_parked_copy(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Review of #65: router.log-2.bak is an `other`-style archive OF THIS LOG, so it is a
+    candidate, and cp -p keeps the nanoseconds; taken, it let a hand-copied file into the
+    chain as log lines. A named style comes before a hand-made one."""
+    path, parked = _banner_stop(tmp_path)
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")
+    twin = tmp_path / "router.log-2.bak"
+    twin.write_bytes((tmp_path / "router.log.3").read_bytes())
+    junk = tmp_path / "router.log.old"
+    junk.write_bytes(b"hand-copied junk" + NLB)
+    assert parked.mtime is not None
+    # the parked copy compressed since (a new inode: its identity cannot decide), the stamp
+    # kept to the nanosecond by gzip and by cp -p alike
+    stamp = os.stat(tmp_path / "router.log.3").st_mtime_ns
+    rotate(tmp_path / "router.log.3", tmp_path / "router.log.3.gz", compress=True)
+    os.utime(tmp_path / "router.log.3.gz", ns=(stamp, stamp))
+    os.utime(twin, ns=(stamp, stamp))
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1", junk)
+    caplog.set_level(logging.INFO, logger="logalert.rotation")
+    source, rest, _ = run(path, _a_minute_later(parked))
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.3.gz")
+    assert "hand-copied junk" not in rest
+    assert [os.path.basename(a.path) for a in source.plan.chain] == ["router.log.2.gz",
+                                                                     "router.log.1"]
+
+
+def test_the_parked_name_moved_inside_the_plan_makes_the_run_list_again(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #65: the parked copy compressed away between the listing and the stage's
+    open answered RENAMED, and the content stage then guessed over the stale listing (the
+    banner rival, mid-line). The stage returns instead, and the second listing finds the
+    copy under its new name by mtime."""
+    path, parked = _banner_stop(tmp_path)
+    _shift_after_the_stop(tmp_path, BANNER + b"live 2")
+    _later(tmp_path / "router.log.2.gz", tmp_path / "router.log.1")
+    assert parked.mtime is not None
+    stamp = parked.mtime
+
+    def compress_the_parked_copy() -> None:
+        rotate(tmp_path / "router.log.3", tmp_path / "router.log.3.gz", compress=True)
+        os.utime(tmp_path / "router.log.3.gz", (stamp, stamp))
+
+    real_scan = rotation.scan_directories
+    calls = {"n": 0}
+
+    def scan_then_compress(directories: list[str], base: str) -> Any:
+        found = real_scan(directories, base)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            compress_the_parked_copy()
+        return found
+
+    monkeypatch.setattr(rotation, "scan_directories", scan_then_compress)
+    source, rest, _ = run(path, _a_minute_later(parked))
+    assert calls["n"] == 2 and isinstance(source, CatchUpSource)
+    assert source.plan.stage == "mtime" and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.3.gz")
+    assert rest[:4] == ["=== router boot log ===", "middle 1", "middle 2", "middle 3"]
+
+
+# -- nothing matched: the copies written since the last run are read (issue #64) ---------------
+
+
+def _aged_out(tmp_path: Path) -> tuple[Path, Cursor]:
+    """rotate 2 with three rotations between two runs: the holder is gone, .2 = 'middle 1'
+    and .1 = 'live 1' were both written after the last run, the live file holds 'live 2'."""
+    path, saved = _two_rotations(tmp_path)
+    _third_rotation(tmp_path)
+    (tmp_path / "router.log.3").unlink()
+    return path, saved
+
+
+def test_the_copies_written_since_the_last_run_are_read_when_nothing_matched(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Measured (the #32 review, S4): the run read the live file alone and 'middle 1' and
+    'live 1' were lost with their copies sitting in the directory."""
+    path, saved = _aged_out(tmp_path)
+    caplog.set_level(logging.WARNING, logger="logalert")
+    source, lines, cursor = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is None
+    assert source.plan.stage == "" and [os.path.basename(a.path) for a in source.plan.chain] == [
+        "router.log.2", "router.log.1"]
+    assert lines == ["middle 1", "live 1", "live 2"]
+    assert cursor is not None and cursor.ino == path.stat().st_ino
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warned) == 1 and "the archive aged out" in warned[0]
+    assert warned[0].endswith(
+        "reading the 2 rotated copies written since the last run from the beginning "
+        "(router.log.2, then router.log.1), then the live file; what was written between the "
+        "last run and the oldest of them is lost")
+
+
+def test_a_stop_then_a_shift_that_drops_the_holder_loses_only_the_holders_tail(
+        tmp_path: Path) -> None:
+    """S4 itself: the stop parks on the holder, one more shift under rotate 2 drops it, and
+    the copies rotated meanwhile are read -- every surviving line once across the two runs."""
+    path, saved = _two_rotations(tmp_path)
+    # real time: the copies were written well before the run that stops (a minute and
+    # more here; hours in real life), so the last-seen bound alone would leave them
+    # out (review, both platforms) -- a parked cursor reads what is not older than the
+    # parked copy
+    for name, back in (("router.log.2", 90), ("router.log.1", 60), ("router.log", 30)):
+        os.utime(tmp_path / name, (time.time() - back, time.time() - back))
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    kept = (tmp_path / "router.log.1").stat().st_mtime
+    compress_to(tmp_path / "router.log.1.gz", (tmp_path / "router.log.1").read_bytes())
+    os.utime(tmp_path / "router.log.1.gz", (kept, kept))  # as gzip keeps it
+    (tmp_path / "router.log.1").unlink()
+    with source:
+        first = texts(list(source.lines()))
+        parked = source.cursor()
+    assert first == ["since 1"]
+    _shift_after_the_stop(tmp_path, b"live 2")
+    (tmp_path / "router.log.3").unlink()  # rotate 2: the parked copy is dropped
+    again, rest, _ = run(path, parked)
+    assert isinstance(again, CatchUpSource) and again.plan.match is None
+    assert rest == ["middle 1", "live 1", "live 2"]
+    assert first + rest == ["since 1", "middle 1", "live 1", "live 2"]
+
+
+def test_a_copy_from_before_the_last_run_is_never_read_when_nothing_matched(
+        tmp_path: Path) -> None:
+    """The mutation: a chain built from `older` too would mail lines sent long ago."""
+    path, saved = _aged_out(tmp_path)
+    ancient = tmp_path / "router.log.4"
+    ancient.write_bytes(b"ancient 1" + NLB)
+    os.utime(ancient, (1_700_000_000, 1_700_000_000))
+    _, lines, _ = run(path, saved)
+    assert lines == ["middle 1", "live 1", "live 2"]
+
+
+def test_an_other_style_copy_with_a_fresh_mtime_is_not_read_when_nothing_matched(
+        tmp_path: Path) -> None:
+    path, saved = _aged_out(tmp_path)
+    (tmp_path / "router.log.bak").write_bytes(b"a hand-made copy" + NLB)
+    _, lines, _ = run(path, saved)
+    assert lines == ["middle 1", "live 1", "live 2"]
+
+
+def test_the_copies_read_without_a_match_keep_to_one_naming_form(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A numbered live sibling in the extension form (router.1.log, issue #51) has a fresh
+    mtime and is not a copy; with classic copies present it stays out, and says so."""
+    path, saved = _aged_out(tmp_path)
+    (tmp_path / "router.1.log").write_bytes(b"sibling 1" + NLB)
+    caplog.set_level(logging.INFO, logger="logalert.rotation")
+    _, lines, _ = run(path, saved)
+    assert lines == ["middle 1", "live 1", "live 2"]
+    assert any("1 rotated copy named in the extension form (router.1.log) left out of the "
+               "copies read: the copies read keep to one naming form" in r.getMessage()
+               for r in caplog.records)
+    # the extension form alone: its compressed copies are read, a plain file in that
+    # form is not -- a numbered live sibling is a plain file in that form
+    (tmp_path / "router.log.2").unlink()
+    (tmp_path / "router.log.1").unlink()
+    (tmp_path / "router.1.log").replace(tmp_path / "router.3.log")  # the sibling, renumbered:
+    #   beside router.1.log.gz the twin rule would keep the plain one as a compression
+    #   in progress
+    compress_to(tmp_path / "router.2.log.gz", b"ext 2" + NLB)
+    compress_to(tmp_path / "router.1.log.gz", b"ext 1" + NLB)
+    caplog.clear()
+    _, lines, _ = run(path, saved)
+    assert lines == ["ext 2", "ext 1", "live 2"]
+    assert any("(router.3.log) left out of the copies read: a plain file in that form is "
+               "what a numbered live sibling looks like" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_an_absent_live_file_with_copies_written_since_reads_them_and_parks(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """nocreate and a gap deeper than rotate keeps: the copies are read now, the cursor parks
+    on the last of them, and the writer's return is a plain rotation next run."""
+    path, saved = _aged_out(tmp_path)
+    path.unlink()
+    caplog.set_level(logging.INFO, logger="logalert")
+    source, lines, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.verdict == "absent"
+    assert lines == ["middle 1", "live 1"]
+    assert parked is not None and parked.ino == (tmp_path / "router.log.1").stat().st_ino
+    assert parked.mtime == (tmp_path / "router.log.1").stat().st_mtime
+    assert any(r.getMessage().endswith(
+        "; reading the 2 rotated copies written since the last run from the beginning "
+        "(router.log.2, then router.log.1)") for r in caplog.records
+        if "absent this run" in r.getMessage())
+    path.write_bytes(b"live 2" + NLB)
+    again, rest, _ = run(path, parked)
+    assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
+    assert rest == ["live 2"]
+
+
+def test_a_cursor_with_no_first_line_reads_the_copies_written_since(tmp_path: Path) -> None:
+    """The issue proposed keeping the live-only answer for a cursor with no hash; corrected:
+    such a cursor has read nothing (offset 0) -- or, past 2000 bytes of an unterminated
+    first line, a cut fragment of it, which is then mailed twice (review) -- so the
+    copies are read."""
+    path = tmp_path / "router.log"
+    saved = seen(path, b"")
+    assert saved.fingerprint is None and saved.offset == 0
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1.gz", compress=True)  # a new inode: no inode hit
+    path.write_bytes(b"live 1" + NLB)
+    # ext4 hands the freed inode number straight back (measured): the new live file
+    # would then read as a continuation of the empty one; the saved inode is fabricated
+    _, lines, _ = run(path, replace(saved, ino=NOWHERE))
+    assert lines == ["since 1", "live 1"]
+
+
+def test_an_unreadable_recent_copy_stays_out_of_the_no_match_chain(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A copy a permission refused is the #38 item, warned about once; the others are read."""
+    if sys.platform == "win32":
+        pytest.skip("mode bits are fabricated on Windows; runs in the sandbox and on CI")
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 0000 file; expected in the root sandbox; CI runs it")
+    path, saved = _aged_out(tmp_path)
+    (tmp_path / "router.log.2").chmod(0o000)
+    caplog.set_level(logging.WARNING, logger="logalert")
+    try:
+        source, lines, _ = run(path, saved)
+    finally:
+        (tmp_path / "router.log.2").chmod(0o644)
+    assert isinstance(source, CatchUpSource)
+    assert lines == ["live 1", "live 2"]
+    assert source.plan.denied.startswith("a permission kept the rotated copies out of reach "
+                                         "(router.log.2)")
+    assert sum("could not be read" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_a_compressed_copy_confirms_the_extension_form_for_its_delayed_plain_sibling(
+        tmp_path: Path) -> None:
+    """extension + delaycompress (review): the delayed plain router.1.log is newer than the
+    compressed router.2.log.gz, so it is read; alone, or older than a compressed copy, a
+    plain file in that form is not (it is what a numbered live sibling looks like)."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    path.unlink()
+    compress_to(tmp_path / "router.2.log.gz", b"ext 2" + NLB)
+    (tmp_path / "router.1.log").write_bytes(b"ext 1" + NLB)
+    path.write_bytes(b"live 1" + NLB)
+    _, lines, _ = run(path, saved)
+    assert lines == ["ext 2", "ext 1", "live 1"]
+    (tmp_path / "router.3.log").write_bytes(b"sibling 3" + NLB)  # older than .2.log.gz
+    _, lines, _ = run(path, saved)
+    assert lines == ["ext 2", "ext 1", "live 1"]
+    (tmp_path / "router.2.log.gz").unlink()
+    _, lines, _ = run(path, saved)
+    assert lines == ["live 1"]
+
+
+def test_the_last_seen_bound_keeps_its_slack(tmp_path: Path) -> None:
+    """A copy stamped one second before last_seen is read (last_seen is whole seconds and the
+    copy may be from the run itself); three seconds before, it is not."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    path.unlink()
+    path.write_bytes(b"live 1" + NLB)
+    last_seen = parse_timestamp(saved.last_seen).timestamp()
+    for name, back in (("router.log.2", 3), ("router.log.1", 1)):
+        (tmp_path / name).write_bytes(name.encode("ascii") + NLB)
+        os.utime(tmp_path / name, (last_seen - back, last_seen - back))
+    _, lines, _ = run(path, saved)
+    assert lines == ["router.log.1", "live 1"]
+
+
+def test_an_absent_live_file_with_a_refused_holder_and_a_readable_copy_is_the_item(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plan surfaces for an absent live file now (issue #64); a permission that kept the
+    holder out of reach is the #38 item there too, beside the copy that was read."""
+    path, saved = _aged_out(tmp_path)
+    (tmp_path / "router.log.3").write_bytes(OLD + b"since 1" + NLB)  # the holder is back
+    holder = str(tmp_path / "router.log.3")
+    real_open = open_log
+
+    def refuse(target: str, *, follow_links: bool = False) -> BinaryStream:
+        if target == holder:
+            raise PermissionError(13, "Permission denied", target)
+        return real_open(target, follow_links=follow_links)
+
+    monkeypatch.setattr("logalert.rotation.open_log", refuse)
+    path.unlink()
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and lines == ["middle 1", "live 1"]
+    assert source.failed_item() == ("a permission kept the rotated copies out of reach "
+                                    "(router.log.3); the lines before the rotation are lost")
+
+
+# -- the live handle's file compressed during the plan (issue #67) -----------------------------
+
+
+def _compress_rotation(tmp_path: Path, fresh: bytes, *, late: bytes = b"") -> None:
+    """logrotate's create + compress, without delaycompress, in its order: .N.gz shift up,
+    the live file renamed to .1, a fresh live file CREATED, then .1 gzipped into .1.gz (a
+    new inode, the mtime kept as gzip keeps it) and removed -- the fresh file first, or
+    ext4 hands it the freed inode and a banner log's fresh file reads as a continuation
+    (review). ``late``: lines an application that ignored the reload wrote into the
+    renamed file after its compression."""
+    for n in (3, 2, 1):
+        source = tmp_path / f"router.log.{n}.gz"
+        if source.exists():
+            source.replace(tmp_path / f"router.log.{n + 1}.gz")
+    plain = tmp_path / "router.log.1"
+    (tmp_path / "router.log").replace(plain)
+    (tmp_path / "router.log").write_bytes(fresh)
+    stamp = plain.stat().st_mtime
+    compress_to(tmp_path / "router.log.1.gz", plain.read_bytes())
+    os.utime(tmp_path / "router.log.1.gz", (stamp, stamp))
+    if late:
+        append(plain, late)
+        os.utime(plain, (stamp, stamp))  # in the same second: the length must tell
+    plain.unlink()
+
+
+def _hooked_scan(monkeypatch: pytest.MonkeyPatch, when: str,
+                 action: Callable[[], None]) -> dict[str, int]:
+    """``scan_directories`` with ``action`` run before or after its first call."""
+    real = rotation.scan_directories
+    calls = {"n": 0}
+
+    def wrapped(directories: list[str], base: str) -> Any:
+        calls["n"] += 1
+        if when == "before" and calls["n"] == 1:
+            action()
+        found = real(directories, base)
+        if when == "after" and calls["n"] == 1:
+            action()
+        return found
+
+    monkeypatch.setattr(rotation, "scan_directories", wrapped)
+    return calls
+
+
+def _one_compress_rotation_behind(tmp_path: Path) -> tuple[Path, Cursor]:
+    """seen at OLD; 'since 1' appended; one compress rotation (.1.gz holds it); the live
+    file holds 'middle 1'."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1" + NLB)
+    _compress_rotation(tmp_path, b"middle 1" + NLB)
+    return path, saved
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_the_live_file_compressed_inside_the_plan_is_read_once_from_the_copy(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+        when: str) -> None:
+    """Measured (the #32 review, S3): gzip finishing between the live open and the listing,
+    or between the two listings, made the .gz a chain member beside the handle it was made
+    from: 'middle 1' twice. The copy is recognised and the handle skipped."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _one_compress_rotation_behind(tmp_path)
+    _hooked_scan(monkeypatch, when, lambda: _compress_rotation(tmp_path, b"live 1" + NLB))
+    caplog.set_level(logging.INFO, logger="logalert.rotation")
+    source, lines, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.absorbed
+    assert lines == ["since 1", "middle 1"]
+    assert any("the live file was rotated and compressed during the run (router.log.1.gz); "
+               "its lines were read from there" in r.getMessage() for r in caplog.records)
+    assert parked is not None and parked.ino == (tmp_path / "router.log.1.gz").stat().st_ino
+    assert parked.mtime == (tmp_path / "router.log.1.gz").stat().st_mtime
+    again, rest, _ = run(path, parked)  # the hook acted on the first listing only
+    assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
+    assert rest == ["live 1"]
+
+
+def test_a_live_file_moved_out_beside_a_longer_banner_copy_is_still_read(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mutation: the first line and the length alone would take an older copy of a
+    banner log for the handle's file when the live file was moved to an unlisted place
+    (olddir by hand); the mtime tells them apart."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path = tmp_path / "router.log"
+    saved = seen(path, BANNER + OLD)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")  # longer than the live file that follows
+    aged = time.time() - 30
+    os.utime(tmp_path / "router.log.1", (aged, aged))
+    path.write_bytes(BANNER + b"middle 1" + NLB)
+    elsewhere = tmp_path / "old"
+    elsewhere.mkdir()
+
+    def move_out() -> None:
+        path.replace(elsewhere / "router.log.1")
+        path.write_bytes(BANNER + b"live 1" + NLB)
+
+    _hooked_scan(monkeypatch, "before", move_out)  # gone before the listing: absent from it
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and not source.absorbed
+    assert lines == ["since 1", "=== router boot log ===", "middle 1"]
+
+
+def test_a_renamed_file_written_after_its_compression_is_read_through_the_handle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An application that ignored the reload wrote on into the renamed file within the
+    same second: the copy is shorter than the handle's file, so the handle is read --
+    'middle 1' twice (today's shape), the late line never lost."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _one_compress_rotation_behind(tmp_path)
+    _hooked_scan(monkeypatch, "after",
+                 lambda: _compress_rotation(tmp_path, b"live 1" + NLB, late=b"late 1" + NLB))
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and not source.absorbed
+    assert lines == ["since 1", "middle 1", "middle 1", "late 1"]
+
+
+def test_the_live_handle_is_listed_by_default(tmp_path: Path) -> None:
+    path, saved = _two_rotations(tmp_path)
+    source, _, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.live_listed
+    assert not source.absorbed
+
+
+def test_the_live_file_compressed_inside_a_no_match_plan_is_read_once_too(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The #64 chain can hold the handle's own compression as well (review of #64): rotate 1
+    drops the holder, the .gz made from the live file is the one recent copy, and the
+    handle would read the same lines again."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _one_compress_rotation_behind(tmp_path)
+
+    def rotate_1_with_compress() -> None:
+        _compress_rotation(tmp_path, b"live 1" + NLB)
+        (tmp_path / "router.log.2.gz").unlink()  # rotate 1: the holder is gone
+
+    _hooked_scan(monkeypatch, "before", rotate_1_with_compress)
+    source, lines, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is None and source.absorbed
+    assert lines == ["middle 1"]
+    assert parked is not None and parked.ino == (tmp_path / "router.log.1.gz").stat().st_ino
+    _, rest, _ = run(path, parked)
+    assert rest == ["live 1"]
+
+
+def test_the_match_read_from_the_offset_never_stands_in_for_the_handle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #67: a banner log, rotate 1 + compress, the handle's file compressed before
+    the listing with the holder aged out -- the content stage takes the handle's own copy as
+    the MATCH and reads it from the saved offset. Absorbing the handle then lost the copy's
+    lines before that offset; only a copy read in full can stand in (a duplicate, as before,
+    where the guess was wrong)."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path = tmp_path / "router.log"
+    saved = seen(path, BANNER + OLD)  # offset 36
+    append(path, b"since 1" + NLB)
+    _compress_rotation(tmp_path, BANNER + b"middle 0001" + NLB + b"middle 2" + NLB)  # 45 bytes
+
+    def rotate_1_with_compress() -> None:
+        # logrotate's order: the fresh live file exists before the plain copy is unlinked,
+        # else ext4 hands the freed inode to the fresh file and the verdict is continue
+        (tmp_path / "router.log.1.gz").unlink()  # rotate 1: the holder is gone
+        plain = tmp_path / "router.log.1"
+        (tmp_path / "router.log").replace(plain)
+        (tmp_path / "router.log").write_bytes(BANNER + b"live 1" + NLB)
+        stamp = plain.stat().st_mtime
+        compress_to(tmp_path / "router.log.1.gz", plain.read_bytes())
+        os.utime(tmp_path / "router.log.1.gz", (stamp, stamp))
+        plain.unlink()
+
+    _hooked_scan(monkeypatch, "before", rotate_1_with_compress)
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "content"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.1.gz")
+    assert not source.absorbed
+    assert lines == ["middle 2", "=== router boot log ===", "middle 0001", "middle 2"]
+
+
+def test_the_listing_is_the_signal_for_a_same_second_banner_copy(
+        tmp_path: Path) -> None:
+    """A busy banner log read within the second of a plain rename: the last copy has the
+    banner, the live file's second and a greater length, and only the listing says the
+    handle's file is its own (the handle was in it)."""
+    path = tmp_path / "router.log"
+    saved = seen(path, BANNER + OLD)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(BANNER + b"middle 1" + NLB + b"middle 2" + NLB + b"middle 3" + NLB)
+    (tmp_path / "router.log.1").replace(tmp_path / "router.log.2")
+    rotate(path, tmp_path / "router.log.1")  # the chain member, read in full
+    path.write_bytes(BANNER + b"live 1" + NLB)  # shorter, the banner, the same second
+    stamp = (tmp_path / "router.log.1").stat().st_mtime
+    os.utime(path, (stamp, stamp))
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.live_listed and not source.absorbed
+    assert lines == ["since 1", "=== router boot log ===", "middle 1", "middle 2", "middle 3",
+                     "=== router boot log ===", "live 1"]
+
+
+def test_a_live_file_moved_out_beside_a_copy_with_another_first_line_is_read(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The first line is one of the three: a longer copy stamped in the same second but
+    opening differently is not the handle's file."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1" + NLB)
+    rotate(path, tmp_path / "router.log.1")
+    path.write_bytes(b"other 1" + NLB + b"other 2" + NLB)  # another first line, longer
+    (tmp_path / "router.log.1").replace(tmp_path / "router.log.2")
+    rotate(path, tmp_path / "router.log.1")  # the chain member, read in full
+    path.write_bytes(b"middle 1" + NLB)
+    stamp = path.stat().st_mtime
+    os.utime(tmp_path / "router.log.1", (stamp, stamp))
+    elsewhere = tmp_path / "old"
+    elsewhere.mkdir()
+
+    def move_out() -> None:
+        path.replace(elsewhere / "router.log.1")
+        path.write_bytes(b"live 1" + NLB)
+
+    _hooked_scan(monkeypatch, "before", move_out)
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and not source.absorbed
+    assert lines == ["since 1", "other 1", "other 2", "middle 1"]
+
+
+def test_a_copy_stamped_to_the_whole_second_still_absorbs_the_handle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """bzip2 by hand keeps the second (measured); the comparison is whole seconds."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _one_compress_rotation_behind(tmp_path)
+
+    def rotation_by_hand() -> None:
+        _compress_rotation(tmp_path, b"live 1" + NLB)
+        whole = float(int((tmp_path / "router.log.1.gz").stat().st_mtime))
+        os.utime(tmp_path / "router.log.1.gz", (whole, whole))
+
+    _hooked_scan(monkeypatch, "before", rotation_by_hand)
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.absorbed
+    assert lines == ["since 1", "middle 1"]
+
+
+# -- a copytruncate under the open handle (issue #66) --------------------------------------------
+
+
+def _copytruncate(tmp_path: Path, fresh: bytes = b"") -> None:
+    """logrotate's copytruncate: .N shift up, the live file copied to .1 (a new inode) and
+    truncated in place (its inode kept), ``fresh`` appended after."""
+    for n in (3, 2, 1):
+        source = tmp_path / f"router.log.{n}"
+        if source.exists():
+            source.replace(tmp_path / f"router.log.{n + 1}")
+    path = tmp_path / "router.log"
+    (tmp_path / "router.log.1").write_bytes(path.read_bytes())
+    with open(path, "r+b") as handle:
+        handle.truncate(0)
+    if fresh:
+        append(path, fresh)
+
+
+def test_a_truncation_under_the_handle_drops_the_chunk_and_keeps_a_pre_truncation_cursor(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The live reader is several chunks in when the file is truncated and refilled under
+    it: nothing of the new content is yielded as old lines, the cursor pairs the old first
+    line with an offset from before, and the next run finds the copy by content there."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    body = b"".join(b"line %05d" % n + NLB for n in range(8000))  # ~80 KiB: two chunks
+    append(path, body)
+    caplog.set_level(logging.WARNING, logger="logalert.cursor")
+    with LogFile(SECTION, str(path), saved) as live:
+        assert live.verdict == "continue"
+        stream = live.lines()
+        first = [next(stream).text for _ in range(100)]
+        refill = b"".join(b"new %05d" % n + NLB for n in range(8000))  # past the position
+        _copytruncate(tmp_path, refill)  # under the handle
+        rest = texts(list(stream))
+        assert live.reader.truncated
+        cursor = live.cursor()
+    assert first == [f"line {n:05d}" for n in range(100)]
+    assert all(line.startswith("line ") for line in rest)  # nothing of the new content
+    assert cursor.fingerprint == saved.fingerprint
+    assert cursor.offset == len(OLD) + (len(first) + len(rest)) * len(b"line 00000" + NLB)
+    assert cursor.offset < len(OLD) + len(body)  # the first chunk's lines at most
+    assert [r.getMessage() for r in caplog.records] == [
+        f"[{SECTION}] {path}: truncated under us during the read (a copytruncate during "
+        f"the run?); stopping at offset {cursor.offset}"]
+    # the next run: the copy holds the rest, then the live file from 0
+    source, lines, _ = run(path, cursor)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.1")
+    assert lines == [f"line {n:05d}" for n in range(len(first) + len(rest), 8000)] + [
+        f"new {n:05d}" for n in range(8000)]
+
+
+def test_a_truncation_the_reader_meets_as_eof_is_reported_too(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The ordinary continue read: the file is truncated after the reader passed the point
+    and refilled with less than its position; the read ends at EOF, the check runs there
+    too (review: a quiet writer's truncation met as EOF must stop a catch-up before the
+    live file), the cursor stays a pre-truncation pair, and the next run resolves the
+    copy."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    caplog.set_level(logging.WARNING, logger="logalert.cursor")
+    with LogFile(SECTION, str(path), saved) as live:
+        stream = live.lines()
+        assert next(stream).text == "since 1"
+        _copytruncate(tmp_path, b"n" + NLB)  # shorter than the reader's position
+        assert texts(list(stream)) == ["since 2"]  # buffered before the truncation
+        assert live.reader.truncated
+        cursor = live.cursor()
+    assert len(caplog.records) == 1
+    assert cursor.offset == len(OLD + SINCE)
+    _, lines, _ = run(path, cursor)
+    assert lines == ["n"]
+
+
+def _s2_layout(tmp_path: Path) -> tuple[Path, Cursor]:
+    """S2 (the #32 review): seen at OLD, 'since 1' appended, one copytruncate between runs
+    (.1 = OLD + since 1, the live file emptied), 'middle 1' written to the live file."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1" + NLB)
+    _copytruncate(tmp_path, b"middle 1" + NLB)
+    return path, saved
+
+
+def _three_runs(path: Path, saved: Cursor, second: Cursor | None = None) -> list[list[str]]:
+    """Runs from ``second`` (the cursor after the staged run) and once more: their lines."""
+    out: list[list[str]] = []
+    cursor = second
+    for _ in range(2):
+        _, lines, cursor = run(path, cursor)
+        out.append(lines)
+    return out
+
+
+def test_a_copytruncate_after_the_plan_stops_before_the_live_file_and_nothing_is_lost(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """S2 measured with real logrotate: 'middle 1' lost, then the fragment '1' and 'live 1'
+    twice. Now the live read yields nothing, the cursor parks on the copy read, and the next
+    run chains the copy the truncation made."""
+    if sys.platform == "win32":
+        pytest.skip("renaming a log under its open handle is refused on Windows; runs in "
+                    "the sandbox and on CI")
+    path, saved = _s2_layout(tmp_path)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    caplog.set_level(logging.WARNING, logger="logalert")
+    _copytruncate(tmp_path, b"live 1" + NLB)  # after the plan, before the reads
+    with source:
+        second = texts(list(source.lines()))
+        parked = source.cursor()
+    assert second == ["since 1"]
+    assert source.stopped and parked.ino == (tmp_path / "router.log.2").stat().st_ino
+    assert parked.offset == len(OLD) + len(b"since 1" + NLB)
+    third, fourth = _three_runs(path, saved, parked)
+    assert third == ["middle 1", "live 1"] and fourth == []
+    assert second + third == ["since 1", "middle 1", "live 1"]  # every line once, no fragment
+
+
+def test_a_copytruncate_between_the_listing_and_the_content_stage_reads_the_copy_once(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """S2b: the second listing sees the copy and chains it; the live read then yields nothing
+    and the cursor parks on that copy -- a live cursor (first line, 0) would match it again.
+    Real on Windows too: no handle is open on .1 when the copy is renamed on."""
+    path, saved = _s2_layout(tmp_path)
+    _hooked_scan(monkeypatch, "after", lambda: _copytruncate(tmp_path, b"live 1" + NLB))
+    source, second, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.stopped
+    assert second == ["since 1", "middle 1"]
+    assert parked is not None and parked.ino == (tmp_path / "router.log.1").stat().st_ino
+    third, fourth = _three_runs(path, saved, parked)
+    assert third == ["live 1"] and fourth == []
+    assert second + third == ["since 1", "middle 1", "live 1"]
+
+
+def test_a_copytruncate_during_the_live_read_keeps_the_live_cursor(
+        tmp_path: Path) -> None:
+    """The live read yielded lines before the truncation (the refill runs past the reader's
+    position, so the check fires on the next chunk; a shorter refill is the EOF shape): the
+    copy did not exist at the plan, so the live pair (first line, offset) is what the next
+    run resolves against it -- parking on the previous copy would mail the new copy whole
+    again (review: the shipped test never entered this branch). Real on Windows too."""
+    path, saved = _s2_layout(tmp_path)
+    body = b"".join(b"middle %05d" % n + NLB for n in range(8000))
+    append(path, body)
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource) and source.live is not None
+    refill = b"".join(b"live %05d" % n + NLB for n in range(8000))
+    with source:
+        stream = source.lines()
+        second = [next(stream).text for _ in range(50)]  # into the live file's first chunk
+        _copytruncate(tmp_path, refill)
+        second += texts(list(stream))
+        assert source.live.reader.truncated
+        cursor = source.cursor()
+    assert not source.stopped and cursor.ino == path.stat().st_ino
+    assert cursor.fingerprint is not None and cursor.fingerprint != saved.fingerprint
+    third, fourth = _three_runs(path, saved, cursor)
+    assert fourth == []
+    written = (["since 1", "middle 1"] + [f"middle {n:05d}" for n in range(8000)]
+               + [f"live {n:05d}" for n in range(8000)])
+    assert second + third == written
+
+
+def test_a_file_shorter_than_the_position_at_the_check_is_a_truncation(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The size half of the check: a truncation landing between a chunk's read and the check
+    leaves the file shorter than the reader's position while the first line may still be
+    the one from the open (a banner refill); the chunk is dropped unread."""
+    path = tmp_path / "router.log"
+    saved = seen(path, BANNER + OLD)
+    append(path, b"".join(b"line %05d" % n + NLB for n in range(8000)))
+    real_fstat = os.fstat
+    armed = {"on": False, "shrunk": False}
+
+    def fstat_after_a_truncation(fd: int) -> os.stat_result:
+        st = real_fstat(fd)
+        if armed["on"] and not armed["shrunk"]:  # the first check: shorter than the position
+            armed["shrunk"] = True
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid,
+                                   st.st_gid, 5, st.st_atime, st.st_mtime, st.st_ctime))
+        return st
+
+    monkeypatch.setattr("logalert.cursor.os.fstat", fstat_after_a_truncation)
+    with LogFile(SECTION, str(path), saved) as live:
+        assert live.verdict == "continue"
+        armed["on"] = True  # the open's own fstat calls are behind us
+        lines = texts(list(live.lines()))
+        assert armed["shrunk"] and live.reader.truncated and lines == []  # nothing yielded
+        cursor = live.cursor()
+    assert cursor.offset == saved.offset and cursor.fingerprint == saved.fingerprint
+
+
+def test_a_file_empty_at_the_open_that_gained_lines_is_read(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """No first line at the open means nothing to compare: the lines a writer added before
+    the read are read, with no truncation claimed (review: the mutant dropped them with a
+    spurious warning)."""
+    path = tmp_path / "router.log"
+    path.write_bytes(b"")
+    caplog.set_level(logging.WARNING, logger="logalert.cursor")
+    with LogFile(SECTION, str(path), None, from_start=True) as live:
+        assert live.fingerprint is None
+        append(path, b"first" + NLB + b"second" + NLB)
+        assert texts(list(live.lines())) == ["first", "second"]
+        assert not live.reader.truncated
+    assert caplog.records == []
+
+
+def test_a_truncation_between_the_check_and_the_next_read_yields_nothing_new(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The order the design rests on: the check runs AFTER each read, so a truncation landing
+    right after a check is seen by the next chunk's check and that chunk is dropped; a check
+    before the read would pass and the chunk would be the new content at the old offsets --
+    the chimera (review)."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"".join(b"line %05d" % n + NLB for n in range(8000)))
+    real_check = LogFile._still_the_file
+    fired = {"n": 0}
+
+    def check_then_truncate(self: LogFile) -> bool:
+        answer = real_check(self)
+        fired["n"] += 1
+        if fired["n"] == 1:  # the window after the first check
+            _copytruncate(tmp_path, b"".join(b"new %05d" % n + NLB for n in range(8000)))
+        return answer
+
+    monkeypatch.setattr(LogFile, "_still_the_file", check_then_truncate)
+    with LogFile(SECTION, str(path), saved) as live:
+        lines = texts(list(live.lines()))
+        assert live.reader.truncated and fired["n"] == 2
+    assert lines and all(line.startswith("line ") for line in lines)
+
+
+def test_a_copytruncate_with_a_quiet_writer_stops_before_the_live_file(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #66: with nothing written after the truncation the live read met EOF, no
+    check ran, and the live cursor (first line, 0) matched the truncation's copy again next
+    run -- 'middle 1' twice when the second listing had chained it. The check runs at EOF."""
+    path, saved = _s2_layout(tmp_path)
+    _hooked_scan(monkeypatch, "after", lambda: _copytruncate(tmp_path))  # no refill
+    source, second, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.stopped
+    assert second == ["since 1", "middle 1"]
+    assert parked is not None and parked.ino == (tmp_path / "router.log.1").stat().st_ino
+    append(path, b"live 1" + NLB)
+    third, fourth = _three_runs(path, saved, parked)
+    assert third == ["live 1"] and fourth == []
+
+
+def test_the_check_reads_past_a_nul_hole_once(tmp_path: Path) -> None:
+    """A copytruncate under a writer without O_APPEND leaves a NUL hole before the first
+    line; the check reads where the line begins (recorded at the open) instead of skipping
+    the hole again on every chunk (review, measured: seconds per chunk on a large hole).
+    The same file passes; a truncation under it is still caught."""
+    path = tmp_path / "router.log"
+    hole = NUL * 8192
+    path.write_bytes(hole + OLD)
+    with LogFile(SECTION, str(path), None, from_start=True) as live:
+        assert live.line_at == len(hole) and live.fingerprint is not None
+        assert texts(list(live.lines())) == ["old 1", "old 2"]
+        assert not live.reader.truncated
+        saved = live.cursor()
+    append(path, b"".join(b"line %05d" % n + NLB for n in range(8000)))
+    with LogFile(SECTION, str(path), saved) as live:
+        assert live.verdict == "continue" and live.line_at == len(hole)
+        stream = live.lines()
+        first = [next(stream).text for _ in range(10)]
+        _copytruncate(tmp_path, b"".join(b"new %05d" % n + NLB for n in range(8000)))
+        rest = texts(list(stream))
+        assert live.reader.truncated
+    assert first == [f"line {n:05d}" for n in range(10)]
+    assert all(line.startswith("line ") for line in rest)
+
+
+def test_context_before_after_a_truncation_under_the_handle_is_empty(tmp_path: Path) -> None:
+    """The context hook's second handle passes the identity test (copytruncate keeps the
+    inode) and would return the new content's lines; the same-file test applies there."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    with LogFile(SECTION, str(path), saved) as live:
+        assert live.context_before(2) == [Line("old 1", False, 1, str(path)),
+                                          Line("old 2", False, 2, str(path))]
+        _copytruncate(tmp_path, b"new A" + NLB + b"new B" + NLB + b"new C" + NLB)
+        assert live.context_before(2) == []
+
+# -- the anchor: a refill with the same first line past the position (issue #34) ---------------
+
+
+def _banner(prefix: bytes, n: int) -> bytes:
+    return b"BANNER" + NLB + b"".join(prefix + b" %03d" % k + NLB for k in range(n))
+
+
+def test_a_refill_with_the_same_first_line_reads_the_copy_then_the_new_file(
+        tmp_path: Path) -> None:
+    """The measured bug with a copytruncate copy beside the file: the run continued at the
+    stale offset (the copy's tail lines and the refill's first 168 lost, a fragment sent).
+    The anchor calls it truncated, the copy holds the position by content, and the new
+    file is read from its top."""
+    path = tmp_path / "router.log"
+    saved = seen(path, _banner(b"old", 200))
+    append(path, b"".join(b"old %03d" % k + NLB for k in range(200, 230)))
+    (tmp_path / "router.log.1").write_bytes(path.read_bytes())  # the copytruncate copy
+    refill = _banner(b"new", 400)
+    path.write_bytes(refill)  # truncated and refilled: the same inode, the same banner
+    assert path.stat().st_ino == saved.ino and len(refill) > saved.offset
+    source, lines, cursor = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.verdict == "truncated"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.1")
+    assert lines == [f"old {k:03d}" for k in range(200, 230)] + ["BANNER"] + [
+        f"new {k:03d}" for k in range(400)]
+    assert cursor is not None and cursor.offset == len(refill)
+    assert cursor.anchor == anchor_of(refill[-ANCHOR_CAP:])
+    _, again, _ = run(path, cursor)
+    assert again == []  # and the anchor it recorded is the new file's
+
+
+def test_a_refill_under_the_handle_with_the_same_first_line_is_caught_by_the_tail(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """#66's in-run check with the one refill it could not see: the copytruncate lands
+    while the reader is chunks in and the writer refills past the position with the
+    same first line. The size and the first line pass; the bytes before the position
+    do not (the mutant yielded the refill's lines as old ones), and the next run finds
+    the rest in the copy by content, then reads the new file from its top."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    body = b"".join(b"line %05d" % n + NLB for n in range(8000))  # ~80 KiB: two chunks
+    append(path, body)
+    caplog.set_level(logging.WARNING, logger="logalert.cursor")
+    with LogFile(SECTION, str(path), saved) as live:
+        stream = live.lines()
+        first = [next(stream).text for _ in range(100)]
+        refill = OLD + b"".join(b"new %05d" % n + NLB for n in range(8000))  # past it
+        _copytruncate(tmp_path, refill)  # under the handle, the first line kept
+        rest = texts(list(stream))
+        assert live.reader.truncated
+        cursor = live.cursor()
+    assert first == [f"line {n:05d}" for n in range(100)]
+    assert rest and all(line.startswith("line ") for line in rest)  # nothing of the refill
+    assert cursor.fingerprint == saved.fingerprint and cursor.offset < len(OLD) + len(body)
+    assert len(refill) > cursor.offset  # past the position at the check: the size rule passed
+    assert cursor.anchor == anchor_of((OLD + body)[:cursor.offset][-ANCHOR_CAP:])
+    assert [r.getMessage() for r in caplog.records] == [
+        f"[{SECTION}] {path}: truncated under us during the read (a copytruncate during "
+        f"the run?); stopping at offset {cursor.offset}"]
+    source, lines, _ = run(path, cursor)
+    assert isinstance(source, CatchUpSource) and source.verdict == "truncated"
+    assert source.plan.match is not None and source.plan.match.path.endswith("router.log.1")
+    assert lines == [f"line {n:05d}" for n in range(len(first) + len(rest), 8000)] + [
+        "old 1", "old 2"] + [f"new {n:05d}" for n in range(8000)]
+
+
+def test_a_cursor_parked_on_a_copy_has_no_anchor_and_resolves_as_before(
+        tmp_path: Path) -> None:
+    """The copy is immutable and is found by its mtime, inode or content (issue #65); the
+    anchor describes a live file's bytes and a parked entry carries none. The live file's
+    entry gains one as soon as it is read."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    assert saved.anchor == anchor_of(OLD)
+    append(path, SINCE)
+    rotate(path, tmp_path / "router.log.1")  # nocreate: the live file is absent
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    with source:
+        stream = source.lines()
+        assert next(stream).text == "since 1"  # a consumer that stops part-way
+        parked = source.cursor()
+    assert parked.anchor is None and parked.mtime is not None
+    assert parked.ino == (tmp_path / "router.log.1").stat().st_ino
+    path.write_bytes(LIVE)
+    again, lines, cursor = run(path, parked)
+    assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
+    assert lines == ["since 2", "live 1"]
+    assert cursor is not None and cursor.anchor == anchor_of(LIVE)

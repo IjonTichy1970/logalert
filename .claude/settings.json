@@ -6,7 +6,8 @@
     "and not a paragraph: it fires at the moment of the mistake. Coverage is deliberately narrow",
     "(see the docstring); .claude/hooks/test_guard_shell_text.py pins both halves as a gate",
     "stage. To disable, delete the hooks block -- but read that test first: every BLOCK case is",
-    "a failure that really happened."
+    "a failure that really happened.",
+    "The command is a POSIX launcher (issue #55): `python` first, `python3` next, and a refusal (exit 2) when neither is on PATH -- Claude Code runs a command hook under sh on Linux/macOS and Git Bash on Windows, and a hook that cannot start would otherwise let every command through. The guard stage runs this string as spelled."
   ],
   "hooks": {
     "PreToolUse": [
@@ -15,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python .claude/hooks/guard_shell_text.py"
+            "command": "py=python3; command -v python >/dev/null 2>&1 && py=python; command -v \"$py\" >/dev/null 2>&1 || { echo \"guard_shell_text.py: neither python nor python3 is on PATH; the command is refused\" >&2; exit 2; }; exec \"$py\" \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard_shell_text.py\""
           }
         ]
       }

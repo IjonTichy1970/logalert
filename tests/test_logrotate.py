@@ -11,11 +11,10 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import SECTION, append, run, seen, texts
 
-from logalert.cursor import Line
 from logalert.globs import expand
 from logalert.rotation import CatchUpSource, open_source
-from logalert.state import Cursor
 
 LOGROTATE = shutil.which("logrotate")
 if sys.platform == "win32":
@@ -24,37 +23,9 @@ if LOGROTATE is None:
     pytest.fail("logrotate is not on PATH: these tests are required on POSIX (could-not-check "
                 "is never a pass)", pytrace=False)
 
-SECTION = "router-disk"
 OLD = b"old 1\nold 2\n"
 SINCE = b"since 1\nsince 2\n"
 LIVE = b"live 1\n"
-
-
-def texts(lines: list[Line]) -> list[str]:
-    return [line.text for line in lines]
-
-
-def run(path: Path, saved: Cursor | None, *, archive_dir: Path | None = None,
-        from_start: bool = False) -> tuple[object, list[str], Cursor | None]:
-    source = open_source(SECTION, str(path), saved, from_start=from_start,
-                         archive_dir=str(archive_dir) if archive_dir else None)
-    if source is None:
-        return None, [], None
-    with source:
-        lines = texts(list(source.lines()))
-        return source, lines, source.cursor()
-
-
-def seen(path: Path, content: bytes) -> Cursor:
-    path.write_bytes(content)
-    _, _, cursor = run(path, None, from_start=True)
-    assert cursor is not None
-    return cursor
-
-
-def append(path: Path, data: bytes) -> None:
-    with open(path, "ab") as handle:
-        handle.write(data)
 
 
 def logrotate(tmp_path: Path, path: Path, options: str) -> None:
@@ -179,7 +150,7 @@ def test_nocreate(tmp_path: Path) -> None:
     assert lines == ["since 1", "since 2"]
     path.write_bytes(LIVE)  # the writer recreates it
     source, lines, _ = run(path, cursor)
-    assert isinstance(source, CatchUpSource) and source.plan.stage == "inode"
+    assert isinstance(source, CatchUpSource) and source.plan.stage == "mtime"  # issue #65
     assert lines == ["live 1"]
 
 
@@ -291,3 +262,100 @@ def test_extension_with_delaycompress_two_rounds(tmp_path: Path) -> None:
     assert lines == ["round 1", "round 2", "live 1"]
     _, again, _ = run(path, cursor)
     assert again == []
+
+
+def test_a_gap_deeper_than_rotate_keeps_reads_the_surviving_copies(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """rotate 1 with two rotations between runs (issue #64): the holder is gone, the copy
+    rotated meanwhile is read before the live file, and only the holder's tail is lost."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    logrotate(tmp_path, path, "    create\n    rotate 1\n")
+    append(path, b"middle 1\n")
+    logrotate(tmp_path, path, "    create\n    rotate 1\n")  # the holder is dropped
+    assert sorted(p.name for p in tmp_path.glob("router.log*")) == ["router.log", "router.log.1"]
+    append(path, LIVE)
+    caplog.set_level("WARNING", logger="logalert")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is None
+    assert lines == ["middle 1", "live 1"]
+    warned = [r.getMessage() for r in caplog.records if "no rotated copy" in r.getMessage()]
+    assert len(warned) == 1 and "the archive aged out" in warned[0]
+    assert "reading the 1 rotated copy written since the last run" in warned[0]
+
+
+def test_compress_finishing_inside_the_plan_mails_the_rotated_file_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #67, with real logrotate: gzip finishing between the live open and the listing
+    made the .gz a chain member beside the handle it was made from ('middle 1' twice)."""
+    import logalert.rotation as rotation_module
+
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1\n")
+    logrotate(tmp_path, path, "    create\n    compress\n")
+    append(path, b"middle 1\n")
+    real_scan = rotation_module.scan_directories
+    calls = {"n": 0}
+
+    def rotate_before_the_listing(directories: list[str], base: str) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:  # the live file is open already: its rotation and gzip land now
+            logrotate(tmp_path, path, "    create\n    compress\n")
+            append(path, b"live 1\n")
+        return real_scan(directories, base)
+
+    monkeypatch.setattr(rotation_module, "scan_directories", rotate_before_the_listing)
+    caplog.set_level("INFO", logger="logalert.rotation")
+    source, lines, parked = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.absorbed
+    assert lines == ["since 1", "middle 1"]
+    assert any("rotated and compressed during the run (router.log.1.gz)" in r.getMessage()
+               for r in caplog.records)
+    _, rest, _ = run(path, parked)
+    assert rest == ["live 1"]
+
+
+def test_copytruncate_landing_after_the_plan_loses_nothing(tmp_path: Path) -> None:
+    """Issue #66, with real logrotate (the #32 review's S2): the truncation under the live
+    handle left a cursor pairing the old first line with a post-truncation offset -- 'middle
+    1' lost, then a fragment and 'live 1' twice. The live read stops before the truncated
+    file's content and the next run chains the copy."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, b"since 1\n")
+    logrotate(tmp_path, path, "    copytruncate\n")
+    append(path, b"middle 1\n")
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    logrotate(tmp_path, path, "    copytruncate\n")  # after the plan, before the reads
+    append(path, b"live 1\n")
+    with source:
+        second = texts(list(source.lines()))
+        parked = source.cursor()
+    assert second == ["since 1"] and source.stopped
+    _, third, cursor = run(path, parked)
+    _, fourth, _ = run(path, cursor)
+    assert third == ["middle 1", "live 1"] and fourth == []
+
+
+def test_copytruncate_then_a_writer_restarting_with_its_banner_is_read_from_the_top(
+        tmp_path: Path) -> None:
+    """Issue #34 with real logrotate: copytruncate, then a writer that restarts with its
+    fixed banner and writes past the saved position -- the same inode, the same first line
+    and a size past the offset, which the old rules read on from the stale offset. The copy
+    holds the position; the live file is read from its top."""
+    path = tmp_path / "router.log"
+    banner = b"BANNER\n"
+    saved = seen(path, banner + OLD)
+    append(path, SINCE)
+    logrotate(tmp_path, path, "    copytruncate\n")
+    assert path.stat().st_ino == saved.ino and path.stat().st_size == 0
+    append(path, banner + b"".join(b"restart %03d\n" % n for n in range(40)))
+    assert path.stat().st_size > saved.offset
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.verdict == "truncated"
+    assert lines == ["since 1", "since 2", "BANNER"] + [f"restart {n:03d}" for n in range(40)]

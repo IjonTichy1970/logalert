@@ -1,6 +1,6 @@
 """Globs in ``files`` through the run (issue #18): the expansion keyed per path, rotated copies
 left out, the new-file rule and its record, the failed listing, ``--check-config`` and
-``--reset-state`` over a glob. Real on both platforms; the fixtures are ``tests/test_run.py``'s.
+``--reset-state`` over a glob. Real on both platforms; the fixtures are ``tests/conftest.py``'s.
 """
 
 import json
@@ -14,16 +14,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_run import NL, Site, body_of
+from conftest import NL, Site, body_of, deny_scandir, unsearchable_listing
 
 import logalert.run
 from logalert.__main__ import main
 from logalert.state import Cursor, State, load_state, parse_timestamp, timestamp
-
-
-@pytest.fixture
-def site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Site:
-    return Site(tmp_path, monkeypatch)
 
 
 def daily(site: Site, name: str, *lines: str) -> Path:
@@ -221,14 +216,7 @@ def test_an_unlistable_directory_is_a_failed_item_and_the_rest_runs(
     site.prime()
     site.append(site.router, "kernel: disk failure on sdb")
     locked = (site.root / "daily").as_posix()
-    real_scandir = os.scandir
-
-    def scandir(path: str = ".") -> object:
-        if os.path.normcase(path) == os.path.normcase(locked):
-            raise PermissionError(13, "Permission denied", path)
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
+    deny_scandir(monkeypatch, locked)
     assert site.run() == 1
     assert capsys.readouterr().err == (
         f"logalert: 1 of 1 section sent; failed: [firewall] {glob_of(site)}: cannot list "
@@ -327,14 +315,7 @@ def test_check_config_shows_what_a_glob_matched(
            f"1 passed over (not regular files)" in out
     assert not any("more" in line for line in out if line.startswith("[firewall]   "))
     locked = (site.root / "daily").as_posix()
-    real_scandir = os.scandir
-
-    def scandir(path: str = ".") -> object:
-        if os.path.normcase(path) == os.path.normcase(locked):
-            raise PermissionError(13, "Permission denied", path)
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
+    deny_scandir(monkeypatch, locked)
     assert site.run("--check-config") == 0  # the configuration is valid; the directory is not
     out = capsys.readouterr().out.splitlines()
     assert f"[firewall] files: {everything} -> cannot list {locked} (Permission denied)" in out
@@ -370,18 +351,6 @@ def test_reset_state_takes_the_expanded_path_and_drops_the_record(
 
 
 # -- the review's cases (issue #18) ------------------------------------------------------
-
-
-def deny_scandir(monkeypatch: pytest.MonkeyPatch, locked: str) -> None:
-    """``os.scandir`` refuses one directory: the unlistable-directory device on both platforms."""
-    real_scandir = os.scandir
-
-    def scandir(path: str = ".") -> object:
-        if os.path.normcase(path) == os.path.normcase(locked):
-            raise PermissionError(13, "Permission denied", path)
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
 
 
 def test_a_glob_whose_directory_could_not_be_listed_keeps_its_moment(
@@ -449,18 +418,31 @@ def test_a_new_file_matched_by_two_globs_is_new_whichever_lists_first(site: Site
 
 
 def test_the_moment_is_the_runs_start(site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A file that appears while a long run is in progress must be newer than the moment."""
+    """A file that appears while a long run is in progress must be newer than the moment: the
+    record's moment is the run's FIRST reading of the clock, not the section's save.
+    The clock's first reading is the start and every later one is 30 s on, so a moment
+    taken at the save is not the start (issue #41: a frozen clock could not tell them
+    apart; under the regression a file created during a long run was first-sighted at
+    its end, silently)."""
     fixed = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=45)
+    # each reading 30 s after the last, stamped with whether the state file existed yet:
+    # the opening save precedes every section, so a reading taken after the file exists
+    # is a section's, whichever section is saved first (review)
+    readings: list[tuple[str, bool]] = []
 
     class Clock(datetime):
         @classmethod
         def now(cls, tz: Any = None) -> "Clock":
-            return cls.fromtimestamp(fixed.timestamp(), tz)
+            moment = cls.fromtimestamp(fixed.timestamp() + 30 * len(readings), tz)
+            readings.append((timestamp(moment), site.state_file.exists()))
+            return moment
 
     monkeypatch.setattr(logalert.run, "datetime", Clock)
     pattern = glob_of(site)
     site.write_config(firewall_files=pattern)
     site.prime()
+    before_the_state = [moment for moment, existed in readings if not existed]
+    assert before_the_state == [timestamp(fixed)]  # the start, read once
     assert at(site, "firewall", pattern) == timestamp(fixed)
 
 
@@ -490,17 +472,24 @@ def test_a_failed_listing_is_not_also_matches_nothing(
 
 def test_a_record_of_a_section_no_longer_configured_expires_a_configured_ones_stays(
         site: Site, caplog: pytest.LogCaptureFixture) -> None:
+    """The configured section's record survives ``expire_runs`` on its own: the glob's
+    directory is away for the run, so nothing re-creates the record (issue #41: with the
+    directory present ``_advance`` re-created what an expiry had dropped, and the
+    ``configured=`` argument was unpinned -- under the regression a file created during
+    an outage longer than ``state_ttl`` was first-sighted at its end)."""
     caplog.set_level(logging.DEBUG, logger="logalert.run")
     pattern = glob_of(site)
     site.write_config("state_ttl = 1" + NL, firewall_files=pattern)
     site.prime()
-    old = datetime.now(UTC) - timedelta(days=3)
+    old = datetime.now(UTC).replace(microsecond=0) - timedelta(days=3)
     state = load_state(str(site.state_file))
     state.record_run("gone-section", [pattern], [pattern], old)
     state.record_run("firewall", [pattern], [pattern], old)
     state.save()
+    (site.root / "daily").rename(site.root / "away")  # away this run: not looked into
     assert site.run() == 0
-    assert "gone-section" not in runs(site) and "firewall" in runs(site)
+    assert "gone-section" not in runs(site)
+    assert at(site, "firewall", pattern) == timestamp(old)  # kept, however old
     assert ("[gone-section] the last-run record forgotten: not configured, no run saved for "
             "1 days") in caplog.messages
 
@@ -584,3 +573,28 @@ def test_a_glob_with_an_unlistable_subdirectory_keeps_its_moment(
     (_, stdin), = site.calls()
     assert "DENY 192.0.2.28" in body_of(stdin)
     assert site.offset("firewall", during) == during.stat().st_size
+
+# -- an unsearchable directory under a wildcard component, through the run (issue #71) ---------
+
+
+def test_an_unsearchable_directory_under_a_wildcard_is_a_failed_item_and_keeps_the_moment(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The listing problem is the section's failed item (exit 1, the one stderr line) and the
+    glob is not looked into, so its record's moment stays where it was -- a file created
+    meanwhile is still new once the directory is searchable (the mutant: nothing matched,
+    nothing said, the moment moved on)."""
+    pattern = (site.root / "hosts" / "*" / "messages").as_posix()
+    (site.root / "hosts" / "r1").mkdir(parents=True)
+    site.write_config(firewall_files=pattern)
+    site.prime()
+    moment = back_date(site, "firewall", 100)
+    locked = (site.root / "hosts").as_posix()
+    with pytest.MonkeyPatch.context() as outage:
+        unsearchable_listing(outage, locked)
+        assert site.run() == 1
+    err = capsys.readouterr().err
+    assert err == (f"logalert: failed: [firewall] {pattern}: cannot examine 1 of the 1 entries "
+                   f"of {locked} (Permission denied); is the directory searchable?; see the log"
+                   + NL)
+    assert at(site, "firewall", pattern) == moment  # not looked into: the moment kept
+    assert site.calls() == []

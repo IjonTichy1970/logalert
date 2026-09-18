@@ -325,6 +325,14 @@ cleanup() {
   if [ -n "${FULL_MOUNTED:-}" ]; then  # the full-disk check's tmpfs: before the tree goes
     bounded "$BOUND_CMD" umount "$T/full" 2>/dev/null && FULL_MOUNTED=""
   fi
+  if [ -n "${NOFT_MOUNTED:-}" ]; then  # the no-d_type check's ext4 image (issue #71)
+    bounded "$BOUND_CMD" umount "$T/noft" 2>/dev/null && NOFT_MOUNTED=""
+  fi
+  if [ -n "${STAGE_UNITS:-}" ]; then  # the documented unit's copies (issue #36)
+    rm -f /run/systemd/system/logalert-stage.service /run/systemd/system/logalert-stage.timer
+    bounded "$BOUND_CMD" systemctl daemon-reload > /dev/null 2>&1
+    STAGE_UNITS=""
+  fi
   [ -n "${T:-}" ] && rm -rf "$T"
 }
 trap cleanup EXIT
@@ -798,7 +806,7 @@ EOF
     ok "state file 600, lock 600, directory 750, all owned by $SVC"
   fi
 
-  echo "-- full disk: a state directory with no room refuses before any mail (issue #30)"
+  echo "-- full disk: a state directory with no room refuses before any mail (issue #30); the band's marker (issue #70)"
   # A 1 MiB tmpfs holding the service user's state directory: with a saved position and a
   # matching line pending, the run on the full disk must send nothing (measured before the
   # fix: a mail on every run), and a lock file created on the full disk is named by the
@@ -826,9 +834,80 @@ EOF
     else
       ok "a full disk: exit 1, the refusal on stderr, no mail"
     fi
+    # the band (issue #70): room for the positions as loaded, none for what the run adds.
+    # A section over a glob first-sights an empty directory with the disk free; 20 new
+    # files then grow its state past a page while the filler leaves exactly one page
+    # free (tmpfs gives a truncated page back at once; measured). Run b2 sends and
+    # cannot save and marks the lock; b3 refuses before any mail; with the room back,
+    # b4 sends once and clears the mark.
+    rm -f "$T/full/filler"
+    mkdir -p "$T/band"
+    chmod 755 "$T/band"
+    cat > "$T/band.conf" <<EOF
+[logalert]
+sendmail_path = $T/bin/sendmail
+state_file = $T/full/state/band.json
+from = alerts@example.net
+[band]
+subject = Band
+to = noc@example.net
+files = $T/band/*.log
+patterns =
+    disk failure
+EOF
+    chmod 644 "$T/band.conf"
+    as_svc b1 -f "$T/band.conf"; rc=$?  # first sight of the glob: its record saved
+    if [ "$rc" -eq 124 ]; then
+      skip "the band's first run did not finish within ${BOUND_CMD}s"
+    elif [ "$rc" -ne 0 ]; then
+      fail "the band's first run exited $rc: $(first_err b1)" "band-first"
+    else
+      for n in $(seq 1 20); do printf 'disk failure %s\n' "$n" > "$T/band/host$n.log"; done
+      chmod 644 "$T/band"/*.log
+      bounded "$BOUND_CMD" dd if=/dev/zero of="$T/full/filler" bs=4096 > /dev/null 2>&1
+      bounded "$BOUND_CMD" truncate -s -"$(getconf PAGESIZE)" "$T/full/filler"
+      before="$(fake_calls)"
+      as_svc b2 -f "$T/band.conf"; rc=$?
+      if [ "$rc" -eq 124 ]; then
+        skip "the band run did not finish within ${BOUND_CMD}s"
+      elif [ "$rc" -ne 1 ] || ! grep -q 'band] state not saved: state file .*cannot write (No space left on device)' "$T/b2.err"; then
+        fail "the band run exited $rc: $(first_err b2)" "band-send"
+      elif [ "$(( $(fake_calls) - before ))" -ne 1 ]; then
+        fail "the band run mailed $(( $(fake_calls) - before )) time(s); once is the band" "band-send"
+      elif ! grep -q ' unsaved [0-9]' "$T/full/state/lock"; then
+        fail "the lock carries no unsaved marker after the band run: $(cat "$T/full/state/lock")" "band-mark"
+      else
+        ok "the band: one mail, the save refused, the lock marked ($(cut -d' ' -f3- "$T/full/state/lock"))"
+      fi
+      before="$(fake_calls)"
+      as_svc b3 -f "$T/band.conf"; rc=$?
+      if [ "$rc" -eq 124 ]; then
+        skip "the marked run did not finish within ${BOUND_CMD}s"
+      elif [ "$rc" -ne 1 ] || ! grep -q 'the last run sent mail it could not record; nothing is sent until the state can be saved' "$T/b3.err"; then
+        fail "the marked run exited $rc: $(first_err b3)" "band-refuse"
+      elif [ "$(fake_calls)" -ne "$before" ]; then
+        fail "the marked run mailed; nothing must leave the box until the room is proven" "band-refuse"
+      elif ! grep -q ' unsaved [0-9]' "$T/full/state/lock"; then
+        fail "the marker did not survive the refused run" "band-refuse"
+      else
+        ok "the marked run: exit 1, the refusal on stderr, no mail, the marker kept"
+      fi
+      rm -f "$T/full/filler"
+      as_svc b4 -f "$T/band.conf"; rc=$?
+      if [ "$rc" -eq 124 ]; then
+        skip "the run after the room came back did not finish within ${BOUND_CMD}s"
+      elif [ "$rc" -ne 0 ] || [ "$(( $(fake_calls) - before ))" -ne 1 ]; then
+        fail "the run with the room back exited $rc with $(( $(fake_calls) - before )) mail(s): $(first_err b4)" "band-clear"
+      elif grep -q 'unsaved' "$T/full/state/lock" || [ "$(grep -c '"offset"' "$T/full/state/band.json")" -lt 20 ]; then
+        fail "after the proof: lock=$(cat "$T/full/state/lock"), $(grep -c '"offset"' "$T/full/state/band.json") positions saved" "band-clear"
+      else
+        ok "the room proven: one mail (the marked run's lines, once more), 20 positions saved, the marker cleared"
+      fi
+    fi
     # the lock created for the first time on the full disk: the freed block goes to the
     # filler first, so the holder line has nowhere to go
     rm -f "$T/full/state/lock"
+    before="$(fake_calls)"  # the band above mailed twice by design
     bounded "$BOUND_CMD" dd if=/dev/zero of="$T/full/filler" bs=4096 oflag=append conv=notrunc > /dev/null 2>&1
     as_svc f3 -f "$T/full.conf"; rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -836,12 +915,121 @@ EOF
     elif [ "$rc" -ne 1 ] || ! grep -q 'state directory: No space left on device (' "$T/f3.err" || grep -q 'must belong' "$T/f3.err"; then
       fail "a fresh lock on the full disk: exit $rc, $(first_err f3)" "full-disk-lock"
     elif [ "$(fake_calls)" -ne "$before" ]; then
-      fail "the run with a fresh lock on the full disk mailed" "full-disk-lock"
+      fail "the run with a fresh lock on the full disk mailed: $(first_err f3)" "full-disk-lock"
     else
       ok "a fresh lock on the full disk: exit 1, the errno without the ownership hint, no mail"
     fi
     rm -f "$T/full/filler"
     bounded "$BOUND_CMD" umount "$T/full" && FULL_MOUNTED=""
+  fi
+
+  echo "-- glob over an unsearchable directory: a failed item where the listing has no d_type (issue #71)"
+  # A 16 MiB ext4 image made WITHOUT the filetype feature: its listings carry no d_type, so
+  # the is_dir of each candidate under a wildcard directory component is an lstat the
+  # unsearchable (0644) parent refuses -- before the fix every candidate was dropped in
+  # silence and the glob matched nothing and said nothing. The control is the same tree
+  # on the stage's own filesystem (d_type filled), where the refusal is the per-file one.
+  # mkfs.ext4 and a loop mount take the privilege the sandbox and CI's sudo have.
+  mkdir -p "$T/noft" "$T/dtype"
+  if ! command -v mkfs.ext4 > /dev/null 2>&1; then
+    skip "mkfs.ext4 is not on PATH (e2fsprogs) -- the no-d_type check needs an ext4 image"
+  elif ! bounded "$BOUND_CMD" dd if=/dev/zero of="$T/noft.img" bs=1M count=16 status=none > "$T/dd.err" 2>&1; then
+    skip "cannot make a 16 MiB image under $T ($(head -1 "$T/dd.err"))"
+  elif ! bounded "$BOUND_CMD" mkfs.ext4 -q -F -O ^filetype "$T/noft.img" > "$T/mkfs.err" 2>&1; then
+    skip "mkfs.ext4 -O ^filetype failed ($(head -1 "$T/mkfs.err")) -- the no-d_type check needs the image"
+  elif ! bounded "$BOUND_CMD" mount -o loop "$T/noft.img" "$T/noft" > "$T/mount2.err" 2>&1; then
+    skip "cannot loop-mount the ext4 image under $T ($(head -1 "$T/mount2.err")) -- the no-d_type check needs one"
+  else
+    NOFT_MOUNTED=1
+    for root in "$T/noft" "$T/dtype"; do
+      install -d -m 755 "$root/hosts/r1" "$root/hosts/r2"
+      printf 'DENY 192.0.2.71\n' > "$root/hosts/r1/messages"
+      printf 'DENY 192.0.2.72\n' > "$root/hosts/r2/messages"
+      chmod 644 "$root/hosts/r1/messages" "$root/hosts/r2/messages"
+      chmod 644 "$root/hosts"   # root's, listable by $SVC, not searchable
+      chmod 755 "$root"
+    done
+    cat > "$T/noft.conf" <<EOF
+[logalert]
+sendmail_path = $T/bin/sendmail
+state_file = $T/state/state.json
+from = alerts@example.net
+log = file:$T/noft.log
+[noft]
+subject = No d_type
+to = noc@example.net
+files = $T/noft/hosts/*/messages
+patterns =
+    DENY
+[dtype]
+subject = With d_type
+to = noc@example.net
+files = $T/dtype/hosts/*/messages
+patterns =
+    DENY
+EOF
+    chmod 644 "$T/noft.conf"
+    install -o "$SVC" -m 640 /dev/null "$T/noft.log"
+    before="$(fake_calls)"
+    as_svc g1 -f "$T/noft.conf"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+      skip "the run over the unsearchable directories did not finish within ${BOUND_CMD}s"
+    elif [ "$rc" -ne 1 ]; then
+      fail "the run over the unsearchable directories exited $rc, not 1: $(first_err g1)" "no-dtype"
+    elif ! grep -q "\[noft\] $T/noft/hosts/\*/messages: cannot examine 2 of the 2 entries of $T/noft/hosts (Permission denied); is the directory searchable?" "$T/g1.err"; then
+      fail "the no-d_type glob did not report the unsearchable directory: $(first_err g1)" "no-dtype"
+    elif ! grep -q "\[dtype\] $T/dtype/hosts/r1/messages: Permission denied" "$T/g1.err"; then
+      fail "the control (d_type filled) did not fail per file: $(first_err g1)" "no-dtype-control"
+    elif [ "$(fake_calls)" -ne "$before" ]; then
+      fail "the run over the unsearchable directories mailed $(( $(fake_calls) - before )) time(s)" "no-dtype"
+    else
+      ok "no d_type: one failed item naming the unsearchable directory; with d_type: one per file; exit 1, no mail"
+    fi
+    bounded "$BOUND_CMD" umount "$T/noft" && NOFT_MOUNTED=""
+  fi
+
+  echo "-- the documented unit: the text INSTALL.md shows is a unit systemd accepts, with the timeout it claims (issue #36)"
+  # The fenced block INSTALL.md and USAGE.md share (pinned one text by the doc tests) is
+  # written under /run/systemd/system as logalert-stage.{service,timer} -- ExecStart pointed
+  # at this tree, the user as documented (verify checks the executable, not the user; the
+  # stage's `nobody` would draw its "special user" warning) -- and systemd-analyze verify is
+  # asked about it, its
+  # TEXT scoped to the units' names (its exit code cannot gate a unit); then the start
+  # timeout the doc claims must be what systemd reports (measured: without the line a
+  # oneshot has TimeoutStartUSec=infinity, and a wedged run held the unit activating and
+  # the timer waiting for good). Where systemd is not PID 1 the check is skipped.
+  if ! [ -d /run/systemd/system ] || ! bounded "$BOUND_CMD" systemctl show -p Version --value > /dev/null 2>&1; then
+    skip "systemd is not PID 1 here -- the documented unit cannot be verified"
+  elif ! command -v systemd-analyze > /dev/null 2>&1; then
+    skip "systemd-analyze is not on PATH -- the documented unit cannot be verified"
+  else
+    # the bare-fenced block whose first line names the service (a fence with an info
+    # string, ```bash, opens the other blocks: every ``` line toggles, only a bare one keeps)
+    awk '/^```/ { if (fence) { if (keep) { exit } ; fence = 0 } else { fence = 1; bare = ($0 == "```") } ; next } fence && bare && /^# \/etc\/systemd\/system\/logalert\.service$/ { keep = 1 } fence && keep { print }' "$REPO_ROOT/INSTALL.md" > "$T/units.txt"
+    awk '/^# \/etc\/systemd\/system\/logalert\.timer/ { part = 2 } part != 2 { print }' "$T/units.txt" \
+      | sed -e "s|^ExecStart=.*|ExecStart=$T/bin/logalert -f $T/logalert.conf|" \
+      > /run/systemd/system/logalert-stage.service
+    awk '/^# \/etc\/systemd\/system\/logalert\.timer/ { part = 2 } part == 2 { print }' "$T/units.txt" \
+      > /run/systemd/system/logalert-stage.timer
+    STAGE_UNITS=1
+    bounded "$BOUND_CMD" systemctl daemon-reload > /dev/null 2>&1
+    out="$(bounded "$BOUND_CMD" systemd-analyze verify /run/systemd/system/logalert-stage.service /run/systemd/system/logalert-stage.timer 2>&1 | tr -d '\r')"
+    timeout_now="$(bounded "$BOUND_CMD" systemctl show -p TimeoutStartUSec --value logalert-stage.service 2>/dev/null)"; rc=$?  # rc read before any pipe
+    timeout_now="$(printf '%s' "$timeout_now" | tr -d '\r')"
+    if [ "$rc" -eq 124 ]; then
+      skip "systemctl show did not answer within ${BOUND_CMD}s -- the documented unit's timeout was not read"
+    elif ! grep -q '^TimeoutStartSec=' /run/systemd/system/logalert-stage.service; then
+      fail "the documented unit carries no TimeoutStartSec= line" "unit-timeout"
+    elif printf '%s\n' "$out" | grep -q 'logalert-stage'; then
+      fail "systemd-analyze verify on the documented unit: $(printf '%s\n' "$out" | grep 'logalert-stage' | head -1)" "unit-verify"
+    elif [ "$timeout_now" != "1h" ]; then
+      fail "the documented unit's start timeout is '${timeout_now:-unknown}', not the hour the doc claims" "unit-timeout"
+    else
+      ok "the documented unit verifies clean and reports TimeoutStartUSec=1h"
+    fi
+    rm -f /run/systemd/system/logalert-stage.service /run/systemd/system/logalert-stage.timer
+    bounded "$BOUND_CMD" systemctl daemon-reload > /dev/null 2>&1
+    STAGE_UNITS=""
   fi
 }
 

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import FAKE_KNOBS, run_logalert
 from esmtp_stub import StubConfig, run_stub  # tests/ has no __init__: the rootdir import
 from fake_sendmail import install
 
@@ -64,7 +65,12 @@ def fake_mta(tmp_path: Path) -> Path:
     return install(tmp_path)
 
 
-def make_config(tmp_path: Path, settings: str = "", to: str = "noc@example.net") -> Config:
+def make_config(tmp_path: Path, settings: str = "", to: str = "noc@example.net",
+                sender: str | None = SENDER) -> Config:
+    """A one-section config; a From is set unless the test is about the default one
+    (``sender=None``), so no test reaches the resolver by accident (issue #43)."""
+    if sender is not None and "from =" not in settings:
+        settings = f"from = {sender}\n" + settings
     text = (f"[logalert]\nlog = file:{(tmp_path / 'activity.log').as_posix()}\n{settings}\n"
             f"[router-disk]\nsubject = Router disk failure\n"
             f"to = {to}\nfiles = {FILE}\npatterns =\n    disk failure\n")
@@ -109,7 +115,7 @@ def stuffed(data: bytes) -> bytes:
 def fake_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     where = tmp_path / "fake"
     monkeypatch.setenv("LOGALERT_FAKE_DIR", str(where))
-    for knob in ("LOGALERT_FAKE_SLEEP", "LOGALERT_FAKE_EXIT", "LOGALERT_FAKE_STDERR_BYTES"):
+    for knob in FAKE_KNOBS:
         monkeypatch.delenv(knob, raising=False)
     return where
 
@@ -389,8 +395,10 @@ def test_resolve_sender_prefers_the_override_then_the_config_and_never_looks_up(
         resolve_sender(config.settings, "Ops <ops@example.net>")
 
 
-def test_the_default_from_is_the_running_user_at_this_host(tmp_path: Path) -> None:
-    config = make_config(tmp_path)
+def test_the_default_from_is_the_running_user_at_this_host(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getfqdn", lambda: "router1.example.net")  # never the resolver
+    config = make_config(tmp_path, sender=None)
     if sys.platform == "win32":
         user = getpass.getuser()
     else:
@@ -633,7 +641,7 @@ def test_check_config_prints_and_checks_the_from_the_run_would_use(
     assert "from: cron@override.example.net (--from)" + NL in capsys.readouterr().out
     # a default From the run would refuse (a host name with an underscore, a user with a
     # space) is a configuration error here too, not a surprise at the first alert
-    make_config(tmp_path, usable)
+    make_config(tmp_path, usable, sender=None)
     monkeypatch.setattr(logalert.config, "default_from", lambda: "bad user@router1")
     monkeypatch.setattr(logalert.transport, "default_from", lambda: "bad user@router1")
     assert main(["--check-config", "-f", conf]) == 2
@@ -649,10 +657,8 @@ def test_test_mail_from_a_real_console_prints_each_line_once(tmp_path: Path) -> 
     with run_stub(StubConfig(refuse=frozenset({"ops@example.net"}))) as server:
         smtp_settings(tmp_path, server.port, "from = alerts@example.net" + NL,
                       to="noc@example.net, ops@example.net")
-        result = subprocess.run(
-            [sys.executable, "-m", "logalert", "--test-mail", "router-disk", "-f",
-             str(tmp_path / "logalert.conf")],
-            capture_output=True, encoding="utf-8", errors="replace", check=False)
+        result = run_logalert("--test-mail", "router-disk", "-f",
+                              str(tmp_path / "logalert.conf"))
         server.wait_idle()
     assert result.returncode == 1
     assert result.stdout.splitlines()[1] == "to: noc@example.net"
@@ -661,10 +667,8 @@ def test_test_mail_from_a_real_console_prints_each_line_once(tmp_path: Path) -> 
                                           "User unknown"]
     with run_stub() as server:
         smtp_settings(tmp_path, server.port, "from = alerts@example.net" + NL)
-        result = subprocess.run(
-            [sys.executable, "-m", "logalert", "--test-mail", "router-disk", "-f",
-             str(tmp_path / "logalert.conf")],
-            capture_output=True, encoding="utf-8", errors="replace", check=False)
+        result = run_logalert("--test-mail", "router-disk", "-f",
+                              str(tmp_path / "logalert.conf"))
         server.wait_idle()
     assert result.returncode == 0 and result.stderr == ""
     lines = result.stdout.splitlines()

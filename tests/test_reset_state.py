@@ -23,6 +23,7 @@ def config(tmp_path: Path) -> str:
         # --check-config exits 2 without a usable transport since #11: the interpreter
         # stands in for sendmail (exists, executable, on both platforms)
         f"sendmail_path = {Path(sys.executable).as_posix()}\n"
+        "from = alerts@example.net\n"  # no resolver asked for a default From (issue #43)
         "[router-disk]\nsubject = Router disk failure\nto = noc@example.net\n"
         f"files = {log}\npatterns =\n    disk failure\n"
         "[firewall]\nsubject = Denies\nto = noc@example.net\n"

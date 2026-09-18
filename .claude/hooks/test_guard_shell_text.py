@@ -254,6 +254,70 @@ check(
     2,
 )
 
+# ---- the string as spelled (issue #55): settings.json's command through the shell that runs it --
+#
+# Claude Code passes a `command` hook to `sh -c` on Linux and macOS and to Git Bash on Windows,
+# with ITS environment -- not the gate's, where the venv's Scripts directory is first on PATH
+# and `python` resolves trivially. So the command string is run as spelled, three times, a
+# BLOCK payload on stdin: (a) with the repo's .venv entries stripped from PATH -- the
+# interpreter the hook actually finds on this host -- expecting the block (exit 2); (b) with
+# PATH reduced to a directory holding only a `python3` shim -- the Debian/Ubuntu host without
+# python-is-python3, where the bare `python` made the hook exit 127 and every command
+# proceed; (c) with an empty PATH, where the launcher must fail CLOSED with its own message,
+# never proceed. No `sh` is could-not-check: a FAIL, never a pass. MUTATIONS: the python3
+# fallback dropped from the launcher -> (b) exits 127; its `exit 2` dropped -> (c) exits 127.
+import shutil
+import tempfile
+
+SETTINGS = os.path.join(HERE, os.pardir, "settings.json")
+REPO_ROOT = os.path.abspath(os.path.join(HERE, os.pardir, os.pardir))
+
+
+def hook_command():
+    with open(SETTINGS, encoding="utf-8") as fh:
+        data = json.load(fh)
+    for entry in data["hooks"]["PreToolUse"]:
+        if entry.get("matcher") == "Bash":
+            return entry["hooks"][0]["command"]
+    raise SystemExit("settings.json: no PreToolUse hook for Bash")
+
+
+def hook_verdict(path_env):
+    """(exit code, stderr) of the command string as spelled, under `sh -c` with PATH set."""
+    sh = shutil.which("sh")
+    if sh is None:
+        FAILURES.append("no `sh` on this host: the hook command as spelled could not be run "
+                        "(could-not-check is never a pass)")
+        return None, ""
+    payload = json.dumps({"tool_name": "Bash",
+                          "tool_input": {"command": "python - <<'PY'" + NL + "open(p,'w')" + NL
+                                         + "PY"}})
+    env = dict(os.environ, PATH=path_env, CLAUDE_PROJECT_DIR=REPO_ROOT)
+    proc = subprocess.run([sh, "-c", hook_command()], input=payload, capture_output=True,
+                          encoding="utf-8", errors="replace", env=env, cwd=REPO_ROOT)
+    return proc.returncode, proc.stderr
+
+
+_stripped = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep)
+                            if ".venv" not in p)
+_rc, _err = hook_verdict(_stripped)
+check("⭐ the hook command as spelled blocks with the venv off PATH (the interpreter the hook "
+      "finds)", (_rc, "BLOCKED" in _err), (2, True))
+with tempfile.TemporaryDirectory() as _shims:
+    _shim = os.path.join(_shims, "python3")
+    with open(_shim, "w", encoding="utf-8", newline=NL) as fh:  # a fresh file in a temp dir
+        fh.write("#!/bin/sh" + NL + "exec \"" + sys.executable.replace(BS, "/") + "\" \"$@\""
+                 + NL)
+    os.chmod(_shim, 0o755)
+    _rc, _err = hook_verdict(_shims)
+    check("⭐ a host with python3 and no python still blocks (the launcher's fallback)",
+          (_rc, "BLOCKED" in _err), (2, True))
+    _empty = os.path.join(_shims, "nothing")
+    os.mkdir(_empty)
+    _rc, _err = hook_verdict(_empty)
+    check("⭐ a host with neither interpreter is refused, never proceeded (fail closed)",
+          (_rc, "neither python nor python3" in _err), (2, True))
+
 # ---- anti-vacuity: the guard must be capable of BOTH answers ----------------------------------
 #
 # ⚠️ Without this, a guard stuck on "allow" passes every ALLOW case above and reads as coverage.

@@ -6,6 +6,8 @@ import re
 import smtplib
 from pathlib import Path
 
+from conftest import fences
+
 from logalert.__main__ import build_parser
 from logalert.config import GLOBAL_KEYS, WATCH_KEYS, example_config
 
@@ -19,10 +21,9 @@ def _text() -> str:
 
 def test_the_quoted_example_is_the_packages_example_verbatim() -> None:
     text = _text()
-    start = text.index("### The example")
-    match = re.search(r"```ini" + NL + "(.*?)```", text[start:], re.S)
-    assert match, "no ```ini block under 'The example'"
-    assert match.group(1) == example_config()
+    blocks = fences(text[text.index("### The example"):], "ini")
+    assert blocks, "no ```ini block under 'The example'"
+    assert blocks[0] == example_config()
 
 
 def _heads(section: str) -> list[str]:
@@ -132,18 +133,23 @@ def test_the_position_section_and_the_table_carry_the_full_disk_refusal() -> Non
     """Issue #30: the opening save and its refusal are documented in the program's own words;
     a dropped sentence or row reddens here."""
     text = _text()
-    section = text[text.index("## Position tracking"):text.index("## Globs")]
-    assert "saved once at the" + NL + "start of every run but a dry run" in section
+    section = text[text.index("## Position tracking"):text.index("## Globs")].replace(NL, " ")
+    assert "saved once at the start of every run but a dry run" in section
+    assert "marks the `lock` file beside the state with `unsaved <bytes>`" in section  # #70
     table = text[text.index("## Troubleshooting"):]
-    row = next(r for r in table.splitlines() if "No space left on device" in r)
-    assert "nothing was sent" in row and "Free space" in row and "Disk quota exceeded" in row
+    rows = [r for r in table.splitlines() if "No space left on device" in r]
+    assert len(rows) == 2  # the full disk (issue #30) and the band's marker (issue #70)
+    assert "nothing was sent" in rows[0] and "Free space" in rows[0]
+    assert "Disk quota exceeded" in rows[0]
+    assert "the last run sent mail it could not record" in rows[1] and "once" in rows[1]
     twice = next(r for r in table.splitlines() if r.startswith("| The same lines arrive twice"))
-    assert "refused before any mail" in twice and "until space is freed" in twice
+    assert "refused before any mail" in twice and "marks the `lock` file" in twice
     package = DOC.parents[1] / "logalert"
     source = (package / "run.py").read_text(encoding="utf-8")
     assert "nothing was sent, because a run that " in source  # the line breaks there
     assert "cannot save its position would send everything again next time" in source
     assert "cannot write (" in (package / "state.py").read_text(encoding="utf-8")
+    assert "the last run sent mail it could not " in source  # the #70 refusal, breaks there
 
 
 def test_the_position_section_says_a_first_sight_keeps_its_place_on_a_failed_delivery() -> None:
@@ -164,6 +170,8 @@ def test_the_causes_paragraph_quotes_every_cause_in_the_logs_own_words() -> None
         CAUSE_UNREADABLE,
         CAUSE_UNSEARCHABLE,
         CAUSES,
+        TAIL_COPIES,
+        TAIL_LIVE_ONLY,
     )
     text = _text()
     paragraph = text[text.index('**The "no rotated copy" warning.**'):
@@ -172,8 +180,84 @@ def test_the_causes_paragraph_quotes_every_cause_in_the_logs_own_words() -> None
                   CAUSE_NO_FIRST_LINE):
         assert "`" + cause + "`" in paragraph, cause
     assert "a permission kept the rotated copies out of reach" in paragraph  # the item
+    for tail in (TAIL_COPIES, TAIL_LIVE_ONLY):  # the two ways the line ends (issue #64)
+        assert tail in paragraph, tail
     for shape in ("could not be read (Permission denied); skipped",
                   "cannot list /var/log/old while looking for rotated copies (Permission denied)",
                   "entries of /var/log/old while looking for rotated copies (Permission denied); "
                   "is the directory searchable?"):
         assert shape in paragraph, shape
+
+
+def test_the_rotation_during_the_run_paragraph_quotes_the_two_stop_lines() -> None:
+    """Issues #32, #66 and #67: the three lines a run writes when a rotation lands under it
+    are quoted in the paragraph, in the code's words."""
+    text = _text().replace(NL, " ")
+    for shape in ("was renamed or removed under us (a rotation during the run); stopping "
+                  "here, the next run resumes after",
+                  "truncated under us during the read (a copytruncate during the run?); "
+                  "stopping at offset",
+                  "the live file was rotated and compressed during the run (router.log.1.gz); "
+                  "its lines were read from there"):
+        assert shape in text, shape
+
+
+def test_the_position_section_and_the_table_carry_the_anchor() -> None:
+    """Issue #34: the anchor is named where the state file's fields are, the truncation
+    rule says what it adds, the in-run check's paragraph names its one blind spot in
+    place of the limit it confessed to, and the table has the rewrite row -- in the
+    program's own words, wrapped or not."""
+    text = _text()
+    section = text[text.index("## Position tracking"):text.index("## Globs")].replace(NL, " ")
+    assert "as the run read them (the `anchor`:" in section
+    assert "an entry from 0.1.0 has none and is trusted once" in section
+    assert "or holding other bytes before the position than the ones read" in section
+    assert "the bytes before the position the ones it read" in section
+    assert "caught within the chunk that read it, by the bytes before the position" in section
+    assert "a file of nothing but identical lines, aligned" in section
+    assert "is invisible to that check, as it is to the next run" in section
+    assert "invisible to that check, as it is to the next run's truncation rule" not in section
+    table = text[text.index("## Troubleshooting"):]
+    row = next(r for r in table.splitlines() if "truncated and refilled?" in r)
+    assert ("`... the bytes before the saved offset are not the ones read (truncated and "
+            "refilled?); truncated`") in row  # the _log shape: note, then the verdict
+    assert "rewrites its log in place" in row and "found the saved position by content" in row
+    assert "issue #74" in row  # the older same-banner copy taken as a guess
+    source = (DOC.parents[1] / "logalert" / "cursor.py").read_text(encoding="utf-8")
+    assert "the bytes before the saved offset are not the ones read " in source  # breaks there
+    assert "(truncated and refilled?)" in source
+    assert 'log.info("%s: %s; %s", where, self.note, self.verdict)' in source
+
+
+def test_the_globs_section_and_the_table_carry_the_unsearchable_directory_line() -> None:
+    """Issue #71: the second failed-item line of a glob, in the program's own words, in the
+    Globs section and in the troubleshooting row beside `cannot list`."""
+    text = _text()
+    section = text[text.index("## Globs"):text.index("## Running it")].replace(NL, " ")
+    shape = ("cannot examine 2 of the 2 entries of /var/log/hosts (Permission denied); is the "
+             "directory searchable?")
+    assert shape in section and "its record's moment stays where it was" in section
+    table = text[text.index("## Troubleshooting"):]
+    row = next(r for r in table.splitlines() if "cannot list /var/log/hosts" in r)
+    assert shape in row and "can list it but not search it" in row
+    source = (DOC.parents[1] / "logalert" / "globs.py").read_text(encoding="utf-8")
+    assert 'f"cannot examine {denied} of the {examined} entries of {path} ({reason}); "' in source
+    assert 'f"is the directory searchable?"' in source
+
+
+def test_the_lock_verdicts_are_crons_and_the_timer_paragraph_names_the_timeout() -> None:
+    """Issue #36: under the timer the lock is never contended, so the two lock verdicts and
+    the `lock_stale` row say cron, and the timer paragraph names `TimeoutStartSec=` and
+    systemd's own words for its expiry."""
+    text = _text()
+    running = text[text.index("## Running it"):text.index("## Mail")].replace(NL, " ")
+    assert "Both verdicts are cron's" in running
+    assert "the timer never starts a unit that is still activating" in running
+    assert "`TimeoutStartSec=` ends it with SIGTERM" in running
+    assert "`Failed with result 'timeout'`" in running and "exit 143" in running
+    reference = text[text.index("### The `[logalert]` section"):text.index("### The example")]
+    row = next(r for r in reference.splitlines() if r.startswith("| `lock_stale`"))
+    assert "Cron's: under the systemd timer the lock is never contended" in row
+    table = text[text.index("## Troubleshooting"):]
+    rows = [r for r in table.splitlines() if r.startswith("| `stale lock:")]
+    assert len(rows) == 2 and all("(exit 1, under cron)" in r for r in rows)

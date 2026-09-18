@@ -17,17 +17,28 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
     that cannot save sends nothing. The residual window is a disk with room for the state
     as loaded but not for
     the state plus what the run adds -- a filesystem block wide for an ordinary run, more
-    for one that adds many cursors -- where a run still sends and cannot save, on every run,
-    until space is freed (review: reproduced on a tmpfs with exactly one free page); a disk
-    that keeps filling is refused at the next opening.
+    for one that adds many cursors -- where a run still sends and cannot save (review:
+    reproduced on a tmpfs with exactly one free page). Issue #70 bounds it to ONE such
+    run: the run marks the lock's holder line with the size that did not fit (the lock's
+    block is the one write a full disk takes, measured), and the next run's opening save
+    must then REACH that size plus a block (``save(reach=...)``: the JSON padded with
+    spaces to the size, fsynced, cut back to the JSON before the replace) or the run
+    refuses to send; a passed proof clears the marker, and the run that passes re-sends
+    what the marked run sent -- the one duplicate at-least-once delivery allows.
+    A disk that keeps filling is refused at the next opening.
   * A missing file is the first run. A file that cannot be parsed is a hard error naming the
     file and ``--reset-state``; logalert never silently starts over.
   * An entry unseen for ``state_ttl`` days expires; ``touch`` records a sighting even when the
     section's mail failed, so a file that is present never expires.
   * ``version`` is the schema version. A file from a newer logalert is refused, not guessed at.
     A cursor's ``size`` and ``mtime`` (issue #44: what a compressed file looked like when it
-    was last read, so an unchanged archive is not decompressed again) are optional too;
-    0.1.0's reader drops them on save and the schema version stays 1.
+    was last read, so an unchanged archive is not decompressed again; issue #65: what the
+    rotated copy a cursor is parked on looked like, so the next run finds that copy by
+    its mtime before guessing by content) are optional too;
+    0.1.0's reader drops them on save and the schema version stays 1. So is ``anchor``
+    (issue #34: what the bytes before ``offset`` hashed to as the run read them, so a
+    file truncated and refilled past the position with the same first line is not
+    continued into); a cursor without one is trusted once and gains it on the next save.
     A cursor's ``line`` (the complete lines before ``offset``, so a report can number lines
     as the file does) is optional: a file without it is read, counted once, and updated.
   * A run as root against a state file another user owns is refused up front: ``mkstemp``
@@ -68,6 +79,7 @@ if sys.platform != "win32":
 
 STATE_VERSION = 1
 LOCK_FILE_NAME = "lock"
+STATE_HEADROOM = 4096  # the block a proving save reaches past the size that did not fit
 
 RESET_HINT = "fix it or start over with --reset-state"
 _MAX_OFFSET = 2**63 - 1  # seek() refuses more; inode and device ids are unbounded
@@ -91,6 +103,9 @@ class Cursor:
     size: int | None = None  # the file's st_size at the read (issue #44); None before it
     mtime: float | None = None  # its st_mtime; a compressed file with both unchanged is
     #                             not opened again
+    anchor: str | None = None  # sha256 of the (at most 4 KiB of) bytes before offset, as
+    #                            read (issue #34); None from 0.1.0, on a compressed file
+    #                            and on a parked copy
 
 
 RunRecord = dict[str, str]  # glob, as written in ``files`` -> ISO 8601 UTC seconds, the run START
@@ -214,9 +229,14 @@ class State:
                 for section, record in sorted(self.runs.items())}
         return {"version": STATE_VERSION, "entries": entries, "runs": runs}
 
-    def save(self) -> None:
-        """Write the file atomically; see the module docstring. Clears ``dirty``."""
-        write_atomically(self.path, json.dumps(self.to_json(), indent=2) + "\n")
+    def render(self) -> str:
+        """The file's text: what ``save`` writes, and how many bytes it needs."""
+        return json.dumps(self.to_json(), indent=2) + "\n"
+
+    def save(self, reach: int | None = None) -> None:
+        """Write the file atomically; see the module docstring. Clears ``dirty``. With
+        ``reach``, the write must also have room for a file that long (issue #70)."""
+        write_atomically(self.path, self.render(), reach=reach)
         self.dirty = False
 
 
@@ -322,7 +342,8 @@ def _cursor(fields: dict[str, Any], corrupt: Any, where: str) -> Cursor:
         raise corrupt(f"entries{where}: 'last_seen' is not a UTC timestamp") from None
     return Cursor(offset=offset, ino=ino, dev=dev, fingerprint=fp, realpath=realpath,
                   last_seen=last_seen, line=line, size=size,
-                  mtime=None if mtime is None else float(mtime))
+                  mtime=None if mtime is None else float(mtime),
+                  anchor=text("anchor", optional=True))
 
 
 def check_state_dir(state_file: str) -> None:
@@ -396,18 +417,46 @@ def _foreign_owner(state_file: str) -> str | None:
             return f"#{uid}"  # sudo -u accepts a numeric uid spelled this way
 
 
-def write_atomically(path: str, text: str) -> None:
-    """Temp file in the same directory (``os.replace`` across devices is EXDEV), fsync, replace."""
+def _write_all(fd: int, data: bytes) -> None:
+    """``os.write`` until every byte is out: a write can be short (measured on a tmpfs
+    near its limit) and says nothing."""
+    done = 0
+    while done < len(data):
+        done += os.write(fd, data[done:])
+
+
+def _write_pad(fd: int, size: int) -> None:
+    """``size`` bytes that no filesystem can store for less (issue #70): the padding that
+    proves the room, written in bounded pieces."""
+    while size > 0:
+        piece = min(size, 65536)
+        _write_all(fd, os.urandom(piece))
+        size -= piece
+
+
+def write_atomically(path: str, text: str, reach: int | None = None) -> None:
+    """Temp file in the same directory (``os.replace`` across devices is EXDEV), fsync,
+    replace. ``reach`` (issue #70): the text is padded with random bytes to that many
+    before the fsync and cut back to the text after it, so a write that succeeds proves
+    the room for a file that long; the file that lands is the text alone."""
     directory = os.path.dirname(path) or "."
+    body = text.encode("utf-8")
+    padding = max(0, (reach or 0) - len(body))
     try:
         fd, temp = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=directory)
     except OSError as exc:
         raise StateError(f"state directory {directory} is not writable ({exc.strerror})") from exc
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            _write_all(fd, body)
+            if padding:  # random, in bounded pieces: a compressing filesystem stores
+                _write_pad(fd, padding)  # spaces for free, and a size need not fit in RAM
+            os.fsync(fd)
+            if padding:  # the room was there: give it back before the file lands
+                os.ftruncate(fd, len(body))
+                os.fsync(fd)
+        finally:
+            os.close(fd)  # before the replace: Windows refuses to replace an open file
         os.replace(temp, path)
     except BaseException as exc:
         try:

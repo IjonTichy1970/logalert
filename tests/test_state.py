@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import try_symlink
 
 from logalert.state import (
     STATE_VERSION,
@@ -57,7 +58,8 @@ def test_round_trip_and_the_on_disk_shape(tmp_path: Path) -> None:
     entry = data["entries"]["router-disk"]["/var/log/router.log"]
     assert entry == {"offset": 10, "ino": 1234, "dev": 56, "fingerprint": "ab" * 32,
                      "realpath": "/var/log/r.log", "last_seen": "2026-09-14T12:00:00Z",
-                     "line": None, "size": None, "mtime": None}  # size/mtime: issue #44
+                     "line": None, "size": None, "mtime": None,  # size/mtime: issue #44
+                     "anchor": None}  # the bytes before the offset, hashed (issue #34)
     assert data["entries"]["firewall"]["/var/log/router.log"]["fingerprint"] is None
     again = load_state(path)
     assert again.entries == state.entries
@@ -130,6 +132,8 @@ def test_forget_one_file_or_everything(tmp_path: Path) -> None:
         ('{"version": 1, "entries": {"a": {"/x": {"offset": 1, "ino": 2, "dev": 3, '
          '"fingerprint": null, "realpath": "/x", "last_seen": "yesterday"}}}}',
          "'last_seen' is not a UTC timestamp"),
+        ("", "not valid JSON"),  # an empty file is never a silent first run (issue #41)
+        ("  " + chr(10), "not valid JSON"),
     ],
 )
 def test_corrupt_state_is_a_hard_error_naming_the_file_and_the_remedy(
@@ -257,13 +261,11 @@ def test_a_symlinked_state_file_is_refused_and_its_target_untouched(tmp_path: Pa
     """A link at state_file never worked as a redirect: the first save replaced the link
     itself with a regular file (issue #39). It is refused up front, with the log's wording,
     before anything is written -- a link to a valid state and a dangling one alike."""
-    if sys.platform == "win32":
-        pytest.skip("symbolic links need a privilege on Windows; runs in the sandbox and on CI")
     real = tmp_path / "real.json"
     State(str(real)).save()
     before = real.read_bytes()
     link = tmp_path / "state.json"
-    link.symlink_to(real)
+    try_symlink(link, real)
     with pytest.raises(StateError) as exc:
         check_state_dir(str(link))
     assert str(exc.value) == f"state file {link} is a symbolic link -- name the real path"
@@ -546,3 +548,176 @@ def test_a_bad_run_record_is_a_hard_error_naming_the_remedy(
     with pytest.raises(StateError, match="start over with --reset-state") as exc:
         load_state(str(path))
     assert fragment in str(exc.value)
+
+
+# -- a save that must reach a size (issue #70) --------------------------------------------------
+
+
+def test_a_write_with_a_reach_proves_the_room_and_lands_the_text_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The padding is there at the first fsync and gone at the second, before the replace."""
+    path = tmp_path / "state.json"
+    sizes: list[int] = []
+    real_fsync = os.fsync
+
+    def fsync(fd: int) -> None:
+        sizes.append(os.fstat(fd).st_size)
+        real_fsync(fd)
+
+    monkeypatch.setattr("logalert.state.os.fsync", fsync)
+    text = '{"version": 1}' + chr(10)
+    write_atomically(str(path), text, reach=len(text) + 5000)
+    assert path.read_text(encoding="utf-8") == text
+    assert sizes == [len(text) + 5000, len(text)]
+    assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
+    write_atomically(str(path), text, reach=3)  # a reach the text already covers: no padding
+    assert sizes[2:] == [len(text)] and path.read_text(encoding="utf-8") == text
+
+
+def test_a_reach_the_disk_cannot_hold_is_the_usual_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.json"
+    path.write_text("old", encoding="utf-8")
+    real_write = os.write
+
+    def no_room(fd: int, data: bytes, /) -> int:  # the padding is what fails
+        if len(data) > 64 and data != b"new":
+            raise OSError(28, "No space left on device")
+        return real_write(fd, data)
+
+    monkeypatch.setattr("logalert.state.os.write", no_room)
+    with pytest.raises(StateError, match=r"cannot write \(No space left on device\)"):
+        write_atomically(str(path), "new", reach=8192)
+    assert path.read_text(encoding="utf-8") == "old"
+    assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
+
+
+def test_state_save_passes_the_reach_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[int | None] = []
+    real = write_atomically
+
+    def spy(path: str, text: str, reach: int | None = None) -> None:
+        seen.append(reach)
+        real(path, text, reach=reach)
+
+    monkeypatch.setattr("logalert.state.write_atomically", spy)
+    state = State(str(tmp_path / "state.json"))
+    state.save()
+    state.save(reach=9000)
+    assert seen == [None, 9000] and state.render() == (tmp_path / "state.json").read_text(
+        encoding="utf-8")
+
+
+def test_a_short_write_is_completed_not_taken_for_the_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """os.write may write less than asked (measured on a tmpfs near its limit) and says
+    nothing; the writer loops until every byte is out, the padding included."""
+    path = tmp_path / "state.json"
+    real_write = os.write
+    sizes: list[int] = []
+    real_fsync = os.fsync
+
+    def short(fd: int, data: bytes, /) -> int:
+        return real_write(fd, data[:7])
+
+    def fsync(fd: int) -> None:
+        sizes.append(os.fstat(fd).st_size)
+        real_fsync(fd)
+
+    monkeypatch.setattr("logalert.state.os.write", short)
+    monkeypatch.setattr("logalert.state.os.fsync", fsync)
+    text = '{"version": 1, "entries": {}, "runs": {}}' + chr(10)
+    write_atomically(str(path), text, reach=len(text) + 100)
+    assert path.read_text(encoding="utf-8") == text
+    assert sizes == [len(text) + 100, len(text)]
+
+# -- the anchor (issue #34) ------------------------------------------------------------------
+
+
+def test_the_anchor_round_trips_and_a_file_without_it_loads(tmp_path: Path) -> None:
+    """What the bytes before the offset hashed to as the run read them; optional, so
+    0.1.0's state loads (trusted once) and 0.1.0 drops it on save."""
+    path = str(tmp_path / "state.json")
+    state = State(path)
+    cursor = Cursor(offset=10, ino=1, dev=2, fingerprint="ab" * 32, realpath="/var/log/r.log",
+                    last_seen="2026-09-14T12:00:00Z", line=7, anchor="cd" * 32)
+    state.set("s", "/var/log/r.log", cursor)
+    state.save()
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert data["entries"]["s"]["/var/log/r.log"]["anchor"] == "cd" * 32
+    assert load_state(path).get("s", "/var/log/r.log") == cursor
+    Path(path).write_text(
+        '{"version": 1, "entries": {"a": {"/x": {"offset": 1, "ino": 2, "dev": 3, '
+        '"fingerprint": null, "realpath": "/x", "last_seen": "2026-09-14T12:00:00Z"}}}}',
+        encoding="utf-8", newline="\n")
+    loaded = load_state(path).get("a", "/x")
+    assert loaded is not None and loaded.anchor is None
+    state.touch("s", "/var/log/r.log")  # a sighting keeps it
+    assert state.entries[("s", "/var/log/r.log")].anchor == "cd" * 32
+
+
+@pytest.mark.parametrize("bad", ["7", "true", "[]"])
+def test_a_bad_anchor_is_a_hard_error(tmp_path: Path, bad: str) -> None:
+    path = tmp_path / "state.json"
+    text = ('{"version": 1, "entries": {"a": {"/x": {"offset": 1, "ino": 2, "dev": 3, '
+            '"fingerprint": null, "realpath": "/x", "last_seen": "2026-09-14T12:00:00Z", '
+            '"anchor": BAD}}}}').replace("BAD", bad)
+    path.write_text(text, encoding="utf-8", newline="\n")
+    with pytest.raises(StateError, match="'anchor' is not a string"):
+        load_state(str(path))
+
+
+# -- root's own state and the empty file (issue #41) --------------------------------------------
+
+
+def test_roots_own_state_is_not_foreign_and_another_users_is(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ``uid == 0`` exception in ``_foreign_owner`` was asserted only under a real root
+    euid (the sandbox); dropping it survived the suite as a non-root user. Faked uids run it
+    everywhere: root's own file and directory are not foreign, another user's are."""
+    if sys.platform == "win32":
+        pytest.skip("no uids on Windows; runs in the sandbox and on CI")
+    path = tmp_path / "state.json"
+    path.write_text("{}", encoding="utf-8")
+    owner = {"uid": 0}
+    real_lstat, real_stat = os.lstat, os.stat
+
+    def lstat_owned(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        st = real_lstat(target, *args, **kwargs)
+        return os.stat_result(tuple(st)[:4] + (owner["uid"],) + tuple(st)[5:])  # st_uid
+
+    def stat_owned(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        st = real_stat(target, *args, **kwargs)
+        return os.stat_result(tuple(st)[:4] + (owner["uid"],) + tuple(st)[5:])
+
+    monkeypatch.setattr("logalert.state.os.geteuid", lambda: 0)
+    monkeypatch.setattr("logalert.state.os.lstat", lstat_owned)
+    monkeypatch.setattr("logalert.state.os.stat", stat_owned)
+    assert _foreign_owner(str(path)) is None  # the file is root's
+    assert _foreign_owner(str(tmp_path / "absent.json")) is None  # its directory is root's
+    owner["uid"] = 4242  # a uid with no name: reported the way sudo -u accepts it
+    assert _foreign_owner(str(path)) == "#4242"
+    assert _foreign_owner(str(tmp_path / "absent.json")) == "#4242"
+
+
+def test_unknown_fields_load_under_version_1_and_are_dropped_on_save(tmp_path: Path) -> None:
+    """The rollback property #18, #44, #65 and #34 rely on, unpinned until now: a file a
+    newer logalert wrote under schema version 1 with a key or a cursor field this version
+    does not know loads, and the save drops what it does not know."""
+    path = tmp_path / "state.json"
+    path.write_text(
+        '{"version": 1, "entries": {"a": {"/x": {"offset": 1, "ino": 2, "dev": 3, '
+        '"fingerprint": null, "realpath": "/x", "last_seen": "2026-09-14T12:00:00Z", '
+        '"later": true}}}, "runs": {}, "future": {"key": 1}}',
+        encoding="utf-8", newline="\n")
+    state = load_state(str(path))
+    loaded = state.get("a", "/x")
+    assert loaded is not None and loaded.offset == 1
+    state.save()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "future" not in data and "later" not in data["entries"]["a"]["/x"]

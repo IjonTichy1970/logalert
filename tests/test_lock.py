@@ -129,6 +129,12 @@ def test_lock_busy_age_never_goes_negative() -> None:
     assert busy.age == 0.0 and busy.stale is False
 
 
+def test_a_holder_exactly_lock_stale_old_is_not_stale() -> None:
+    """USAGE.md: stale means OLDER than lock_stale, not as old (issue #41: `>=` survived)."""
+    assert LockBusy("/x/lock", 42, started=1000.0, stale_after=10, now=1010.0).stale is False
+    assert LockBusy("/x/lock", 42, started=1000.0, stale_after=10, now=1010.5).stale is True
+
+
 def test_other_open_errors_propagate(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         RunLock(str(tmp_path / "nope" / "lock"), 3600).acquire()
@@ -293,3 +299,121 @@ def test_a_live_process_of_another_user_with_the_recorded_pid_is_not_the_holder(
 
     monkeypatch.setattr(os, "kill", eperm)  # the one os module, as lock.py sees it
     assert lock_module.holder_gone(4242) is True
+
+
+# -- the unsaved marker in the holder line (issue #70) ------------------------------------------
+
+
+def test_the_unsaved_marker_is_written_in_place_carried_forward_and_cleared(
+        tmp_path: Path) -> None:
+    path = tmp_path / "lock"
+    lock = RunLock(str(path), 3600)
+    lock.acquire(now=1_700_000_000.0)
+    assert lock.unsaved is None
+    lock.mark_unsaved(6100)
+    assert lock.unsaved == 6100
+    assert path.read_bytes() == f"{os.getpid()} 1700000000 unsaved 6100\n".encode("ascii")
+    lock.release()
+    # the next holder reads it before writing its own line, and carries it forward
+    again = RunLock(str(path), 3600)
+    again.acquire(now=1_700_000_010.0)
+    assert again.unsaved == 6100
+    assert path.read_bytes() == f"{os.getpid()} 1700000010 unsaved 6100\n".encode("ascii")
+    again.clear_unsaved()
+    assert again.unsaved is None
+    assert path.read_bytes() == f"{os.getpid()} 1700000010\n".encode("ascii")
+    again.release()
+    third = RunLock(str(path), 3600)
+    third.acquire()
+    assert third.unsaved is None
+    third.release()
+
+
+def test_the_holder_line_is_written_in_place_never_truncated_first(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of #70: a page given up (ftruncate to 0, then the write) went to a competing
+    writer on a full disk 216 times in 300, the holder line and its marker with it;
+    written in place and cut afterwards, 0 in 300. The order is pinned here."""
+    calls: list[tuple[str, int]] = []
+    real_write, real_truncate = os.write, os.ftruncate
+
+    def write(fd: int, data: bytes, /) -> int:
+        calls.append(("write", len(data)))
+        return real_write(fd, data)
+
+    def truncate(fd: int, length: int, /) -> None:
+        calls.append(("truncate", length))
+        real_truncate(fd, length)
+
+    monkeypatch.setattr("logalert.lock.os.write", write)
+    monkeypatch.setattr("logalert.lock.os.ftruncate", truncate)
+    path = tmp_path / "lock"
+    lock = RunLock(str(path), 3600)
+    lock.acquire(now=1_700_000_000.0)
+    lock.mark_unsaved(6100)
+    lock.clear_unsaved()
+    lock.release()
+    kinds = [kind for kind, _ in calls]
+    assert kinds == ["write", "truncate"] * 3  # never a truncate before a write
+    assert all(length > 0 for kind, length in calls if kind == "truncate")
+
+
+def test_the_readers_parse_the_first_line_only(tmp_path: Path) -> None:
+    """A kill between a write and its cut leaves the old tail after the new line: a
+    cleared line with the old marker behind it is no marker."""
+    path = tmp_path / "lock"
+    path.write_bytes(b"12345 1700000000\nunsaved 6100\n")
+    lock = RunLock(str(path), 3600)
+    lock.acquire()
+    assert lock.unsaved is None
+    lock.release()
+    path.write_bytes(b"12345 1700000000 unsaved 6100\n0\n")
+    lock = RunLock(str(path), 3600)
+    lock.acquire()
+    assert lock.unsaved == 6100
+    lock.release()
+
+
+def test_a_shorter_marker_over_a_longer_line_leaves_no_tail(tmp_path: Path) -> None:
+    """The line is cut to the marker: a size with fewer digits than the last one leaves no
+    digits of the old one behind."""
+    path = tmp_path / "lock"
+    lock = RunLock(str(path), 3600)
+    lock.acquire(now=1_700_000_000.0)
+    lock.mark_unsaved(1_000_000)
+    lock.mark_unsaved(42)
+    assert path.read_bytes() == f"{os.getpid()} 1700000000 unsaved 42\n".encode("ascii")
+    lock.release()
+
+
+@pytest.mark.parametrize("line", [b"12345 1700000000 unsaved\n", b"12345 1700000000 other 6\n",
+                                  b"12345 1700000000 unsaved x\n", b"12345 1700000000 unsaved -1\n",
+                                  b"12345 1700000000 unsaved 99999999999999\n",  # no state file
+                                  b"garbage\n", b""])
+def test_other_words_after_the_holder_are_no_marker(tmp_path: Path, line: bytes) -> None:
+    path = tmp_path / "lock"
+    path.write_bytes(line)
+    lock = RunLock(str(path), 3600)
+    lock.acquire()
+    assert lock.unsaved is None
+    lock.release()
+
+
+def test_the_stale_check_reads_past_the_marker(tmp_path: Path) -> None:
+    """The busy path parses the first two words as before, marker or not."""
+    path = tmp_path / "lock"
+    lock = RunLock(str(path), 3600)
+    lock.acquire(now=time.time() - 7200)
+    lock.mark_unsaved(6100)
+    try:
+        rc, words = try_holder(path)
+    finally:
+        lock.release()
+    assert rc == 3 and words[:2] == ["busy", str(os.getpid())] and words[3] == "True"
+
+
+def test_marking_without_the_lock_is_a_no_op(tmp_path: Path) -> None:
+    lock = RunLock(str(tmp_path / "lock"), 3600)
+    lock.mark_unsaved(1)
+    lock.clear_unsaved()
+    assert lock.unsaved is None and not (tmp_path / "lock").exists()

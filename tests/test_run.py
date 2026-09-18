@@ -17,114 +17,34 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import NL, SENDER, Site, body_of, run_logalert
 from esmtp_stub import StubConfig, run_stub
-from fake_sendmail import install
 
 import logalert.__main__
 import logalert.cursor
 import logalert.run
-from logalert.__main__ import main
-from logalert.cursor import LogFile
+import logalert.state
+from logalert.cursor import LogFile, anchor_of
 from logalert.lock import RunLock
 from logalert.match import scan
 from logalert.rotation import open_source
 from logalert.run import Outcome
-from logalert.state import Cursor, State, StateError, load_state, lock_path, timestamp
-
-NL = chr(10)
-SENDER = "alerts@example.net"
-
-
-class Site:
-    """A config with two sections over two fixture logs, a state directory, the fake."""
-
-    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.root = tmp_path
-        self.router = tmp_path / "router.log"
-        self.firewall = tmp_path / "fw.log"
-        self.router.write_text("boot" + NL + "quiet" + NL, encoding="utf-8", newline=NL)
-        self.firewall.write_text("up" + NL, encoding="utf-8", newline=NL)
-        self.state_dir = tmp_path / "state"
-        self.state_dir.mkdir()
-        self.state_file = self.state_dir / "state.json"
-        self.activity_log = tmp_path / "activity.log"  # not in the state dir: tests remove it
-        self.fake_dir = tmp_path / "fake"
-        monkeypatch.setenv("LOGALERT_FAKE_DIR", str(self.fake_dir))
-        for knob in ("LOGALERT_FAKE_SLEEP", "LOGALERT_FAKE_EXIT", "LOGALERT_FAKE_EXIT_IF_RCPT",
-                     "LOGALERT_FAKE_STDERR_BYTES"):
-            monkeypatch.delenv(knob, raising=False)
-        self.binary = install(tmp_path)
-        self.conf = tmp_path / "logalert.conf"
-        self.write_config()
-
-    def write_config(self, settings: str = "", router: str = "", firewall: str = "",
-                     router_to: str = "noc@example.net", sendmail: str | None = None,
-                     firewall_files: str | None = None, log: str | None = None) -> None:
-        fw_files = firewall_files or self.firewall.as_posix()
-        log = log or f"file:{self.activity_log.as_posix()}"
-        text = (f"[logalert]\nsendmail_path = {sendmail or self.binary.as_posix()}\n"
-                f"state_file = {self.state_file.as_posix()}\nfrom = {SENDER}\n"
-                f"log = {log}\n{settings}\n"
-                f"[router-disk]\nsubject = Router disk failure\nto = {router_to}\n"
-                f"files = {self.router.as_posix()}\npatterns =\n    disk failure\n{router}\n"
-                f"[firewall]\nsubject = Firewall denies\nto = fw@example.net\n"
-                f"files = {fw_files}\npatterns =\n    DENY\n{firewall}\n")
-        self.conf.write_text(text, encoding="utf-8", newline=NL)
-
-    def run(self, *extra: str) -> int:
-        return main(["-f", str(self.conf), *extra])
-
-    def prime(self) -> None:
-        """A first run: first sight of both files, nothing mailed, the state created."""
-        assert self.run() == 0
-        assert self.calls() == []
-
-    def append(self, path: Path, *lines: str) -> None:
-        with open(path, "a", encoding="utf-8", newline=NL) as fh:
-            for line in lines:
-                fh.write(line + NL)
-
-    def calls(self) -> list[tuple[dict[str, Any], bytes]]:
-        if not self.fake_dir.exists():
-            return []
-        out = []
-        for name in sorted(n for n in os.listdir(self.fake_dir) if n.startswith("call-")
-                           and n.endswith("-argv.json")):
-            argv: dict[str, Any] = json.loads((self.fake_dir / name).read_text(encoding="ascii"))
-            stdin = (self.fake_dir / name.replace("-argv.json", "-stdin.bin")).read_bytes()
-            out.append((argv, stdin))
-        return out
-
-    def state(self) -> dict[str, dict[str, dict[str, Any]]]:
-        data: dict[str, Any] = json.loads(self.state_file.read_text(encoding="utf-8"))
-        entries: dict[str, dict[str, dict[str, Any]]] = data["entries"]
-        return entries
-
-    def offset(self, section: str, path: Path) -> int:
-        return int(self.state()[section][path.as_posix()]["offset"])
-
-    def activity(self) -> list[str]:
-        """The activity log so far, each line without its timestamp and ident."""
-        if not self.activity_log.exists():
-            return []
-        lines = self.activity_log.read_text(encoding="utf-8").splitlines()
-        return [line.split("]: ", 1)[1] for line in lines]
-
-
-@pytest.fixture
-def site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Site:
-    return Site(tmp_path, monkeypatch)
-
-
-def body_of(stdin: bytes) -> str:
-    return stdin.decode("utf-8")
-
+from logalert.state import (
+    STATE_HEADROOM,
+    Cursor,
+    State,
+    StateError,
+    load_state,
+    lock_path,
+    timestamp,
+)
 
 # -- the clean runs -----------------------------------------------------------------------------
 
@@ -209,12 +129,14 @@ def test_an_unreadable_file_is_named_the_rest_is_processed_its_cursor_untouched(
 def test_a_failed_delivery_keeps_that_sections_place_and_a_rerun_resends_it_only(
         site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     site.prime()
-    # age the firewall entry so a touch is visible: same-second timestamps compare equal
+    # age the firewall entry past half of state_ttl (30 days), where a refused delivery
+    # still touches it (issue #64: a younger entry keeps the moment its position was
+    # taken, which bounds what a rotation gap reads back)
     state = load_state(str(site.state_file))
     aged = state.get("firewall", site.firewall.as_posix())
     assert aged is not None
     state.set("firewall", site.firewall.as_posix(),
-              replace(aged, last_seen=timestamp(datetime.now(UTC) - timedelta(days=2))))
+              replace(aged, last_seen=timestamp(datetime.now(UTC) - timedelta(days=16))))
     state.save()
     primed = site.state()["firewall"][site.firewall.as_posix()]
     site.append(site.router, "disk failure now")
@@ -528,6 +450,10 @@ def test_the_run_only_flags_refuse_the_modes(
         assert exc.value.code == 2
         assert "apply to the run, not to" in capsys.readouterr().err
     assert site.state_file.read_bytes() == written and site.calls() == []
+    # --example-config is not in the mode set that refuses the run-only flags: -n beside it
+    # is ignored and the example printed, exit 0 (issue #41: unpinned)
+    assert site.run("--example-config", "-n") == 0
+    assert capsys.readouterr().out.startswith("# logalert configuration")
 
 
 def test_state_file_override_reaches_reset_state_and_check_config(
@@ -623,7 +549,7 @@ def test_a_save_failure_says_whether_a_mail_went_out(
         opening.add(id(state))
         return state
 
-    def save(self: State) -> None:
+    def save(self: State, reach: int | None = None) -> None:
         if id(self) in opening:  # the opening save (issue #30) passes; the section's fails
             opening.discard(id(self))
             real_save(self)
@@ -1046,7 +972,7 @@ def test_every_file_read_is_touched_when_the_delivery_fails(
     sibling.write_text("up" + NL, encoding="utf-8", newline=NL)
     site.write_config(firewall_files=site.firewall.as_posix() + NL + f"    {sibling.as_posix()}")
     site.prime()
-    first = age(site, "firewall", site.firewall, days=2)
+    first = age(site, "firewall", site.firewall, days=16)  # past half of state_ttl (#64)
     second = age(site, "firewall", sibling, days=2)
     site.append(site.firewall, "DENY 192.0.2.9")
     site.append(sibling, "quiet")  # read, nothing matched: still present
@@ -1689,3 +1615,247 @@ def test_a_permission_on_the_rotated_copy_is_a_failed_item_and_the_position_move
     assert "disk failure after" in body and "before the rotation" not in body
     assert site.offset("router-disk", site.router) == site.router.stat().st_size  # moved on
     assert site.run() == 0 and len(site.calls()) == 1  # the next run: nothing to say
+
+
+def test_a_refused_delivery_keeps_a_young_entrys_sighting(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review of #64: a touch on every refusal moved last_seen past copies the refused run had
+    read, and a later rotation gap left them out. An entry under half of state_ttl keeps
+    the moment its position was taken."""
+    site.prime()
+    primed = age(site, "firewall", site.firewall, days=2)
+    site.append(site.firewall, "DENY 192.0.2.9")
+    monkeypatch.setenv("LOGALERT_FAKE_EXIT", "75")
+    assert site.run() == 1
+    capsys.readouterr()
+    after = site.state()["firewall"][site.firewall.as_posix()]
+    assert after["offset"] == primed["offset"] and after["last_seen"] == primed["last_seen"]
+
+
+# -- the unsaved marker: a delivered section whose save failed (issue #70) ----------------------
+
+
+def _lock_line(site: Site) -> str:
+    return (site.state_dir / "lock").read_text(encoding="ascii")
+
+
+class _Saves:
+    """write_atomically with a failure schedule: ``failing(n)`` says whether the n-th call
+    (1-based, across runs) fails; every call's text length and reach are recorded.
+    ``room`` set is a disk with room for that many bytes and no more: a write reaching
+    past it fails, as the padded proof does."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, failing: Callable[[int], bool]) -> None:
+        self.calls = 0
+        self.sizes: list[int] = []
+        self.reaches: list[int | None] = []
+        self.failing = failing
+        self.room: int | None = None
+        real = logalert.state.write_atomically
+
+        def write(path: str, text: str, reach: int | None = None) -> None:
+            self.calls += 1
+            self.sizes.append(len(text))
+            self.reaches.append(reach)
+            if self.failing(self.calls) or (self.room is not None
+                                            and max(len(text), reach or 0) > self.room):
+                raise StateError("disk full")
+            real(path, text, reach=reach)
+
+        monkeypatch.setattr("logalert.state.write_atomically", write)
+
+
+def test_a_delivered_section_whose_save_failed_marks_the_lock_and_the_next_run_refuses(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The band (issue #30's residual): room for the state as loaded, none for its growth.
+    Run 1 sends and cannot save; run 2 must refuse before any mail (without the marker it
+    would send again: the opening save fits, the section's does not -- the storm); run
+    3, with the room back, proves it, sends once and clears the marker."""
+    site.prime()
+    site.append(site.router, "disk failure now" + " x" * 50)  # the offset gains a digit
+    saves = _Saves(monkeypatch, lambda n: False)
+    saves.room = len(site.state_file.read_text(encoding="utf-8"))  # as loaded: fits
+    assert site.run() == 1
+    assert saves.sizes[1] > saves.room  # the band's precondition: the section's save grew
+    err = capsys.readouterr().err
+    assert err.startswith("logalert: 1 of 1 section sent; failed: [router-disk] state not saved: "
+                          "disk full; [firewall] state not saved: disk full; see the log")
+    assert len(site.calls()) == 1  # the mail went out
+    marked = _lock_line(site)
+    assert marked.endswith(f" unsaved {saves.sizes[1]}\n")  # the size the router section needed
+    # run 2: the proving save is refused; nothing is sent, the marker stands
+    assert site.run() == 1
+    assert capsys.readouterr().err == (
+        "logalert: failed: state file: disk full -- the last run sent mail it could not record; "
+        "nothing is sent until the state can be saved; see the log" + NL)
+    assert len(site.calls()) == 1
+    assert saves.reaches[-1] == saves.sizes[1] + STATE_HEADROOM  # what did not fit, plus a block
+    assert _lock_line(site).endswith(f" unsaved {saves.sizes[1]}\n")
+    assert saves.calls == 4  # nothing was read: the run stopped at the opening
+    # run 3: the room is back; the proof passes, the lines go out once more, the marker goes
+    saves.room = None
+    assert site.run() == 0
+    assert len(site.calls()) == 2
+    assert body_of(site.calls()[1][1]).count("disk failure now") == 1
+    assert " unsaved" not in _lock_line(site)
+    assert site.offset("router-disk", site.router) == site.router.stat().st_size
+    assert any("the last run sent mail it could not record; the room is there now" in line
+               for line in site.activity())
+
+
+def test_a_later_save_in_the_marked_run_clears_the_marker(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The whole state is one file: the firewall section's save records the router's moved
+    position too, so the next run neither refuses nor re-sends."""
+    site.prime()
+    site.append(site.router, "disk failure now")
+    _Saves(monkeypatch, lambda n: n == 2)  # the router section's save alone fails
+    assert site.run() == 1
+    assert "state not saved" in capsys.readouterr().err
+    assert " unsaved" not in _lock_line(site)
+    assert site.offset("router-disk", site.router) == site.router.stat().st_size
+    assert site.run() == 0 and len(site.calls()) == 1
+
+
+def test_a_failed_save_after_no_delivery_leaves_no_marker(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    site.prime()
+    site.append(site.router, "quiet line")  # nothing matches: no mail, the cursors move
+    _Saves(monkeypatch, lambda n: n >= 2)
+    assert site.run() == 1
+    assert "state not saved" in capsys.readouterr().err and site.calls() == []
+    assert " unsaved" not in _lock_line(site)
+
+
+def test_reset_state_clears_the_marker(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    site.prime()
+    site.append(site.router, "disk failure now")
+    saves = _Saves(monkeypatch, lambda n: n >= 2)
+    assert site.run() == 1
+    assert " unsaved" in _lock_line(site)
+    saves.failing = lambda n: False
+    assert site.run("--reset-state", site.router.as_posix()) == 0
+    capsys.readouterr()
+    assert " unsaved" in _lock_line(site)  # one file forgotten: the band is where it was
+    assert site.run("--reset-state") == 0
+    capsys.readouterr()
+    assert " unsaved" not in _lock_line(site)
+    # the escape hatch (a state file nothing can read, replaced) clears it too
+    assert site.run() == 0  # the first sight after the reset
+    site.append(site.router, "disk failure again")
+    base = saves.calls
+    saves.failing = lambda n: n >= base + 2  # the opening save passes, the rest fail
+    assert site.run() == 1 and " unsaved" in _lock_line(site)
+    saves.failing = lambda n: False
+    site.state_file.write_text("{", encoding="utf-8")
+    assert site.run("--reset-state") == 0
+    assert capsys.readouterr().out.rstrip().endswith("; replaced it with an empty state")
+    assert " unsaved" not in _lock_line(site)
+
+
+def test_a_dry_run_neither_reads_nor_touches_the_marker(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    site.prime()
+    site.append(site.router, "disk failure now")
+    saves = _Saves(monkeypatch, lambda n: n >= 2)
+    assert site.run() == 1
+    marked = _lock_line(site)
+    saves.failing = lambda n: False
+    assert site.run("--dry-run") == 0  # previews, sends nothing, writes nothing
+    assert "disk failure now" in capsys.readouterr().out
+    assert _lock_line(site) == marked and len(site.calls()) == 1
+
+
+def test_a_marking_that_fails_is_one_log_line_not_a_traceback(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The marker's write can fail too (an I/O error); the run keeps its one stderr line and
+    says the next run re-sends (review: unpinned)."""
+    site.prime()
+    site.append(site.router, "disk failure now")
+    _Saves(monkeypatch, lambda n: n >= 2)
+
+    def refused(self: RunLock, size: int) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(RunLock, "mark_unsaved", refused)
+    assert site.run() == 1
+    assert capsys.readouterr().err.startswith(
+        "logalert: 1 of 1 section sent; failed: [router-disk] state not saved: disk full; ")
+    assert len(site.calls()) == 1 and " unsaved" not in _lock_line(site)
+    assert any("[router-disk] the lock could not be marked either (No space left on device); "
+               "the next run re-sends" in line for line in site.activity())
+
+# -- a log rewritten in place with its banner (issue #34) ---------------------------------------
+
+
+def test_a_log_rewritten_with_its_banner_past_the_position_is_read_from_the_top(
+        site: Site) -> None:
+    """Issue #34 end to end, through the state file: a service restart truncates its log
+    and rewrites the fixed banner and more than was there; the old rules continued at the
+    stale offset (a fragment mailed, the lines before it never). The anchor persists
+    between runs, so the third run reads the rewritten file from its beginning."""
+    site.prime()
+    site.append(site.router, "kernel: disk failure on sda")
+    assert site.run() == 0 and len(site.calls()) == 1
+    entry = site.state()["router-disk"][site.router.as_posix()]
+    assert entry["anchor"] == anchor_of(site.router.read_bytes()[-4096:])
+    # the restart: the same file (inode), the same first line, longer than the position
+    rewritten = (["boot", "disk failure early in the new log"]
+                 + [f"quiet {n}" for n in range(40)] + ["disk failure late"])
+    site.router.write_text(NL.join(rewritten) + NL, encoding="utf-8", newline=NL)
+    assert site.router.stat().st_size > entry["offset"]
+    assert site.run() == 0
+    calls = site.calls()
+    assert len(calls) == 2
+    body = body_of(calls[1][1])
+    assert "2: disk failure early in the new log" in body and "43: disk failure late" in body
+    assert site.offset("router-disk", site.router) == site.router.stat().st_size
+    assert any("the bytes before the saved offset are not the ones read (truncated and "
+               "refilled?); truncated" in line for line in site.activity())
+    assert site.run() == 0 and len(site.calls()) == 2  # and nothing twice
+
+
+def test_an_entry_from_0_1_0_is_trusted_once_and_gains_the_anchor_on_the_next_save(
+        site: Site) -> None:
+    """The upgrade path, through the state file (review: the docstring's "gains it on the
+    next save" was pinned by the pure rule only): an entry without an anchor continues,
+    the run that continued records one over the bytes it found, and the rewrite after
+    that is a truncation."""
+    site.prime()
+    site.append(site.router, "kernel: disk failure on sda")
+    assert site.run() == 0 and len(site.calls()) == 1
+    data = json.loads(site.state_file.read_text(encoding="utf-8"))
+    entry = data["entries"]["router-disk"][site.router.as_posix()]
+    assert entry.pop("anchor") is not None  # what 0.1.0 never wrote
+    site.state_file.write_text(json.dumps(data), encoding="utf-8", newline=NL)
+    assert site.run() == 0 and len(site.calls()) == 1  # nothing new; trusted once
+    entry = site.state()["router-disk"][site.router.as_posix()]
+    assert entry["anchor"] == anchor_of(site.router.read_bytes()[-4096:])
+    rewritten = ["boot", "quiet", "kernel: disk failure on sdb"] + [f"quiet {n}" for n in range(9)]
+    site.router.write_text(NL.join(rewritten) + NL, encoding="utf-8", newline=NL)
+    assert site.router.stat().st_size > entry["offset"]
+    assert site.run() == 0
+    calls = site.calls()
+    assert len(calls) == 2 and "3: kernel: disk failure on sdb" in body_of(calls[1][1])
+
+
+# -- the dry run's console guard (issue #41) ----------------------------------------------------
+
+
+def test_a_dry_run_prints_a_subject_the_console_cannot_encode(site: Site) -> None:
+    """``main`` reconfigures stdout with ``errors="backslashreplace"`` so a subject from the
+    config never crashes the reader; pytest captures in-process, so only a child under a
+    console encoding that lacks the character exercises it (the mutant: UnicodeEncodeError,
+    exit 1). PYTHONIOENCODING overrides UTF-8 mode, so the case holds on newer interpreters."""
+    em_dash = chr(0x2014)  # from the code point: gated Python stays ASCII
+    text = site.conf.read_text(encoding="utf-8").replace("Router disk failure",
+                                                         "Platte " + em_dash + " defekt")
+    site.conf.write_text(text, encoding="utf-8", newline=NL)
+    site.prime()
+    site.append(site.router, "disk failure now")
+    env = dict(os.environ, PYTHONIOENCODING="ascii")  # a console that cannot show the dash
+    result = run_logalert("-n", "-f", str(site.conf), env=env, binary=True)
+    assert result.returncode == 0, result.stderr
+    escaped = b"Subject: Platte " + chr(0x5C).encode() + b"u2014 defekt -- 1 match(es)"
+    assert escaped in result.stdout

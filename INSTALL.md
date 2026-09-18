@@ -280,6 +280,8 @@ Description=logalert run
 Type=oneshot
 User=logalert
 ExecStart=/usr/local/bin/logalert
+# a run that never ends would hold the unit activating and the timer waiting
+TimeoutStartSec=3600
 
 # /etc/systemd/system/logalert.timer
 [Unit]
@@ -304,6 +306,42 @@ nothing mails the one line of a failed run; it is in the journal (next section)
 at info, and `journalctl -p err -t logalert` finds each failed item's ERROR
 record, the same text. Keep the default `log = syslog`
 under a timer -- [docs/USAGE.md](docs/USAGE.md#running-it) explains why.
+
+`TimeoutStartSec=` is not decoration. A `Type=oneshot` unit has no start
+timeout of its own (`TimeoutStartUSec=infinity`), and the timer never starts a
+unit that is still activating: a run that never ends -- a hung mount, a socket
+nobody drains, a regex that backtracks for hours -- would hold the unit
+`activating` and the schedule silent, with nothing recorded as a failure. The
+lock never comes into it under the timer (the two lock verdicts of
+[docs/USAGE.md](docs/USAGE.md#running-it) are cron's, where runs overlap). With
+the hour set, systemd ends such a run with SIGTERM -- `Failed with result
+'timeout'` in `systemctl status logalert.service`, `logalert: terminated` in the
+journal, exit 143 -- and the timer fires again at once, then on schedule. It
+caps a legitimately long run the same way: the state saved per section persists
+and the section in flight is re-sent by the next run, so nothing is lost; a
+message the sendmail child had read entirely may still be queued.
+
+**Hardening the unit** is worth doing, with four lines to leave out.
+`NoNewPrivileges=yes` -- and `SystemCallFilter=~@privileged` and
+`DynamicUser=yes`, which imply it -- and `PrivateUsers=yes` make a setgid
+`sendmail` client keep the caller's group (measured with systemd 255): Postfix,
+Exim and `dma` all hand the message to their queue through a setgid or setuid
+front end, so every delivery then fails at the spool with a permission error
+(Postfix: `sendmail exit 75 (EX_TEMPFAIL): postdrop: ... Permission denied`;
+the others' codes differ), one failed item per section with something to
+send, blaming the spool. `ProtectSystem=strict` makes `/var/lib/logalert`
+read-only too (`state directory ... is not writable (Read-only file system)`,
+exit 1 every run): `StateDirectory=logalert` with `StateDirectoryMode=0750` is
+the unit-side form of step 5's `install -d` -- without the mode line systemd
+makes the directory `0755`, and re-sets an existing `0750` one on every start.
+`strict` also needs `ReadWritePaths=` for the MTA's spool
+(`/var/spool/postfix/maildrop`, `/var/spool/exim4`, `/var/spool/dma` --
+rehearse the one you have; these are examples, not measured with a real MTA)
+and for a `file:` activity log. `RestrictAddressFamilies=AF_UNIX` breaks
+`transport = smtp`, which needs `AF_INET AF_INET6`, and a `sendmail` that
+relays over the network itself (`msmtp-mta`). A full hardened block is not
+shown on purpose: nothing here rehearses it, and an unrehearsed unit is where
+the setgid surprise came from.
 
 ### 8. Where the log is
 

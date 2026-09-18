@@ -11,6 +11,18 @@ will actually read, and decides how the saved cursor applies:
   * same inode, size < offset -> TRUNCATED (``copytruncate``); so is a file whose first line
     is GONE (a NUL hole from ``copytruncate`` under a writer without ``O_APPEND``), whatever
     its size
+  * same inode, first line and size in order, but the bytes before the saved offset are not
+    the ones the last run read -> TRUNCATED too (issue #34). A file truncated and refilled
+    past the position with the same first line (a restart script's ``>`` with a fixed
+    banner, a report rewritten whole) was read on from the stale offset: a fragment, and
+    the refill's lines before it lost, silently (measured on both platforms). The cursor's
+    ``anchor`` is the sha256 of the last ``ANCHOR_CAP`` bytes before the offset AS READ --
+    the reader keeps them as it goes, so a refill landing after the read's last check is
+    not recorded as the file -- and a cursor without one (0.1.0's, a parked copy's) is
+    trusted once. What it cannot see: a refill whose last ``ANCHOR_CAP`` bytes before the
+    position are the ones read (a file of nothing but identical lines, aligned). The plan
+    behind the verdict is the rotation module's: an older copy sharing the banner is still
+    taken as a guess there (issue #74).
   * inode differs -> ROTATED
   * device id differs alone -> continue, with a log line (a remount or a reboot renumbers
     devices; that never declares a rotation by itself)
@@ -22,8 +34,11 @@ A listed COMPRESSED file whose inode, device, size and mtime are what the cursor
 is not opened at all (issue #44): nothing new can be in an archive that has not changed,
 and the confirming seek to the saved offset was a full decompression on every run. The
 cursor records the two only when its offset IS the end of the stream (a read that reached
-EOF with no unterminated tail), so a cursor that carries them never has unread bytes
-behind it. Its first sight is one pass: the stream's end, the last line boundary and the
+EOF with no unterminated tail), so a cursor of a LISTED file that carries them never has
+unread bytes behind it (a cursor parked on a rotated copy carries them as that copy's
+identity, issue #65, and lives under the log's own key, which is never a compressed
+path with that inode). Its first sight is one pass: the stream's end, the last line
+boundary and the
 line count come from a single forward read. A plain file changes size and mtime with
 every append and is never short-circuited; nor is a symbolic link, which goes through the
 owner rule below on every run.
@@ -50,6 +65,30 @@ so a link swapped between the check and the follow is the link that was checked 
 a target that is itself a link is refused. Windows has none of these flags: there a link
 opens as before.
 
+A ``copytruncate`` that lands UNDER the open handle (issue #66) is caught by the reader
+itself: after every read -- each chunk, and the empty read at the end -- a plain live
+file is asked whether it is still the file that was opened -- its size not below the
+reader's position, its first line the one from the open -- and a chunk read from a
+file that is not is dropped unread and the read ends (a truncation met as EOF, the
+writer quiet, is reported the same way: review -- the live cursor at 0 it left matched
+the truncation's copy again next run when the plan had chained it already).
+The check runs after the read, so a chunk that passes was read before any truncation
+the check can see, and a good chunk dropped by a truncation landing between its read
+and the check costs nothing: its lines stay unread and come from the copy next run.
+Every yielded line is therefore from the file as opened, and the cursor is a (first
+line, offset) pair from before the truncation -- what the next run resolves against
+the copy by content. Without it the cursor paired the old first line with an offset
+into the new content: lines lost, then a fragment and a duplicate (measured with real
+logrotate). The check compares the bytes before the position too, against the reader's
+rolling tail (issue #34), so a refill with the same first line past the position is
+caught within the chunk that read it; one whose bytes before the position are the ones
+read is invisible to it, as to the next run. Archives never change and
+a seek in a compressed stream is a decompression, so neither is asked. The check reads
+where the first line BEGINS, recorded at the open: past a NUL hole (a ``copytruncate``
+under a writer without ``O_APPEND``), which ``fingerprint`` would otherwise skip again
+on every chunk (review, measured: a 48 MiB hole made an 8 MiB read take 49 s); the
+cost is two small reads per 64 KiB (measured: 5 ms over a 64 MiB read).
+
 Lines are read in binary and decoded as UTF-8 with replacement. The cursor advances only to
 the end of the last COMPLETE line: an unterminated tail is re-read next run. A line longer
 than ``LINE_CAP`` bytes is cut there and the cut is reported; the cap is a hard boundary, so
@@ -71,7 +110,7 @@ import re
 import stat
 import sys
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -86,6 +125,7 @@ log = logging.getLogger("logalert.cursor")
 
 LINE_CAP = 2000  # bytes; a longer line is cut here and the cut reported
 FINGERPRINT_CAP = 4096  # bytes of the first line that identify a file
+ANCHOR_CAP = 4096  # bytes before the position that identify what was read (issue #34)
 HOLE_CAP = 64 * 1024 * 1024  # NUL bytes fingerprint() will skip before giving up
 _CHUNK = 65536
 NUL = bytes([0])  # spelled from the code point: gated Python carries no control characters
@@ -278,7 +318,14 @@ def special_kind(mode: int) -> str | None:
 
 
 def fingerprint(handle: BinaryStream) -> str | None:
-    """sha256 of the first complete line (at most FINGERPRINT_CAP bytes), read from 0.
+    """sha256 of the first complete line (at most FINGERPRINT_CAP bytes), read from 0; see
+    ``first_line``, which also says where that line begins."""
+    return first_line(handle)[0]
+
+
+def first_line(handle: BinaryStream) -> tuple[str | None, int]:
+    """The first line's hash (sha256 of the first complete line, at most FINGERPRINT_CAP
+    bytes) and the offset where that line begins, read from 0.
 
     A run of NULs at the start (a copytruncate hole) is not the first line and is skipped,
     as the reader skips it -- however long it is, up to HOLE_CAP: the hole is the old file's
@@ -296,10 +343,17 @@ def fingerprint(handle: BinaryStream) -> str | None:
         skipped += len(head)
         if skipped >= HOLE_CAP:
             handle.seek(0)
-            return None
+            return None, skipped
+    begins = skipped + len(head) - len(text)
     if text and len(text) < FINGERPRINT_CAP:
         text += _read_up_to(handle, FINGERPRINT_CAP - len(text))  # a cap of the line itself
     handle.seek(0)
+    return _hash_of(text), begins
+
+
+def _hash_of(text: bytes) -> str | None:
+    """``first_line``'s rule over the bytes at the line's start: the line up to its
+    newline, the whole cap when the line is longer than it, None when it is incomplete."""
     newline = text.find(b"\n")
     if newline >= 0:
         line = text[:newline]
@@ -332,11 +386,37 @@ def _read_up_to(handle: BinaryStream, size: int) -> bytes:
     return b"".join(parts)
 
 
+def tail_of(handle: BinaryStream, offset: int, keep: int) -> bytes:
+    """The last ``keep`` bytes before ``offset`` of a plain file (a seek is free there), the
+    position left at the offset."""
+    start = max(0, offset - keep)
+    handle.seek(start)
+    parts: list[bytes] = []
+    remaining = offset - start
+    while remaining > 0:
+        chunk = handle.read1(remaining)
+        if not chunk:
+            break
+        parts.append(chunk)
+        remaining -= len(chunk)
+    handle.seek(offset)
+    return b"".join(parts)
+
+
+def anchor_of(tail: bytes) -> str | None:
+    """The cursor's ``anchor``: sha256 of the bytes before the position (at most
+    ``ANCHOR_CAP``, the last of them); None when there are none."""
+    return hashlib.sha256(tail).hexdigest() if tail else None
+
+
 def identify(saved: Cursor | None, ino: int, dev: int, size: int | None,
-             current: str | None) -> tuple[Verdict, str | None]:
+             current: str | None, anchor: str | None = None) -> tuple[Verdict, str | None]:
     """Apply the identity rules; returns the verdict and a note worth logging, if any.
 
-    ``size`` is None for a compressed file, whose truncation is detected by seeking instead.
+    ``size`` is None for a compressed file, whose truncation is detected by seeking instead;
+    ``anchor`` is what the bytes before the saved offset hash to now (``anchor_of``), None
+    when they were not read (a compressed file, an offset of 0) -- and a None on either
+    side is never compared, like a None fingerprint.
     """
     if saved is None:
         return "first-sight", None
@@ -351,6 +431,11 @@ def identify(saved: Cursor | None, ino: int, dev: int, size: int | None,
         return "truncated", "the first line is gone (a copytruncate hole?)"
     if size is not None and size < saved.offset:
         return "truncated", f"size {size} < saved offset {saved.offset}"
+    if saved.anchor is not None and anchor is not None and anchor != saved.anchor:
+        # the same first line and a size past the offset, but not the bytes the last run
+        # read before it (issue #34): truncated and refilled, or rewritten in place
+        return "truncated", ("the bytes before the saved offset are not the ones read "
+                             "(truncated and refilled?)")
     if dev != saved.dev:
         return "continue", f"device id changed ({saved.dev} -> {dev}; remount or reboot?)"
     return "continue", None
@@ -370,22 +455,60 @@ class LineReader:
     ``offset``), so every Line carries the number the file would show in ``grep -n``."""
 
     def __init__(self, handle: BinaryStream, offset: int, cap: int = LINE_CAP,
-                 start_line: int = 0, path: str = "") -> None:
+                 start_line: int = 0, path: str = "",
+                 same_file: Callable[[], bool] | None = None,
+                 tail: bytes | None = None) -> None:
         self.handle = handle
         self.offset = offset
         self.cap = cap
         self.line = start_line
         self.path = path
+        self.same_file = same_file  # asked after each chunk (issue #66); None: never
+        self.truncated = False  # a chunk came from another file: dropped, the read ended
         self.nul_bytes = 0  # NUL bytes skipped at line starts (a copytruncate hole)
         self.at_end = False  # the last read reached EOF with no unterminated tail behind it
+        # the last ANCHOR_CAP bytes before ``offset`` as read (issue #34): seeded with the
+        # bytes before the start, folded from each chunk's consumed bytes at the next read
+        # -- never per line -- and, between folds, completed on demand from the buffer;
+        # None: not kept (a compressed stream, an archive)
+        self._tail = tail
+        self._buf = b""  # the buffer the reader is consuming, for ``tail`` between folds
+        self._mark = 0  # the position in it just after the last line end: what offset is at
+        self._carried = 0  # NULs of the current line's hole consumed from earlier buffers
         handle.seek(offset)
+
+    @property
+    def tail(self) -> bytes | None:
+        """The bytes before ``offset``, at most ``ANCHOR_CAP`` of them, as this reader saw
+        them (or was seeded with); None when they are not kept."""
+        if self._tail is None or self._mark == 0:
+            return self._tail
+        return (self._tail + NUL * min(self._carried, ANCHOR_CAP)
+                + self._buf[:self._mark])[-ANCHOR_CAP:]
+
+    @property
+    def anchor(self) -> str | None:
+        return anchor_of(self.tail or b"")
+
+    def _fold(self, buf: bytes, mark: int, carried: int) -> None:
+        """Fold the consumed bytes of ``buf`` (up to ``mark``, behind ``carried`` NULs from
+        earlier buffers) into the kept tail; only the last ``ANCHOR_CAP`` survive, so a
+        hole longer than the cap counts as the cap."""
+        if self._tail is not None and mark > 0:
+            self._tail = (self._tail + NUL * min(carried, ANCHOR_CAP)
+                          + buf[:mark])[-ANCHOR_CAP:]
+        self._mark = 0
 
     def __iter__(self) -> Iterator[Line]:
         self.handle.seek(self.offset)  # a second pass resumes where the cursor is
+        self._fold(self._buf, self._mark, self._carried)  # what a stopped pass consumed
         buf = b""
         pos = 0
         hole = 0  # NUL bytes consumed at this line's start, counted once the line ends
         line_start = True
+        mark = 0  # the position in buf just after the last line end (or cap cut)
+        carried = 0  # NULs of the current line's hole that earlier buffers held
+        self._buf, self._mark, self._carried = buf, mark, carried
         while True:
             while True:
                 if line_start:
@@ -412,6 +535,7 @@ class LineReader:
                 else:
                     break
                 self.offset += hole + len(raw) + (0 if cut else 1)
+                mark = self._mark = pos  # the tail's reach: offset is here (issue #34)
                 self.nul_bytes += hole
                 number = self.line + 1  # a fragment is still part of this physical line
                 if not cut:
@@ -424,9 +548,21 @@ class LineReader:
                 if nul_only:
                     continue  # a line of nothing but the hole
                 yield Line(raw.decode("utf-8", errors="replace"), cut, number, self.path)
+            # the consumed bytes join the tail before the check below asks for it; what
+            # was consumed past the last line end is a hole still open (NULs only), and
+            # only its length is needed once the buffer moves on
+            self._fold(buf, mark, carried)
+            carried = (carried if mark == 0 else 0) + (pos - mark)
             # read1, not read: on a cut archive read() raises before handing over the bytes
             # it did decompress, read1 hands them over first (measured for gz, bz2, xz)
             chunk = self.handle.read1(_CHUNK)
+            if self.same_file is not None and not self.same_file():
+                # the file was truncated under the handle (issue #66): the chunk may be
+                # the new content at the old position; dropped, the offset stays at
+                # the last complete line from before -- and an EOF met on a truncated
+                # file (a quiet writer) is the same event, not the stream's end
+                self.truncated = True
+                return
             if not chunk:
                 # the stream is exhausted: an unterminated tail may remain, and re-reading
                 # it from this offset yields nothing until the file changes (the boundaries
@@ -434,7 +570,8 @@ class LineReader:
                 self.at_end = True
                 return  # what is left is an unterminated tail: re-read next run
             buf = buf[pos:] + chunk
-            pos = 0
+            pos = mark = 0
+            self._buf, self._mark, self._carried = buf, mark, carried
 
 
 class LogFile:
@@ -456,6 +593,7 @@ class LogFile:
         self.size: int | None
         self.verdict: Verdict
         self.note: str | None
+        self.seed: bytes | None  # the bytes before the start, as read at the open (#34)
         if saved is not None and compressed_suffix(path) is not None and _unchanged(path, saved):
             self.unchanged = True
             self.handle = io.BytesIO()  # nothing to read; closes like any handle
@@ -463,9 +601,11 @@ class LogFile:
             self.compressed = True
             self.size = None
             self.fingerprint = saved.fingerprint
+            self.line_at = 0
             self.verdict, self.note = "continue", None
             self.skipped = 0
             self.start, self.start_line = saved.offset, saved.line or 0
+            self.seed = None
             self.reader = LineReader(self.handle, 0, start_line=self.start_line, path=path)
             self.reader.offset, self.reader.line = saved.offset, saved.line or 0
             self.file_size, self.file_mtime = saved.size, saved.mtime
@@ -480,15 +620,30 @@ class LogFile:
             self.file_size, self.file_mtime = st.st_size, st.st_mtime
             self.compressed = compressed_suffix(path) is not None
             self.size = None if self.compressed else st.st_size
-            self.fingerprint = fingerprint(self.handle)
+            self.fingerprint, self.line_at = first_line(self.handle)  # where the line begins
+            probe = b""  # the bytes before the saved offset, as the file has them now (#34)
+            if saved is not None and not self.compressed and saved.offset > 0:
+                probe = tail_of(self.handle, saved.offset, ANCHOR_CAP)
             self.verdict, self.note = identify(saved, self.ino, self.dev, self.size,
-                                               self.fingerprint)
+                                               self.fingerprint, anchor_of(probe))
             self.skipped = 0  # bytes passed over on first sight
             self._counted: int | None = None  # lines before the start, when a pass counted them
             self.start = self._start_offset(from_start)
             self.start_line = self._start_line()
+            # the reader's tail starts as the bytes before its start (issue #34): the probe
+            # when it passed (or was trusted), the end's tail on a first sight, nothing
+            # from 0; a compressed stream keeps none
+            if self.compressed:
+                self.seed = None
+            elif self.start == 0:
+                self.seed = b""
+            elif self.verdict == "continue":
+                self.seed = probe
+            else:
+                self.seed = tail_of(self.handle, self.start, ANCHOR_CAP)
             self.reader = LineReader(self.handle, self.start, start_line=self.start_line,
-                                     path=path)
+                                     path=path, same_file=None if self.compressed
+                                     else self._still_the_file, tail=self.seed)
         except STREAM_ERRORS as exc:
             self.handle.close()
             raise OSError(f"{path}: incomplete or corrupt compressed stream ({exc})") from exc
@@ -547,6 +702,11 @@ class LogFile:
                 st = os.fstat(handle.fileno())
                 if (st.st_ino, st.st_dev) != (self.ino, self.dev):
                     return []  # rotated under us since the open: not this file's lines
+                if st.st_size < self.start or (self.fingerprint is not None
+                                                and self._line_hash(handle) != self.fingerprint):
+                    return []  # truncated under us (issue #66): the new content's lines
+                if self.seed and tail_of(handle, self.start, len(self.seed)) != self.seed:
+                    return []  # refilled past the start with the same first line (issue #34)
                 return lines_before(handle, self.start, n, self.start_line, self.path)
         except _HOOK_ERRORS as exc:
             log.warning("[%s] %s: context before the saved position could not be read (%s)",
@@ -569,12 +729,41 @@ class LogFile:
         else:
             log.debug("%s: continuing at offset %d", where, self.start)
 
+    def _still_the_file(self) -> bool:
+        """Whether the handle still reads the file that was opened (issue #66): its size not
+        below the reader's position, its first line the one from the open, and the bytes
+        before the position the ones the reader saw (issue #34) -- re-read through the
+        handle with the position put back. A plain file only."""
+        st = os.fstat(self.handle.fileno())
+        if st.st_size < self.reader.offset:
+            return False
+        position = self.handle.tell()
+        try:
+            # no first line at the open (an empty file that gained lines): nothing to compare
+            if self.fingerprint is not None and self._line_hash(self.handle) != self.fingerprint:
+                return False
+            tail = self.reader.tail
+            return not tail or tail_of(self.handle, self.reader.offset, len(tail)) == tail
+        finally:
+            self.handle.seek(position)
+
+    def _line_hash(self, handle: BinaryStream) -> str | None:
+        """The hash of what is at the first line's recorded start now: the same line for
+        the same file; NULs (a longer hole), another line (a refill) or nothing
+        otherwise. One read of the cap, wherever the hole ended."""
+        handle.seek(self.line_at)
+        return _hash_of(_read_up_to(handle, FINGERPRINT_CAP))
+
     def lines(self) -> Iterator[Line]:
         """The complete lines from the start offset; ``OSError`` for a stream that ends early."""
         try:
             yield from self.reader
         except STREAM_ERRORS as exc:
             raise OSError(f"{self.path}: incomplete or corrupt compressed stream ({exc})") from exc
+        if self.reader.truncated:
+            log.warning("[%s] %s: truncated under us during the read (a copytruncate during "
+                        "the run?); stopping at offset %d", self.section, self.path,
+                        self.reader.offset)
         if self.reader.nul_bytes:
             log.info("[%s] %s: skipped %d NUL bytes (copytruncate under a writer without "
                      "O_APPEND?)", self.section, self.path, self.reader.nul_bytes)
@@ -592,7 +781,8 @@ class LogFile:
         settled."""
         return Cursor(offset=self.start, ino=self.ino, dev=self.dev,
                       fingerprint=self.fingerprint, realpath=self.realpath,
-                      last_seen=timestamp(now), line=self.start_line)
+                      last_seen=timestamp(now), line=self.start_line,
+                      anchor=anchor_of(self.seed or b""))
 
     def cursor(self, now: datetime | None = None) -> Cursor:
         return Cursor(offset=self.reader.offset, ino=self.ino, dev=self.dev,
@@ -601,7 +791,8 @@ class LogFile:
                       # recorded only for a compressed file read to its end: a cursor that
                       # carries them says its offset IS the unchanged stream's end
                       size=self.file_size if self._settled() else None,
-                      mtime=self.file_mtime if self._settled() else None)
+                      mtime=self.file_mtime if self._settled() else None,
+                      anchor=self.reader.anchor)  # the bytes before offset, as read (#34)
 
     def _settled(self) -> bool:
         return self.compressed and (self.unchanged or self.reader.at_end)

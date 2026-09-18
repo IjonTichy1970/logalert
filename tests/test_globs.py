@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import deny_scandir, try_symlink, unsearchable_listing
 
 from logalert.globs import Expansion, expand, is_glob
 from logalert.rotation import archive_suffix
@@ -113,10 +114,8 @@ def test_a_symbolic_link_is_passed_over_wherever_it_points(tmp_path: Path) -> No
     """A link is a name the operator never wrote (a root run following one planted in a
     watched directory would mail a file outside it -- reproduced in review); a link where a
     wildcard directory component would descend is not followed either."""
-    if sys.platform == "win32":
-        pytest.skip("creating a symlink needs a privilege here; runs in the sandbox and on CI")
     make(tmp_path, "real.log", "hosts/r1/messages", "outside/secret")
-    os.symlink(tmp_path / "real.log", tmp_path / "link.log")
+    try_symlink(tmp_path / "link.log", tmp_path / "real.log")
     os.symlink(tmp_path / "gone", tmp_path / "dangling.log")
     os.symlink(tmp_path / "outside" / "secret", tmp_path / "hosts" / "r1" / "planted")
     os.symlink(tmp_path / "outside", tmp_path / "hosts" / "evil")
@@ -187,14 +186,7 @@ def test_unlistable_directory_is_an_error_not_silence(
     """``glob.glob`` returns nothing for it (measured as nobody); this must not."""
     make(tmp_path, "hosts/r1/messages", "hosts/r2/messages")
     locked = (tmp_path / "hosts" / "r1").as_posix()
-    real_scandir = os.scandir
-
-    def scandir(path: str = ".") -> object:
-        if os.path.normcase(path) == os.path.normcase(locked):
-            raise PermissionError(13, "Permission denied", path)
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
+    deny_scandir(monkeypatch, locked)
     found = expand((tmp_path / "hosts" / "*" / "*").as_posix())
     assert relative(tmp_path, found) == ["hosts/r2/messages"]
     assert found.errors == (f"cannot list {locked} (Permission denied)",)
@@ -316,3 +308,57 @@ def test_kin_bases_carry_no_duplicates() -> None:
     bases = _kin_bases("router.log-20260916.log")
     assert len(bases) == len(set(bases))
     assert "router.log" in bases and "router.log-20260916" in bases
+
+# -- an unsearchable directory under a wildcard component (issue #71) ---------------------------
+
+
+def test_an_unsearchable_directory_under_a_wildcard_component_is_an_error_not_silence(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Where the listing carries no d_type the is_dir of each candidate is an lstat the
+    unsearchable parent refuses; the mutant dropped every candidate in silence -- nothing
+    matched, nothing said, the moment moved on. One error per directory, in #38's words."""
+    make(tmp_path, "hosts/r1/messages", "hosts/r2/messages")
+    locked = (tmp_path / "hosts").as_posix()
+    unsearchable_listing(monkeypatch, locked)
+    found = expand((tmp_path / "hosts" / "*" / "messages").as_posix())
+    assert found.files == () and found.listed
+    assert found.errors == (f"cannot examine 2 of the 2 entries of {locked} (Permission denied); "
+                            f"is the directory searchable?",)
+
+
+def test_an_entry_gone_since_the_listing_is_skipped_without_a_word(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    make(tmp_path, "hosts/r1/messages", "hosts/r2/messages")
+    unsearchable_listing(monkeypatch, (tmp_path / "hosts").as_posix(), gone=True)
+    found = expand((tmp_path / "hosts" / "*" / "messages").as_posix())
+    assert found.files == () and found.errors == () and found.listed
+
+
+@pytest.mark.parametrize("component, extra", [
+    ("*", "hosts/.hidden/messages"),  # hidden: the `.` rule, not fnmatch (review)
+    ("r*", "hosts/notes.txt"),  # a name the component does not match
+])
+def test_only_the_entries_the_component_names_are_counted(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str, extra: str) -> None:
+    """The counts are the candidates the component named: a hidden name under a plain
+    component, or a name the component does not match, is never examined."""
+    make(tmp_path, "hosts/r1/messages", "hosts/r2/messages", extra)
+    locked = (tmp_path / "hosts").as_posix()
+    unsearchable_listing(monkeypatch, locked)
+    found = expand((tmp_path / "hosts" / component / "messages").as_posix())
+    assert found.errors == (f"cannot examine 2 of the 2 entries of {locked} (Permission denied); "
+                            f"is the directory searchable?",)
+
+
+def test_the_entries_that_answer_are_found_and_the_refused_ones_counted(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The two numbers apart (review: every whole refusal has them equal): a lister that
+    refuses one candidate and answers the other -- the answered one is found, the refused
+    one counted."""
+    make(tmp_path, "hosts/r1/messages", "hosts/r2/messages")
+    locked = (tmp_path / "hosts").as_posix()
+    unsearchable_listing(monkeypatch, locked, refused={"r2"})
+    found = expand((tmp_path / "hosts" / "*" / "messages").as_posix())
+    assert relative(tmp_path, found) == ["hosts/r1/messages"]
+    assert found.errors == (f"cannot examine 1 of the 2 entries of {locked} (Permission denied); "
+                            f"is the directory searchable?",)
