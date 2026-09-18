@@ -272,6 +272,13 @@ its notes.
   covers a permission; a glob with no moment yet takes the run's all the same,
   so one file that never opens cannot switch the new-file rule off.
 
+- `[internal]` **The four values that lived twice live once, `State.dirty` is
+  gone, and the test-only file opener left the package** (#49). The exit
+  codes, the `Transport` literal, the lock path and the compression suffixes
+  are imported where they were copied (a fifth suffix would have split the
+  last pair); `dirty` was set in seven places and read in none; `open_log_file`
+  was a door around the rotation catch-up that only the tests used.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

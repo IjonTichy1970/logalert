@@ -144,6 +144,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from logalert.cursor import (
+    COMPRESSED_SUFFIXES,
     STREAM_ERRORS,
     BinaryStream,
     Line,
@@ -172,7 +173,9 @@ TAIL = 256 * 1024  # bytes before the saved offset kept from the confirming seek
 Style = Literal["numeric", "dated", "other"]
 DatedKey = tuple[int, int, int, int, int, int, int]  # Y, M, D, HH, MM, SS, epoch
 
-_EXT = re.compile(r"\.(gz|bz2|xz|zst)$", re.I)
+# the compression suffixes cursor.py understands, as a suffix regex: one set, not two
+_EXT = re.compile(r"\.(" + "|".join(re.escape(s[1:]) for s in COMPRESSED_SUFFIXES) + r")$",
+                  re.I)
 _NUMERIC = re.compile(r"^\.(\d{1,4})$")
 _EPOCH = re.compile(r"^[.-](\d{9,10})$")
 _DATED: tuple[tuple[re.Pattern[str], tuple[int, ...]], ...] = (

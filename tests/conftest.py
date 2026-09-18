@@ -18,7 +18,7 @@ from fake_sendmail import install
 
 import logalert.cursor
 from logalert.__main__ import main
-from logalert.cursor import Line
+from logalert.cursor import Line, LogFile
 from logalert.rotation import open_source
 from logalert.state import Cursor
 
@@ -235,6 +235,18 @@ def fences(text: str, info: str) -> list[str]:
 
 def texts(lines: list[Line]) -> list[str]:
     return [line.text for line in lines]
+
+
+def open_log_file(section: str, path: str, saved: Cursor | None, *,
+                  from_start: bool = False) -> LogFile | None:
+    """A ``LogFile`` for the path, or None when it is absent: a TEST seam over the reader
+    alone (issue #49: it lived in the package with no caller there). Never the run's
+    door -- ``open_source`` is, and it reads a rotated file's copies first, where a
+    ``LogFile`` opened here reads a rotated file from 0."""
+    try:
+        return LogFile(section, path, saved, from_start=from_start)
+    except FileNotFoundError:
+        return None
 
 
 def run(path: Path, saved: Cursor | None, *, archive_dir: Path | None = None,

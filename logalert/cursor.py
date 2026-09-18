@@ -807,16 +807,6 @@ class LogFile:
         self.close()
 
 
-def open_log_file(section: str, path: str, saved: Cursor | None, *,
-                  from_start: bool = False) -> LogFile | None:
-    """``LogFile`` for the path, or None when it is absent this run (the entry is kept)."""
-    try:
-        return LogFile(section, path, saved, from_start=from_start)
-    except FileNotFoundError:
-        log.debug("[%s] %s: absent this run", section, path)
-        return None
-
-
 def count_newlines(handle: BinaryStream, end: int) -> int:
     """The complete lines in ``[0, end)``: one pass, chunked. Leaves the position at 0."""
     handle.seek(0)

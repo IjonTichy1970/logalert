@@ -3081,3 +3081,21 @@ def test_a_cursor_parked_on_a_copy_has_no_anchor_and_resolves_as_before(
     assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
     assert lines == ["since 2", "live 1"]
     assert cursor is not None and cursor.anchor == anchor_of(LIVE)
+
+
+# -- one suffix set (issue #49) -------------------------------------------------------------------
+
+
+def test_the_archive_suffix_regex_is_cursors_suffix_tuple_and_nothing_else() -> None:
+    """``rotation._EXT`` is compiled from ``cursor.COMPRESSED_SUFFIXES``: every suffix the
+    reader opens is one the scan strips, and no other. MUTANT: a hand regex that lacks a
+    tuple suffix, or carries one the tuple lacks -> red (the derivation makes the tuple
+    alone impossible to break)."""
+    from logalert.cursor import COMPRESSED_SUFFIXES
+    from logalert.rotation import _EXT
+    for suffix in COMPRESSED_SUFFIXES:
+        assert _EXT.search("router.log.1" + suffix) is not None, suffix
+        assert _EXT.search("router.log.1" + suffix.upper()) is not None, suffix
+    assert _EXT.search("router.log.1.zip") is None and _EXT.search("router.log.1.lz4") is None
+    assert sorted(_EXT.pattern.split("(", 1)[1].split(")")[0].split("|")) == sorted(
+        s[1:] for s in COMPRESSED_SUFFIXES)
