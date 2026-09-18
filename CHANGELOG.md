@@ -9,6 +9,10 @@ its notes.
 
 ### Nitty Gritty
 
+## [0.1.1] — 2026-09-18 — the rotation catch-up corrected and the run hardened
+
+### Nitty Gritty
+
 - `[internal]` **Changelog entries are one bold sentence, then at most three
   short sentences** (#60). The issue behind `(#N)` carries the reasoning; the
   gate refuses an entry over six lines. Every earlier entry is rewritten to the
@@ -451,5 +455,6 @@ corrects; the quote lives on the issue. The prose separator is `--`; version
 headings use the em dash.
 
 
-[Unreleased]: https://github.com/IjonTichy1970/logalert/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/IjonTichy1970/logalert/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/IjonTichy1970/logalert/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/IjonTichy1970/logalert/releases/tag/v0.1.0

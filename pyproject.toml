@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "logalert"
-version = "0.1.0"
+version = "0.1.1"
 description = "Generalized log file watcher."
 readme = "README.md"
 requires-python = ">=3.11"             # the measured floor (#53); 3.10 lacks datetime.UTC
