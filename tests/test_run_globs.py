@@ -418,18 +418,31 @@ def test_a_new_file_matched_by_two_globs_is_new_whichever_lists_first(site: Site
 
 
 def test_the_moment_is_the_runs_start(site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A file that appears while a long run is in progress must be newer than the moment."""
+    """A file that appears while a long run is in progress must be newer than the moment: the
+    record's moment is the run's FIRST reading of the clock, not the section's save.
+    The clock's first reading is the start and every later one is 30 s on, so a moment
+    taken at the save is not the start (issue #41: a frozen clock could not tell them
+    apart; under the regression a file created during a long run was first-sighted at
+    its end, silently)."""
     fixed = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=45)
+    # each reading 30 s after the last, stamped with whether the state file existed yet:
+    # the opening save precedes every section, so a reading taken after the file exists
+    # is a section's, whichever section is saved first (review)
+    readings: list[tuple[str, bool]] = []
 
     class Clock(datetime):
         @classmethod
         def now(cls, tz: Any = None) -> "Clock":
-            return cls.fromtimestamp(fixed.timestamp(), tz)
+            moment = cls.fromtimestamp(fixed.timestamp() + 30 * len(readings), tz)
+            readings.append((timestamp(moment), site.state_file.exists()))
+            return moment
 
     monkeypatch.setattr(logalert.run, "datetime", Clock)
     pattern = glob_of(site)
     site.write_config(firewall_files=pattern)
     site.prime()
+    before_the_state = [moment for moment, existed in readings if not existed]
+    assert before_the_state == [timestamp(fixed)]  # the start, read once
     assert at(site, "firewall", pattern) == timestamp(fixed)
 
 
@@ -459,17 +472,24 @@ def test_a_failed_listing_is_not_also_matches_nothing(
 
 def test_a_record_of_a_section_no_longer_configured_expires_a_configured_ones_stays(
         site: Site, caplog: pytest.LogCaptureFixture) -> None:
+    """The configured section's record survives ``expire_runs`` on its own: the glob's
+    directory is away for the run, so nothing re-creates the record (issue #41: with the
+    directory present ``_advance`` re-created what an expiry had dropped, and the
+    ``configured=`` argument was unpinned -- under the regression a file created during
+    an outage longer than ``state_ttl`` was first-sighted at its end)."""
     caplog.set_level(logging.DEBUG, logger="logalert.run")
     pattern = glob_of(site)
     site.write_config("state_ttl = 1" + NL, firewall_files=pattern)
     site.prime()
-    old = datetime.now(UTC) - timedelta(days=3)
+    old = datetime.now(UTC).replace(microsecond=0) - timedelta(days=3)
     state = load_state(str(site.state_file))
     state.record_run("gone-section", [pattern], [pattern], old)
     state.record_run("firewall", [pattern], [pattern], old)
     state.save()
+    (site.root / "daily").rename(site.root / "away")  # away this run: not looked into
     assert site.run() == 0
-    assert "gone-section" not in runs(site) and "firewall" in runs(site)
+    assert "gone-section" not in runs(site)
+    assert at(site, "firewall", pattern) == timestamp(old)  # kept, however old
     assert ("[gone-section] the last-run record forgotten: not configured, no run saved for "
             "1 days") in caplog.messages
 

@@ -129,6 +129,12 @@ def test_lock_busy_age_never_goes_negative() -> None:
     assert busy.age == 0.0 and busy.stale is False
 
 
+def test_a_holder_exactly_lock_stale_old_is_not_stale() -> None:
+    """USAGE.md: stale means OLDER than lock_stale, not as old (issue #41: `>=` survived)."""
+    assert LockBusy("/x/lock", 42, started=1000.0, stale_after=10, now=1010.0).stale is False
+    assert LockBusy("/x/lock", 42, started=1000.0, stale_after=10, now=1010.5).stale is True
+
+
 def test_other_open_errors_propagate(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         RunLock(str(tmp_path / "nope" / "lock"), 3600).acquire()

@@ -220,6 +220,17 @@ def test_odd_line_separators_inside_a_pattern_stay_in_the_pattern(tmp_path: Path
     assert w.patterns[0].text == "disk" + form_feed + "failure"
 
 
+def test_a_priority_tag_is_lowercase_one_space_only(tmp_path: Path) -> None:
+    """USAGE.md: the tag is lowercase, one space -- `[HIGH]`, `[High]` and `[high]x` are
+    pattern text (issue #41: a case-insensitive tag survived the suite; review: so did an
+    optional space)."""
+    text = watch(tmp_path).replace("    disk failure\n",
+                                   "    [HIGH] disk failure\n    [High] x\n    [high]x\n")
+    (w,) = load_config(write(tmp_path, text)).watches
+    assert [(p.text, p.priority) for p in w.patterns[:3]] == [
+        ("[HIGH] disk failure", None), ("[High] x", None), ("[high]x", None)]
+
+
 def test_priority_tag_text_is_stripped(tmp_path: Path) -> None:
     text = watch(tmp_path).replace("    disk failure\n", "    [high]   disk failure  \n")
     (w,) = load_config(write(tmp_path, text)).watches

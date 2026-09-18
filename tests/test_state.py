@@ -132,6 +132,8 @@ def test_forget_one_file_or_everything(tmp_path: Path) -> None:
         ('{"version": 1, "entries": {"a": {"/x": {"offset": 1, "ino": 2, "dev": 3, '
          '"fingerprint": null, "realpath": "/x", "last_seen": "yesterday"}}}}',
          "'last_seen' is not a UTC timestamp"),
+        ("", "not valid JSON"),  # an empty file is never a silent first run (issue #41)
+        ("  " + chr(10), "not valid JSON"),
     ],
 )
 def test_corrupt_state_is_a_hard_error_naming_the_file_and_the_remedy(
@@ -668,3 +670,54 @@ def test_a_bad_anchor_is_a_hard_error(tmp_path: Path, bad: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
     with pytest.raises(StateError, match="'anchor' is not a string"):
         load_state(str(path))
+
+
+# -- root's own state and the empty file (issue #41) --------------------------------------------
+
+
+def test_roots_own_state_is_not_foreign_and_another_users_is(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ``uid == 0`` exception in ``_foreign_owner`` was asserted only under a real root
+    euid (the sandbox); dropping it survived the suite as a non-root user. Faked uids run it
+    everywhere: root's own file and directory are not foreign, another user's are."""
+    if sys.platform == "win32":
+        pytest.skip("no uids on Windows; runs in the sandbox and on CI")
+    path = tmp_path / "state.json"
+    path.write_text("{}", encoding="utf-8")
+    owner = {"uid": 0}
+    real_lstat, real_stat = os.lstat, os.stat
+
+    def lstat_owned(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        st = real_lstat(target, *args, **kwargs)
+        return os.stat_result(tuple(st)[:4] + (owner["uid"],) + tuple(st)[5:])  # st_uid
+
+    def stat_owned(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        st = real_stat(target, *args, **kwargs)
+        return os.stat_result(tuple(st)[:4] + (owner["uid"],) + tuple(st)[5:])
+
+    monkeypatch.setattr("logalert.state.os.geteuid", lambda: 0)
+    monkeypatch.setattr("logalert.state.os.lstat", lstat_owned)
+    monkeypatch.setattr("logalert.state.os.stat", stat_owned)
+    assert _foreign_owner(str(path)) is None  # the file is root's
+    assert _foreign_owner(str(tmp_path / "absent.json")) is None  # its directory is root's
+    owner["uid"] = 4242  # a uid with no name: reported the way sudo -u accepts it
+    assert _foreign_owner(str(path)) == "#4242"
+    assert _foreign_owner(str(tmp_path / "absent.json")) == "#4242"
+
+
+def test_unknown_fields_load_under_version_1_and_are_dropped_on_save(tmp_path: Path) -> None:
+    """The rollback property #18, #44, #65 and #34 rely on, unpinned until now: a file a
+    newer logalert wrote under schema version 1 with a key or a cursor field this version
+    does not know loads, and the save drops what it does not know."""
+    path = tmp_path / "state.json"
+    path.write_text(
+        '{"version": 1, "entries": {"a": {"/x": {"offset": 1, "ino": 2, "dev": 3, '
+        '"fingerprint": null, "realpath": "/x", "last_seen": "2026-09-14T12:00:00Z", '
+        '"later": true}}}, "runs": {}, "future": {"key": 1}}',
+        encoding="utf-8", newline="\n")
+    state = load_state(str(path))
+    loaded = state.get("a", "/x")
+    assert loaded is not None and loaded.offset == 1
+    state.save()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "future" not in data and "later" not in data["entries"]["a"]["/x"]

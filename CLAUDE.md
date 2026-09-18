@@ -33,8 +33,9 @@ verdict** -- an announced skip reads as green at a glance.
 Expected announced skips on the Windows host: `changelog refs` ("no release
 commit yet", until the first release) and `pytest` (the POSIX-only tests --
 file modes, a FIFO, symlinks, the real-`logrotate` module, the POSIX-only lock
-probe, a rename under an open handle, a signal delivered to a handler -- each
-saying "runs in the sandbox and on CI"; 69 as of #66). In the root sandbox the
+probe, a rename under an open handle, a signal delivered to a handler, the
+faked uids of the root-owner pin -- all but the lock probe saying "runs in the
+sandbox and on CI"; 70 as of #41). In the root sandbox the
 non-root tests skip instead, saying "expected in the root sandbox; CI runs it"
 (11 as of #64), plus one Windows-only
 test ("the read-only attribute is a Windows shape"); as `nobody` the one

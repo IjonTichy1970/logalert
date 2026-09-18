@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import NL, SENDER, Site, body_of
+from conftest import NL, SENDER, Site, body_of, run_logalert
 from esmtp_stub import StubConfig, run_stub
 
 import logalert.__main__
@@ -450,6 +450,10 @@ def test_the_run_only_flags_refuse_the_modes(
         assert exc.value.code == 2
         assert "apply to the run, not to" in capsys.readouterr().err
     assert site.state_file.read_bytes() == written and site.calls() == []
+    # --example-config is not in the mode set that refuses the run-only flags: -n beside it
+    # is ignored and the example printed, exit 0 (issue #41: unpinned)
+    assert site.run("--example-config", "-n") == 0
+    assert capsys.readouterr().out.startswith("# logalert configuration")
 
 
 def test_state_file_override_reaches_reset_state_and_check_config(
@@ -1834,3 +1838,24 @@ def test_an_entry_from_0_1_0_is_trusted_once_and_gains_the_anchor_on_the_next_sa
     assert site.run() == 0
     calls = site.calls()
     assert len(calls) == 2 and "3: kernel: disk failure on sdb" in body_of(calls[1][1])
+
+
+# -- the dry run's console guard (issue #41) ----------------------------------------------------
+
+
+def test_a_dry_run_prints_a_subject_the_console_cannot_encode(site: Site) -> None:
+    """``main`` reconfigures stdout with ``errors="backslashreplace"`` so a subject from the
+    config never crashes the reader; pytest captures in-process, so only a child under a
+    console encoding that lacks the character exercises it (the mutant: UnicodeEncodeError,
+    exit 1). PYTHONIOENCODING overrides UTF-8 mode, so the case holds on newer interpreters."""
+    em_dash = chr(0x2014)  # from the code point: gated Python stays ASCII
+    text = site.conf.read_text(encoding="utf-8").replace("Router disk failure",
+                                                         "Platte " + em_dash + " defekt")
+    site.conf.write_text(text, encoding="utf-8", newline=NL)
+    site.prime()
+    site.append(site.router, "disk failure now")
+    env = dict(os.environ, PYTHONIOENCODING="ascii")  # a console that cannot show the dash
+    result = run_logalert("-n", "-f", str(site.conf), env=env, binary=True)
+    assert result.returncode == 0, result.stderr
+    escaped = b"Subject: Platte " + chr(0x5C).encode() + b"u2014 defekt -- 1 match(es)"
+    assert escaped in result.stdout

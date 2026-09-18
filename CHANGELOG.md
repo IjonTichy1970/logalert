@@ -209,6 +209,13 @@ its notes.
   the gate's verdict counts an announced skip as green by design; the read
   path would have been measured nowhere. Below 3.14 nothing changes.
 
+- `[internal]` **Seven behaviours the audit's mutation run found unpinned are
+  pinned, each red under its mutant on the platform where it is real** (#41).
+  The glob record's moment is the run's start (a frozen clock could not tell);
+  a configured section's record survives an outage longer than `state_ttl`;
+  root's own state is not foreign (faked uids, so CI sees it); the dry run's
+  console guard; an empty state file is corrupt; three boundaries.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty
