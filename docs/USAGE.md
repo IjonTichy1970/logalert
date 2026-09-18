@@ -633,7 +633,20 @@ A glob that matches nothing is nothing to do (a DEBUG line; the directory may
 not exist yet). A directory the glob needs to list but cannot is a failed item
 (`[section] /var/log/hosts/*/messages: cannot list /var/log/hosts (Permission
 denied)`, exit 1): a watch that went quiet because of a permission must not
-look like a watch with nothing to say.
+look like a watch with nothing to say. So is a directory the running user can
+list but not search (mode `644`) under a wildcard directory component: where
+the listing says what each entry is (ext4 with `filetype`, every modern
+default) its files fail at the open, one failed item each; where it does not
+(ext4 made without `filetype`, XFS with `ftype=0`, some FUSE and network
+mounts) the entries cannot be told apart and the line is `cannot examine 2 of
+the 2 entries of /var/log/hosts (Permission denied); is the directory
+searchable?`, once per directory, counting the entries the pattern names.
+Where the line is the directory's the glob was not looked into, so its
+record's moment stays where it was; where its files failed one by one the
+glob was listed and the moment moves on as after any run, so a host directory
+that appeared during the outage and wrote nothing since is first-sighted at
+its end once the mode is fixed (with a wildcard last component, `hosts/*/*`,
+the refusal is each subdirectory's `cannot list` and the moment stays).
 
 ## Running it
 
@@ -879,4 +892,4 @@ configured destination still gets INFO and above.
 | `--reset-state /var/log/x.log` says `no entry for ...` | The path is not spelled as in the config (or as `--check-config` lists a glob's match), or the file was never seen; given the glob itself it says `is a glob` | Use the exact path; `--reset-state` with no path forgets everything |
 | A glob mails nothing, or a file it should read is missing from `--check-config` | The glob matches nothing where it looks (`matches nothing`), or the file is left out as a rotated copy (`left out:` -- a name ending in `.N` or a date such as `app.2024`, a `.bak` or `.gz` twin), or it is not a regular file or is a symbolic link (`passed over:`) | `logalert --check-config` names every match and everything left out; list a wanted file by name, or set `include_archives = yes` for a directory of dated live files |
 | `[section] /var/log/app/current: is a symbolic link owned by app to a file owned by root; not followed (...)` (exit 1) | A listed path is a link whose owner is neither root, nor the running user, nor the owner of the file it points to -- in a directory another user owns, what the name resolves to is that user's choice | List the file itself, or make the link root's (`chown -h root <link>`); a link another user planted is the reason the rule exists |
-| `[section] /var/log/hosts/*/messages: cannot list /var/log/hosts (Permission denied)` (exit 1) | The running user cannot list a directory the glob needs to look into; the files of the section that were reachable were processed | Grant read and search permission on the directory, or run as a user that has it |
+| `[section] /var/log/hosts/*/messages: cannot list /var/log/hosts (Permission denied)` (exit 1), or `... cannot examine 2 of the 2 entries of /var/log/hosts (Permission denied); is the directory searchable?` | The running user cannot list a directory the glob needs to look into -- or can list it but not search it (mode `644`), on a filesystem whose listings do not say what each entry is; the files of the section that were reachable were processed | Grant read and search permission on the directory, or run as a user that has it |

@@ -227,3 +227,19 @@ def test_the_position_section_and_the_table_carry_the_anchor() -> None:
     assert "the bytes before the saved offset are not the ones read " in source  # breaks there
     assert "(truncated and refilled?)" in source
     assert 'log.info("%s: %s; %s", where, self.note, self.verdict)' in source
+
+
+def test_the_globs_section_and_the_table_carry_the_unsearchable_directory_line() -> None:
+    """Issue #71: the second failed-item line of a glob, in the program's own words, in the
+    Globs section and in the troubleshooting row beside `cannot list`."""
+    text = _text()
+    section = text[text.index("## Globs"):text.index("## Running it")].replace(NL, " ")
+    shape = ("cannot examine 2 of the 2 entries of /var/log/hosts (Permission denied); is the "
+             "directory searchable?")
+    assert shape in section and "its record's moment stays where it was" in section
+    table = text[text.index("## Troubleshooting"):]
+    row = next(r for r in table.splitlines() if "cannot list /var/log/hosts" in r)
+    assert shape in row and "can list it but not search it" in row
+    source = (DOC.parents[1] / "logalert" / "globs.py").read_text(encoding="utf-8")
+    assert 'f"cannot examine {denied} of the {examined} entries of {path} ({reason}); "' in source
+    assert 'f"is the directory searchable?"' in source

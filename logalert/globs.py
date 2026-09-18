@@ -25,9 +25,16 @@ measured in the sandbox and on Windows):
     be opened: ``glob.glob`` returns nothing for it, silently (measured as ``nobody`` over a
     0000 directory), and a watch that went quiet because of a permission would look like a
     watch with nothing to say. This module walks the pattern itself, with ``os.scandir``, for
-    that one reason. A directory that does not exist, or a component that is not a
-    directory, matches nothing; ``listed`` says whether any directory was scanned at all,
-    which the run's new-file rule needs.
+    that one reason. So is a directory that can be listed but not searched (``0644``) under
+    a wildcard directory component (issue #71): where the listing carries no ``d_type``
+    (ext4 without ``filetype``, XFS ``ftype=0``, some FUSE and network mounts) the
+    ``is_dir`` of each candidate is an ``lstat`` the parent refuses, and every candidate
+    was dropped in silence -- the same hole #38 closed in the catch-up, said the same way,
+    once per directory: ``cannot examine N of the M entries of <dir> (...); is the
+    directory searchable?``. With ``d_type`` the candidates are found and their files fail
+    at the open, one failed item each. A directory that does not exist, or a component
+    that is not a directory, matches nothing; ``listed`` says whether any directory was
+    scanned at all, which the run's new-file rule needs.
   * Rotated copies are left out unless the section says ``include_archives = yes``: by SHAPE
     (``rotation.archive_suffix``: a numeric or dated rotation suffix whose base does not end
     in a digit, a copy suffix such as ``.bak`` or ``-old``, or a bare compression extension,
@@ -51,7 +58,8 @@ measured in the sandbox and on Windows):
   * The expansion is sorted by name, so a daily directory reads in date order.
 
 What the run does with the expansion -- one read per path however often a section names it,
-a failed item per unlistable directory, the new-file rule -- is ``logalert.run``'s.
+a failed item per unlistable or unsearchable directory, the new-file rule -- is
+``logalert.run``'s.
 """
 
 import fnmatch
@@ -161,6 +169,8 @@ def _list(path: str, separator: str, component: str, last: bool, errors: list[st
         return []
     scanned[0] += 1
     found: list[str] = []
+    examined = denied = 0
+    reason = ""
     for entry in entries:
         if entry.name.startswith(".") and not component.startswith("."):
             continue  # hidden, as the shell and glob leave it
@@ -168,11 +178,29 @@ def _list(path: str, separator: str, component: str, last: bool, errors: list[st
             continue
         if not last:
             try:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-            except OSError:
+                # the listing's d_type where the filesystem fills it; an lstat otherwise
+                # (DT_UNKNOWN: ext4 without `filetype`, XFS `ftype=0`), which a directory
+                # the user can list but not search refuses -- a listing problem of the
+                # parent, said once per directory as the catch-up says it (issue #71),
+                # never a silent skip of every candidate
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except (FileNotFoundError, NotADirectoryError):
+                # gone since the listing, or the parent replaced by a file: as `expand`
+                # treats its lstat (CPython's own entry answers False for a vanished name;
+                # a lister that raises instead is skipped the same way)
+                continue
+            except OSError as exc:
+                examined += 1
+                denied += 1
+                reason = reason or (exc.strerror or str(exc))
+                continue
+            examined += 1
+            if not is_dir:
                 continue
         found.append(_join(path, separator, entry.name))
+    if denied:
+        errors.append(f"cannot examine {denied} of the {examined} entries of {path} ({reason}); "
+                      f"is the directory searchable?")
     return found
 
 

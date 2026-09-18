@@ -285,6 +285,7 @@ def test_bounded_passes_success_and_failure_through_unchanged() -> None:
 BOUNDED_BINARIES = ("runuser", "logrotate", "journalctl", "systemctl", "cp", "python3",
                     "mount", "umount", "dd",  # the full-disk check's tmpfs (issue #30)
                     "truncate",  # the band's one free page (issue #70)
+                    "mkfs.ext4",  # the no-d_type check's image (issue #71)
                     '"$pyx"', '"$T/venv/bin/python"', '"$T/bin/logalert"')
 _TREE_BINARY = re.compile(r'^"?\$\{?(?:T|pyx)\}?"?(?:/\S*)?$')
 # where a command may begin: after these, the next word is at a command position

@@ -144,6 +144,59 @@ def deny_scandir(monkeypatch: pytest.MonkeyPatch, locked: str) -> None:
     monkeypatch.setattr(os, "scandir", scandir)
 
 
+def unsearchable_listing(monkeypatch: pytest.MonkeyPatch, locked: str, *,
+                         gone: bool = False, refused: set[str] | None = None) -> None:
+    """``os.scandir`` of one directory lists as a filesystem without ``d_type`` does over a
+    directory the user can list but not search: every entry's ``is_dir``/``is_symlink`` is
+    the lstat the parent refuses (issue #71; #38's shape for the catch-up) -- or, with
+    ``refused``, only the named entries', the others answering as the real entry does; with
+    ``gone`` the lstat says the entry is gone since the listing (CPython's own entry answers
+    False there; a lister that raises is the shape pinned). Both platforms."""
+
+    class Unknown:
+        def __init__(self, entry: "os.DirEntry[str]") -> None:
+            self.entry = entry
+            self.name, self.path = entry.name, entry.path
+
+        def _refuse(self) -> None:
+            if refused is not None and self.name not in refused:
+                return
+            if gone:
+                raise FileNotFoundError(2, "No such file or directory", self.path)
+            raise PermissionError(13, "Permission denied", self.path)
+
+        def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+            self._refuse()
+            return self.entry.is_dir(follow_symlinks=follow_symlinks)
+
+        def is_symlink(self) -> bool:
+            self._refuse()
+            return self.entry.is_symlink()
+
+    class Listing:
+        def __init__(self, entries: list[Unknown]) -> None:
+            self.entries = entries
+
+        def __enter__(self) -> "Listing":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def __iter__(self) -> Any:
+            return iter(self.entries)
+
+    real_scandir = os.scandir
+
+    def scandir(path: Any = ".", *args: Any, **kwargs: Any) -> Any:
+        if os.path.normcase(str(path)) == os.path.normcase(locked):
+            with real_scandir(path, *args, **kwargs) as entries:
+                return Listing([Unknown(entry) for entry in entries])
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+
 def try_symlink(link: Path, target: Path) -> None:
     """A symbolic link, or the project's skip where the host refuses one (Windows without
     Developer Mode); a host that can make one measures the case."""

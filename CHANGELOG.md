@@ -216,6 +216,13 @@ its notes.
   root's own state is not foreign (faked uids, so CI sees it); the dry run's
   console guard; an empty state file is corrupt; three boundaries.
 
+- `[contract]` **A glob's wildcard directory component over a directory the
+  user can list but not search is a failed item (exit 1) where the listing
+  carries no `d_type`, not silence** (#71). Every candidate's `is_dir` is an
+  `lstat` the parent refuses (ext4 without `filetype`, XFS `ftype=0`, some
+  FUSE and network mounts), and each was dropped without a word, the glob's
+  moment moving on. The line is #38's: `cannot examine N of the M entries`.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

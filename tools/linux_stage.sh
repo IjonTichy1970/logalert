@@ -325,6 +325,9 @@ cleanup() {
   if [ -n "${FULL_MOUNTED:-}" ]; then  # the full-disk check's tmpfs: before the tree goes
     bounded "$BOUND_CMD" umount "$T/full" 2>/dev/null && FULL_MOUNTED=""
   fi
+  if [ -n "${NOFT_MOUNTED:-}" ]; then  # the no-d_type check's ext4 image (issue #71)
+    bounded "$BOUND_CMD" umount "$T/noft" 2>/dev/null && NOFT_MOUNTED=""
+  fi
   [ -n "${T:-}" ] && rm -rf "$T"
 }
 trap cleanup EXIT
@@ -913,6 +916,71 @@ EOF
     fi
     rm -f "$T/full/filler"
     bounded "$BOUND_CMD" umount "$T/full" && FULL_MOUNTED=""
+  fi
+
+  echo "-- glob over an unsearchable directory: a failed item where the listing has no d_type (issue #71)"
+  # A 16 MiB ext4 image made WITHOUT the filetype feature: its listings carry no d_type, so
+  # the is_dir of each candidate under a wildcard directory component is an lstat the
+  # unsearchable (0644) parent refuses -- before the fix every candidate was dropped in
+  # silence and the glob matched nothing and said nothing. The control is the same tree
+  # on the stage's own filesystem (d_type filled), where the refusal is the per-file one.
+  # mkfs.ext4 and a loop mount take the privilege the sandbox and CI's sudo have.
+  mkdir -p "$T/noft" "$T/dtype"
+  if ! command -v mkfs.ext4 > /dev/null 2>&1; then
+    skip "mkfs.ext4 is not on PATH (e2fsprogs) -- the no-d_type check needs an ext4 image"
+  elif ! bounded "$BOUND_CMD" dd if=/dev/zero of="$T/noft.img" bs=1M count=16 status=none > "$T/dd.err" 2>&1; then
+    skip "cannot make a 16 MiB image under $T ($(head -1 "$T/dd.err"))"
+  elif ! bounded "$BOUND_CMD" mkfs.ext4 -q -F -O ^filetype "$T/noft.img" > "$T/mkfs.err" 2>&1; then
+    skip "mkfs.ext4 -O ^filetype failed ($(head -1 "$T/mkfs.err")) -- the no-d_type check needs the image"
+  elif ! bounded "$BOUND_CMD" mount -o loop "$T/noft.img" "$T/noft" > "$T/mount2.err" 2>&1; then
+    skip "cannot loop-mount the ext4 image under $T ($(head -1 "$T/mount2.err")) -- the no-d_type check needs one"
+  else
+    NOFT_MOUNTED=1
+    for root in "$T/noft" "$T/dtype"; do
+      install -d -m 755 "$root/hosts/r1" "$root/hosts/r2"
+      printf 'DENY 192.0.2.71\n' > "$root/hosts/r1/messages"
+      printf 'DENY 192.0.2.72\n' > "$root/hosts/r2/messages"
+      chmod 644 "$root/hosts/r1/messages" "$root/hosts/r2/messages"
+      chmod 644 "$root/hosts"   # root's, listable by $SVC, not searchable
+      chmod 755 "$root"
+    done
+    cat > "$T/noft.conf" <<EOF
+[logalert]
+sendmail_path = $T/bin/sendmail
+state_file = $T/state/state.json
+from = alerts@example.net
+log = file:$T/noft.log
+[noft]
+subject = No d_type
+to = noc@example.net
+files = $T/noft/hosts/*/messages
+patterns =
+    DENY
+[dtype]
+subject = With d_type
+to = noc@example.net
+files = $T/dtype/hosts/*/messages
+patterns =
+    DENY
+EOF
+    chmod 644 "$T/noft.conf"
+    install -o "$SVC" -m 640 /dev/null "$T/noft.log"
+    before="$(fake_calls)"
+    as_svc g1 -f "$T/noft.conf"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+      skip "the run over the unsearchable directories did not finish within ${BOUND_CMD}s"
+    elif [ "$rc" -ne 1 ]; then
+      fail "the run over the unsearchable directories exited $rc, not 1: $(first_err g1)" "no-dtype"
+    elif ! grep -q "\[noft\] $T/noft/hosts/\*/messages: cannot examine 2 of the 2 entries of $T/noft/hosts (Permission denied); is the directory searchable?" "$T/g1.err"; then
+      fail "the no-d_type glob did not report the unsearchable directory: $(first_err g1)" "no-dtype"
+    elif ! grep -q "\[dtype\] $T/dtype/hosts/r1/messages: Permission denied" "$T/g1.err"; then
+      fail "the control (d_type filled) did not fail per file: $(first_err g1)" "no-dtype-control"
+    elif [ "$(fake_calls)" -ne "$before" ]; then
+      fail "the run over the unsearchable directories mailed $(( $(fake_calls) - before )) time(s)" "no-dtype"
+    else
+      ok "no d_type: one failed item naming the unsearchable directory; with d_type: one per file; exit 1, no mail"
+    fi
+    bounded "$BOUND_CMD" umount "$T/noft" && NOFT_MOUNTED=""
   fi
 }
 

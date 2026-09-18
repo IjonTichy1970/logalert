@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import NL, Site, body_of, deny_scandir
+from conftest import NL, Site, body_of, deny_scandir, unsearchable_listing
 
 import logalert.run
 from logalert.__main__ import main
@@ -573,3 +573,28 @@ def test_a_glob_with_an_unlistable_subdirectory_keeps_its_moment(
     (_, stdin), = site.calls()
     assert "DENY 192.0.2.28" in body_of(stdin)
     assert site.offset("firewall", during) == during.stat().st_size
+
+# -- an unsearchable directory under a wildcard component, through the run (issue #71) ---------
+
+
+def test_an_unsearchable_directory_under_a_wildcard_is_a_failed_item_and_keeps_the_moment(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """The listing problem is the section's failed item (exit 1, the one stderr line) and the
+    glob is not looked into, so its record's moment stays where it was -- a file created
+    meanwhile is still new once the directory is searchable (the mutant: nothing matched,
+    nothing said, the moment moved on)."""
+    pattern = (site.root / "hosts" / "*" / "messages").as_posix()
+    (site.root / "hosts" / "r1").mkdir(parents=True)
+    site.write_config(firewall_files=pattern)
+    site.prime()
+    moment = back_date(site, "firewall", 100)
+    locked = (site.root / "hosts").as_posix()
+    with pytest.MonkeyPatch.context() as outage:
+        unsearchable_listing(outage, locked)
+        assert site.run() == 1
+    err = capsys.readouterr().err
+    assert err == (f"logalert: failed: [firewall] {pattern}: cannot examine 1 of the 1 entries "
+                   f"of {locked} (Permission denied); is the directory searchable?; see the log"
+                   + NL)
+    assert at(site, "firewall", pattern) == moment  # not looked into: the moment kept
+    assert site.calls() == []
