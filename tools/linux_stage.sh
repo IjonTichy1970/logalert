@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# TEMPLATE: a gate stage that only makes sense on Linux, delegated into a WSL
-# sandbox when the gate runs on Windows. Copy it, keep it in tools/, and fill in
-# run_native_checks(). Everything else is the delegation machinery, which was
-# learned the expensive way (a 20-minute silent hang, a misattributed fault, a
-# stub that was silently bypassed) and should be copied rather than re-derived.
+# The gate's Linux stage: the checks of issue #14 and its follow-ups over the
+# INSTALLED script on a real Linux host, as the service user, over a fixture
+# tree nobody else can see (run_native_checks) -- run natively on CI and
+# delegated into the WSL sandbox when the gate runs on Windows. The delegation
+# machinery is the source project's template, learned the expensive way (a
+# 20-minute silent hang, a misattributed fault, a stub that was silently
+# bypassed): copy it rather than re-derive it.
 #
 # Modes:
 #   auto      (default) skip what this host cannot run, and SAY so
@@ -32,8 +34,8 @@ MODE="${LOGALERT_CHECK_MODE:-auto}"
 # shellcheck disable=SC1007 # `CDPATH= cd --` is a deliberate one-shot ENV PREFIX so a stray
 # CDPATH in the caller's environment cannot silently send us to a different directory.
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-# This script's path relative to the repo root, as the distro will run it. The
-# template assumes it lives in tools/; change this line if you move it.
+# This script's path relative to the repo root, as the distro will run it (it
+# lives in tools/; change this line if you move it).
 SELF_REL="tools/$(basename -- "$0")"
 
 FAILED=""
@@ -270,13 +272,14 @@ if [ "$(uname -s)" != "Linux" ]; then
 fi
 
 # -- privilege -----------------------------------------------------------------
-# Installing a unit or a vhost needs root, but a gate is deliberately NOT run as
-# root. Inside the sandbox the child already IS root (`-u root` above). On CI
-# runners and a dev box configured for it, re-exec once under passwordless
-# sudo; where it does not exist, the privileged checks skip and say why.
-# `sudo -n` is non-interactive: a plain `sudo` would sit waiting for a password
-# with no tty and look exactly like a hung gate. The env var is the recursion
-# guard. Delete this block if run_native_checks() needs no privilege.
+# Running the installed script as the service user (`runuser`), installing the
+# documented unit and mounting the fixtures' filesystems need root, but a gate
+# is deliberately NOT run as root. Inside the sandbox the child already IS root
+# (`-u root` above). On CI runners and a dev box configured for it, re-exec
+# once under passwordless sudo; where it does not exist, the check below skips
+# the stage and says why. `sudo -n` is non-interactive: a plain `sudo` would
+# sit waiting for a password with no tty and look exactly like a hung gate.
+# The env var is the recursion guard.
 # `sudo -E` keeps the environment but NOT PATH: Ubuntu's `secure_path` replaces
 # it even with -E (measured), so the venv-first PATH the gate insists on would
 # be gone in here and any `python` below would be the system one. PATH is
@@ -286,9 +289,28 @@ if [ "$(id -u)" -ne 0 ] && [ "${LOGALERT_SUDO_REEXEC:-}" != "1" ] && sudo -n tru
   echo "  (re-executing under sudo for the privileged checks)"
   exec sudo -E env PATH="$PATH" bash "$0" "$@"
 fi
+# Not root and no passwordless sudo -- an ordinary account on a Linux dev host:
+# ONE named skip, before the venv and the wheel are built. Measured without it
+# (issue #59): the wheel built, and nine checks FAILED naming mail, the state,
+# the rotation and the documented unit, for two faults no non-root caller can
+# avoid (`runuser: may not be used by non-root users`, a refused write under
+# /run/systemd/system) -- a transcript that reads like a product defect.
+# A string test: an `id` that fails answers "", which must skip too, where
+# `-ne 0` would error out and fall through as if root.
+if [ "$(id -u 2>/dev/null)" != "0" ]; then
+  skip "not root and no passwordless sudo -- the checks run the installed script as the service user and install a unit, which needs root"
+  echo ""
+  [ -z "$FAILED" ] && { echo "LINUX STAGE SKIPPED"; exit 0; }
+  echo "LINUX STAGE FAILED -$FAILED"; exit 1
+fi
+# `runuser` and `logrotate` are /usr/sbin's, and a Debian user's PATH has no
+# sbin -- kept on purpose by the `sudo -E env PATH="$PATH"`
+# above, the venv first. Appended, so that order stands; measured before this
+# line: `missing on this host: runuser logrotate`, both installed.
+PATH="$PATH:/usr/sbin:/sbin"
 
 # -- the native Linux path -----------------------------------------------------
-# This runs on CI natively and inside the sandbox when delegated. Fill it in.
+# This runs on CI natively and inside the sandbox when delegated.
 # Rules that earned their place:
 #   * wrap every external binary in `bounded "$BOUND_CMD" ...`
 #   * check `$? -eq 124` FIRST, before interpreting output: a killed command

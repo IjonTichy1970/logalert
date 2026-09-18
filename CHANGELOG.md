@@ -258,6 +258,13 @@ its notes.
   `pytest` and the `docs` extra, and run there in seconds. Everything else
   stays could-not-check for such a PR, as documented.
 
+- `[internal]` **The Linux stage skips, named, when it is not root and has no
+  passwordless sudo, before it builds anything** (#59). Measured as an
+  ordinary user: the wheel built and nine checks FAILED naming mail, the
+  state, the rotation and the documented unit, for faults no non-root caller
+  can avoid. The native path also finds `runuser` and `logrotate` under a PATH
+  without `/usr/sbin`, and the header is this stage's, not the template's.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty
