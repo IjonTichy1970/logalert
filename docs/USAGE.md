@@ -617,17 +617,22 @@ run (a copy restored with its timestamps, a rotated copy under
 original's modification time), and every listed path, whose first sight is
 unchanged. A glob's moment is recorded when the section's positions are saved
 -- never when its delivery failed (the new file it read keeps its position at
-the beginning, and a file the failed run did not reach is still new), and
-never for a glob whose directory was away or could not be listed that run, so
-a file created during the outage is read whole once the directory is back.
-`--reset-state` forgets the section's moments with the positions: a
-file that appears between the reset and the next run is a plain first sight
-at the end, so reset right before a run, or preview with `-n`. One consequence
-to know: a file the glob matched but could not open for a while (a `Permission
-denied` failed item each run) is read from 0 once it can be, since it was never
-matched before; a fresh modification time on old content (`cp` without `-p`)
-reads the same way, at most `max_lines` matching lines in one mail; `-n` first
-shows what that would send.
+the beginning, and a file the failed run did not reach is still new), never
+for a glob whose directory was away or could not be listed that run, and never
+for a glob whose file with no position yet could not be opened that run (a
+failed item, exit 1 -- a `Permission denied`, typically), so a file created
+during the outage is read whole once the directory, or the file, is back:
+everything written before the permission was fixed is mailed then, once. (A
+glob that has no moment yet takes the run's all the same: its unopened file is
+a plain first sight at the end unless it is written to after that run.)
+`--reset-state` forgets the section's moments with the positions: a file that
+appears between the reset and the next run, or is still refused at it, is a
+plain first sight at the end, so reset right before a run, or preview with
+`-n`. One consequence to know: a new file the glob matched but could not open
+for a while is read from 0 once it can be (an older one is a first sight at
+its end), and so is a fresh modification time on old content (`cp` without
+`-p`), at most `max_lines` matching lines in one mail; `-n` first shows what
+that would send.
 
 A glob that matches nothing is nothing to do (a DEBUG line; the directory may
 not exist yet). A directory the glob needs to list but cannot is a failed item
@@ -641,12 +646,12 @@ default) its files fail at the open, one failed item each; where it does not
 mounts) the entries cannot be told apart and the line is `cannot examine 2 of
 the 2 entries of /var/log/hosts (Permission denied); is the directory
 searchable?`, once per directory, counting the entries the pattern names.
-Where the line is the directory's the glob was not looked into, so its
-record's moment stays where it was; where its files failed one by one the
-glob was listed and the moment moves on as after any run, so a host directory
-that appeared during the outage and wrote nothing since is first-sighted at
-its end once the mode is fixed (with a wildcard last component, `hosts/*/*`,
-the refusal is each subdirectory's `cannot list` and the moment stays).
+Either way a host directory that appeared during the outage is read whole
+once the mode is fixed: where the line is the directory's the glob was not
+looked into and its record's moment stays where it was, and where its files
+failed one by one at the open the new host's file has no position yet and the
+moment waits for it (with a wildcard last component, `hosts/*/*`, the refusal
+is each subdirectory's `cannot list`).
 
 ## Running it
 
@@ -885,7 +890,7 @@ configured destination still gets INFO and above.
 | The same lines arrive twice | A delivery whose state could not be saved afterwards (`state not saved` in the log) -- the mail went out, then the next run that could save re-sent it, once | Make the state directory the running user's -- owned by it, and so writable (`state directory ... is not writable`). The run refuses to send when it cannot save: a directory it cannot write, and a full disk or quota, are refused before any mail (the rows below), and a run that sent and could not save marks the `lock` file so the next run refuses too, until the room is proven |
 | `state file ...: cannot write (No space left on device) -- nothing was sent, because a run that cannot save its position would send everything again next time` (exit 1; `Disk quota exceeded` for a quota), or `state directory: No space left on device (.../lock)` on a first run or after the `lock` file was removed | The filesystem holding the state directory is full (or the user's quota is). A run that sent and then could not save would re-send the same lines (once, with the row below's mark; every run before it) -- the other same-message shape, beside a relay's refusal above, by a different mechanism -- so nothing is sent | Free space (or raise the quota); the run resumes where it was, the positions as last saved |
 | `state file ...: cannot write (No space left on device) -- the last run sent mail it could not record; nothing is sent until the state can be saved` (exit 1), every run; `cat` of the `lock` file shows `unsaved <bytes>` after the holder's PID and start time | The disk had room for the positions as they were but not for what a run added (`state not saved` after a delivery in that run's log): the run marked the lock, and every run since finds too little room to save a state of that size plus a block | Free space (or raise the quota); the next run proves the room, re-sends what the marked run sent -- once per proven room -- and clears the mark. `--reset-state` with no path clears it with the positions |
-| `[section] /var/log/x.log: Permission denied` (exit 1) | The running user cannot read that file; the other files of the section were processed | Grant read access (a group, ACLs) or run as a user that has it |
+| `[section] /var/log/x.log: Permission denied` (exit 1) | The running user cannot read that file; the other files of the section were processed. A glob's new file with no position yet stays new while it cannot be opened (the glob's moment waits for it) and is read whole once it can be | Grant read access (a group, ACLs) or run as a user that has it |
 | `state file ... belongs to <user>; a run as root would leave it root-owned ...` -- or, before the first run, `state directory ... belongs to <user>; ...` (exit 1) | A root run against a cron user's state | Run as that user: `sudo -u <user> logalert ...` |
 | `stale lock: another run (PID N) has held the lock ... for Ns` (exit 1, under cron) | A run still alive and holding the lock for longer than `lock_stale` -- a stuck run, or one that genuinely takes that long. Not a leftover file: the lock is an OS lock, released the moment its holder exits or is killed; the last holder's line stays in the `lock` file by design and turns nobody away | Look at PID N (`ps -o pid,etime,cmd -p N`; `cat` the `lock` file beside the state file shows the holder's PID and start time, and `unsaved <bytes>` after a run that sent mail it could not record) and end it if it is stuck -- the lock is released with it; raise `lock_stale` if runs really take that long. If `ps` shows PID N is not logalert, the PID was reused: `fuser <lock>` as root names the holder. Do not remove the `lock` file while a run is alive: the next run would lock a fresh file and overlap it |
 | `stale lock: the recorded holder PID N is gone; another process holds the lock ... (fuser ... names it)` (exit 1, under cron) | The last run that wrote the file has exited (or PID N now belongs to another user's process, which cannot hold a `0600` lock), and something else holds the lock: a run stalled between taking the lock and writing its line, or another process that opened the file and locked it | `fuser <lock>` (or `lsof <lock>`), run as root -- as the running user it cannot see another user's process -- names the holder; end it if it should not be there. The lock is `0600` (one left `0644` by an earlier version is tightened by the next run that takes it), so only the running user and root can open it |

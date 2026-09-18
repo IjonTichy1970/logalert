@@ -52,10 +52,12 @@ Rules (decided in issue #7, pinned by tests/test_state.py):
     the last SUCCESSFUL run that looked into that glob: what the run's new-file rule
     compares a first sight against. A glob's moment moves when the section's cursors move
     and the glob's directories were listed without error -- never when its delivery
-    failed, and never for a glob whose directory was away or unlistable that run, so a
-    file created during the outage is still newer than the moment when the directory is
-    back; a glob never looked into has none. ``forget`` drops a section's record with its
-    cursors so ``--reset-state``'s promise (the next run starts at the end, or the
+    failed, never for a glob whose directory was away or unlistable that run, and never
+    for a glob whose file with no entry could not be opened (issue #69; a glob with no
+    moment yet takes the run's, the rule is ``run``'s), so a file created during the
+    outage is still newer than the moment when the directory, or the file, is back; a
+    glob never looked into has none. ``forget`` drops a section's record
+    with its cursors so ``--reset-state``'s promise (the next run starts at the end, or the
     beginning per ``start``) stays true; a record whose section left the configuration
     expires after ``state_ttl`` days, a configured section's never (its next saved run
     refreshes it). A file without ``runs`` is from before #18 and reads as if no section

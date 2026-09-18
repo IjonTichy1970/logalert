@@ -34,13 +34,12 @@ Expected announced skips on the Windows host: `pytest` only (the POSIX-only
 tests -- file modes, a FIFO, symlinks, the real-`logrotate` module, the
 POSIX-only lock probe, a rename under an open handle, a signal delivered to a
 handler, the faked uids of the root-owner pin -- all but the lock probe saying
-"runs in the sandbox and on CI"; 70 as of #41); `changelog refs` skipped ("no
+"runs in the sandbox and on CI"; 71 as of #69); `changelog refs` skipped ("no
 release commit yet") only until 0.1.0 was cut. In the root sandbox the
 non-root tests skip instead, saying "expected in the root sandbox; CI runs it"
-(11 as of #64), plus one Windows-only
-test ("the read-only attribute is a Windows shape"); as `nobody` the one
-root-only test skips ("needs root to plant another user's link"), and the Linux
-stage carries that scenario on CI.
+(12 as of #69), plus one Windows-only test ("the read-only attribute is a
+Windows shape"); as `nobody` the one root-only test skips ("needs root to
+plant another user's link"), and the Linux stage carries that scenario on CI.
 Any other announced skip is worth reading. mypy on this host is the
 pure-Python build (`pip install --no-binary mypy mypy`): the compiled wheel's
 DLL is blocked by an Application Control policy. **mypy here checks nothing

@@ -45,9 +45,16 @@ line and dispatches here. The rules (decided in issue #12; the seams are #7's st
     the end, a section whose delivery failed keeps its moment (the new file it read keeps
     an entry at the beginning, issue #31, and a file it did not reach is still new next
     run), and a glob whose directory was away or unlistable keeps its moment, so a file
-    created during the outage is read whole once the directory is back. A listed path is
-    never new, wherever a glob also matches it: its first sight is #7's, unchanged; a
-    path is one path however it is spelled (``normcase``, ``normpath``).
+    created during the outage is read whole once the directory is back -- as does a glob
+    whose file WITHOUT an entry could not be opened this run (issue #69: a permission is
+    an outage too; the record moving past the file first-sighted it at its end once it
+    opened, its content before the fix never mailed). A glob with no moment yet takes
+    this run's all the same: an unread file older than this run is a plain first sight
+    either way, one written after it is new by the rule when it opens, and a glob left
+    without a moment would have the rule OFF for every file it matches while one of them
+    will not open. A listed path is never new, wherever a glob also matches it: its first
+    sight is #7's, unchanged; a path is one path however it is spelled (``normcase``,
+    ``normpath``).
   * A file's scan is bounded by ``scan_timeout`` seconds on POSIX (issue #28: ``SIGALRM``
     reaches into a regex that backtracks without bound, measured; a thread cannot, and
     Windows has no interval timer): past it the file is a failed item naming the line and
@@ -381,6 +388,12 @@ def _section(watch: Watch, config: Config, options: Options, sender: str, state:
                                  from_start=from_start)
         except OSError as exc:
             outcome.fail(f"[{watch.name}] {path}: {_reason(exc, path)}")
+            if saved is None:
+                # a glob's file that could not be OPENED has no entry to keep its place
+                # (issue #69): its globs' moments stay where they were, so it is still new
+                # when it can be read; a glob without a moment yet takes this run's (see
+                # the module docstring)
+                seen.difference_update(g for g in globs if state.last_run(watch.name, g))
             continue
         if source is None:
             continue  # absent this run; the cursor and its last_seen stay

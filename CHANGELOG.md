@@ -265,6 +265,13 @@ its notes.
   can avoid. The native path also finds `runuser` and `logrotate` under a PATH
   without `/usr/sbin`, and the header is this stage's, not the template's.
 
+- `[contract]` **A glob's new file that could not be opened this run keeps the
+  glob's moment, so it is read whole once it can be** (#69). The record moved
+  past a file a permission kept shut, and the next run first-sighted it at its
+  end -- everything written before the fix never mailed. The outage rule now
+  covers a permission; a glob with no moment yet takes the run's all the same,
+  so one file that never opens cannot switch the new-file rule off.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty
