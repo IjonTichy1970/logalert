@@ -295,7 +295,8 @@ def run(config: Config, options: Options) -> int:
         except StateError as exc:
             outcome.fail(f"state directory: {exc}")
             return _finish(outcome)
-        lock = RunLock(lock_path(state_file), config.settings.lock_stale)
+        lock = RunLock(lock_path(state_file), config.settings.lock_stale,
+                       key=os.path.basename(state_file))  # the marker's key (issue #73)
         try:
             lock.acquire()
         except LockBusy as busy:

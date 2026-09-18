@@ -188,7 +188,7 @@ its notes.
   reaches that size plus a block proves the room** (#70). The #30 refusal left
   a band -- room for the positions as they were, none for what a run adds --
   where the same lines went out on every run; now they go out once more, when
-  the room is back. `cat` of the lock shows `unsaved <bytes>`.
+  the room is back. `cat` of the lock shows `unsaved <bytes> <state file>`.
 
 - `[contract]` **A file truncated and refilled past the saved position with
   the same first line is caught as a truncation, not read on from the stale
@@ -285,6 +285,13 @@ its notes.
   sdist's members were 0666 and root's `tar xzf` left a world-writable tree
   (35 of 36 entries, measured); `release.yml` builds, runs
   `tools/check_artifacts.py` and attaches the pair to the release.
+
+- `[contract]` **The full-disk marker in the lock file is keyed to the state
+  file: `unsaved <bytes> <state file>`, one per configuration sharing the
+  directory** (#73). The lock is the directory's, so configuration B's run
+  read A's marker as its own: refused with A's message, proved the room
+  against A's size and cleared A's marker. Each run now honours, sets and
+  clears only its own and carries the others along; `--reset-state` likewise.
 
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 

@@ -211,7 +211,7 @@ def test_a_stale_lock_is_exit_1_a_fresh_holder_exit_0_and_quiet(
         site: Site, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="logalert.run")
     site.prime()
-    lock = RunLock(str(site.state_dir / "lock"), 3600)
+    lock = RunLock(str(site.state_dir / "lock"), 3600, key="state.json")
     lock.acquire()
     try:
         assert site.run() == 0
@@ -219,7 +219,7 @@ def test_a_stale_lock_is_exit_1_a_fresh_holder_exit_0_and_quiet(
         assert any("this run exits quietly" in m for m in caplog.messages)
     finally:
         lock.release()
-    stale = RunLock(str(site.state_dir / "lock"), 3600)
+    stale = RunLock(str(site.state_dir / "lock"), 3600, key="state.json")
     stale.acquire(now=time.time() - 7200)
     try:
         assert site.run() == 1
@@ -527,7 +527,7 @@ def test_the_log_frames_every_exit_including_a_configuration_error_and_a_fresh_h
     site.write_config()
     site.prime()
     caplog.clear()
-    holder = RunLock(str(site.state_dir / "lock"), 3600)
+    holder = RunLock(str(site.state_dir / "lock"), 3600, key="state.json")
     holder.acquire()
     try:
         assert site.run() == 0
@@ -600,7 +600,7 @@ def test_an_interrupt_is_one_line_and_exit_130_with_the_lock_released(
     monkeypatch.setattr(logalert.run, "deliver", interrupt)
     assert site.run() == 130
     assert capsys.readouterr().err == "logalert: interrupted" + NL
-    probe = RunLock(str(site.state_dir / "lock"), 3600)
+    probe = RunLock(str(site.state_dir / "lock"), 3600, key="state.json")
     probe.acquire()  # LockBusy here would mean the interrupted run kept it
     probe.release()
     # the one record a signalled run leaves (issue #33), and no end line after it
@@ -710,7 +710,7 @@ def test_a_configuration_error_is_exit_2_before_the_lock_even_under_a_holder(
     with the loader's line even while another run holds the lock, and must create no lock
     file -- nothing ran."""
     site.write_config(sendmail=(site.root / "none").as_posix())
-    holder = RunLock(str(site.state_dir / "lock"), 3600)
+    holder = RunLock(str(site.state_dir / "lock"), 3600, key="state.json")
     holder.acquire()
     try:
         assert site.run() == 2
@@ -741,7 +741,7 @@ def test_the_lock_is_released_after_an_exception_mid_run_and_after_an_early_exit
     monkeypatch.setattr(logalert.run, "open_source", boom)
     with pytest.raises(RuntimeError):
         site.run()
-    probe = RunLock(lock_file, 3600)
+    probe = RunLock(lock_file, 3600, key="state.json")
     probe.acquire()  # LockBusy here means the run left the lock behind
     probe.release()
     monkeypatch.setattr(logalert.run, "open_source", real_open)
@@ -931,7 +931,7 @@ def test_state_file_override_moves_the_lock_and_the_directory_check(
     assert site.run("--state-file", target) == 0
     assert capsys.readouterr() == ("", "")
     assert (other / "lock").exists() and not site.state_dir.exists()
-    holder = RunLock(str(other / "lock"), 3600)
+    holder = RunLock(str(other / "lock"), 3600, key="state.json")
     holder.acquire()
     try:
         site.append(site.router, "disk failure now")
@@ -1123,7 +1123,7 @@ def test_a_sigterm_during_the_delivery_is_one_line_exit_143_the_lock_free_and_on
     previous = signal.getsignal(signal.SIGTERM)
     assert site.run() == 143
     assert capsys.readouterr() == ("", "logalert: terminated" + NL)
-    probe = RunLock(str(site.state_dir / "lock"), 3600)
+    probe = RunLock(str(site.state_dir / "lock"), 3600, key="state.json")
     probe.acquire()  # LockBusy here would mean the terminated run kept it
     probe.release()
     records = _records_of_the_last_run(site)
@@ -1267,7 +1267,7 @@ def test_reset_state_and_test_mail_are_under_the_handler_too(
     assert capsys.readouterr().err == "logalert: terminated" + NL
     assert sorted(p.name for p in site.state_dir.iterdir()) == ["lock", "state.json"]
     assert site.state_file.read_bytes() == before
-    probe = RunLock(str(site.state_dir / "lock"), 3600)
+    probe = RunLock(str(site.state_dir / "lock"), 3600, key="state.json")
     probe.acquire()
     probe.release()
     monkeypatch.setattr(logalert.__main__, "deliver", _sigterm_self)
@@ -1682,7 +1682,7 @@ def test_a_delivered_section_whose_save_failed_marks_the_lock_and_the_next_run_r
                           "disk full; [firewall] state not saved: disk full; see the log")
     assert len(site.calls()) == 1  # the mail went out
     marked = _lock_line(site)
-    assert marked.endswith(f" unsaved {saves.sizes[1]}\n")  # the size the router section needed
+    assert marked.endswith(f" unsaved {saves.sizes[1]} state.json\n")  # the router section's size
     # run 2: the proving save is refused; nothing is sent, the marker stands
     assert site.run() == 1
     assert capsys.readouterr().err == (
@@ -1690,7 +1690,7 @@ def test_a_delivered_section_whose_save_failed_marks_the_lock_and_the_next_run_r
         "nothing is sent until the state can be saved; see the log" + NL)
     assert len(site.calls()) == 1
     assert saves.reaches[-1] == saves.sizes[1] + STATE_HEADROOM  # what did not fit, plus a block
-    assert _lock_line(site).endswith(f" unsaved {saves.sizes[1]}\n")
+    assert _lock_line(site).endswith(f" unsaved {saves.sizes[1]} state.json\n")
     assert saves.calls == 4  # nothing was read: the run stopped at the opening
     # run 3: the room is back; the proof passes, the lines go out once more, the marker goes
     saves.room = None
@@ -1859,3 +1859,57 @@ def test_a_dry_run_prints_a_subject_the_console_cannot_encode(site: Site) -> Non
     assert result.returncode == 0, result.stderr
     escaped = b"Subject: Platte " + chr(0x5C).encode() + b"u2014 defekt -- 1 match(es)"
     assert escaped in result.stdout
+
+
+def test_two_configurations_sharing_a_state_directory_keep_their_own_markers(
+        site: Site, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Issue #73: the lock is the directory's, so configuration B's run read A's marker as
+    its own -- refused with A's message, proved the room against A's size and cleared A's
+    marker, so A's next run sent its duplicate without a proof. Keyed to the state file:
+    B sends normally and carries A's marker along; A's next run refuses; A's proof clears
+    only A's. MUTANT: the key ignored -> B's run refuses with A's message."""
+    other = site.root / "other.conf"
+    other.write_text(site.conf.read_text(encoding="utf-8").replace("state.json", "other.json"),
+                     encoding="utf-8", newline=NL)
+    site.prime()
+    run_b = logalert.__main__.main
+    assert run_b(["-f", str(other)]) == 0 and site.calls() == []  # B's first sight, beside A's
+    site.append(site.router, "disk failure now" + " x" * 50)
+    saves = _Saves(monkeypatch, lambda n: False)
+    room = len(site.state_file.read_text(encoding="utf-8"))
+    saves.room = room
+    assert site.run() == 1  # A: the mail went out, the save was refused, the marker set
+    assert len(site.calls()) == 1 and "state not saved" in capsys.readouterr().err
+    assert _lock_line(site).endswith(f" unsaved {saves.sizes[1]} state.json\n")
+    marker = saves.sizes[1]
+    saves.room = None  # the room is back for B's run
+    assert run_b(["-f", str(other)]) == 0  # B: sends its own mail, refuses nothing
+    assert len(site.calls()) == 2 and capsys.readouterr().err == ""
+    line = _lock_line(site)
+    assert f" unsaved {marker} state.json" in line and "other.json" not in line  # A's kept
+    saves.room = room  # gone again for A's proof
+    assert site.run() == 1
+    assert capsys.readouterr().err == (
+        "logalert: failed: state file: disk full -- the last run sent mail it could not record; "
+        "nothing is sent until the state can be saved; see the log" + NL)
+    assert len(site.calls()) == 2
+    # B out of room too: its own mail out, its own marker beside A's (B's state grew by a
+    # line as well); the line carries both, each with its own size
+    site.append(site.firewall, "DENY 192.0.2.73" + " y" * 50)
+    saves.room = len((site.state_dir / "other.json").read_text(encoding="utf-8"))
+    assert run_b(["-f", str(other)]) == 1 and len(site.calls()) == 3
+    assert "state not saved" in capsys.readouterr().err
+    line = _lock_line(site)
+    assert f" unsaved {marker} state.json" in line and " other.json" in line
+    saves.room = None
+    # A's proof passes: the router lines once more, the firewall line (new to A) once,
+    # A's marker gone, B's kept
+    assert site.run() == 0
+    line = _lock_line(site)
+    assert len(site.calls()) == 5 and "state.json" not in line and " other.json" in line
+    saves.room = room  # B's proof, against B's own size, refused
+    assert run_b(["-f", str(other)]) == 1 and len(site.calls()) == 5
+    assert "the last run sent mail it could not record" in capsys.readouterr().err
+    saves.room = None
+    assert run_b(["-f", str(other)]) == 0 and len(site.calls()) == 6  # B re-sends once
+    assert " unsaved" not in _lock_line(site)

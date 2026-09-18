@@ -135,7 +135,7 @@ def test_the_position_section_and_the_table_carry_the_full_disk_refusal() -> Non
     text = _text()
     section = text[text.index("## Position tracking"):text.index("## Globs")].replace(NL, " ")
     assert "saved once at the start of every run but a dry run" in section
-    assert "marks the `lock` file beside the state with `unsaved <bytes>`" in section  # #70
+    assert "marks the `lock` file beside the state with `unsaved <bytes> <state file>`" in section
     table = text[text.index("## Troubleshooting"):]
     rows = [r for r in table.splitlines() if "No space left on device" in r]
     assert len(rows) == 2  # the full disk (issue #30) and the band's marker (issue #70)

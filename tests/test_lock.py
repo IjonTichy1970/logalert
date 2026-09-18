@@ -4,6 +4,7 @@ The overlap tests spawn tests/lock_holder.py as a second process, so the lock is
 across processes on the gate (msvcrt.locking on Windows, fcntl.flock in the sandbox and CI).
 """
 
+import logging
 import os
 import subprocess
 import sys
@@ -53,7 +54,7 @@ def try_holder(path: Path, stale_after: int = 3600) -> tuple[int, list[str]]:
 
 def test_acquire_writes_pid_and_start_time_and_releases(tmp_path: Path) -> None:
     path = tmp_path / "lock"
-    lock = RunLock(str(path), 3600)
+    lock = RunLock(str(path), 3600, key="state.json")
     lock.acquire(now=1_700_000_000.0)
     assert lock.fd is not None and not os.get_inheritable(lock.fd)  # never passed to children
     assert path.read_bytes() == f"{os.getpid()} 1700000000\n".encode("ascii")  # no CRLF
@@ -61,14 +62,14 @@ def test_acquire_writes_pid_and_start_time_and_releases(tmp_path: Path) -> None:
     assert lock.fd is None
     assert path.read_bytes() == f"{os.getpid()} 1700000000\n".encode("ascii")  # kept: cat lock
     lock.release()  # idempotent
-    with RunLock(str(path), 3600):  # re-acquirable after release
+    with RunLock(str(path), 3600, key="state.json"):  # re-acquirable after release
         pass
 
 
 def test_second_acquire_in_the_same_process_is_refused(tmp_path: Path) -> None:
     path = tmp_path / "lock"
-    with RunLock(str(path), 3600):
-        second = RunLock(str(path), 3600)
+    with RunLock(str(path), 3600, key="state.json"):
+        second = RunLock(str(path), 3600, key="state.json")
         with pytest.raises(LockBusy) as exc:
             second.acquire()
         assert exc.value.pid == os.getpid() and exc.value.stale is False
@@ -80,19 +81,19 @@ def test_second_process_is_refused_and_told_who_holds_it(tmp_path: Path) -> None
     with holder(path) as pid:
         assert pid != os.getpid()
         with pytest.raises(LockBusy) as exc:
-            RunLock(str(path), 3600).acquire()
+            RunLock(str(path), 3600, key="state.json").acquire()
         busy = exc.value
         assert busy.pid == pid and busy.stale is False
         assert busy.age is not None and 0 <= busy.age < 60
         assert str(busy) == f"another run (PID {pid}) has held the lock {path} for {busy.age:.0f}s"
     # the holder is gone: the lock is free again
-    with RunLock(str(path), 3600):
+    with RunLock(str(path), 3600, key="state.json"):
         pass
 
 
 def test_our_hold_refuses_a_second_process(tmp_path: Path) -> None:
     path = tmp_path / "lock"
-    with RunLock(str(path), 3600):
+    with RunLock(str(path), 3600, key="state.json"):
         code, words = try_holder(path)
         assert code == 3 and words[0] == "busy", words
         assert int(words[1]) == os.getpid() and words[3] == "False"
@@ -103,12 +104,12 @@ def test_stale_holder_is_reported_as_such(tmp_path: Path) -> None:
     two_hours_ago = time.time() - 7200
     with holder(path, stale_after=3600, started=two_hours_ago) as pid:
         with pytest.raises(LockBusy) as exc:
-            RunLock(str(path), 3600).acquire()
+            RunLock(str(path), 3600, key="state.json").acquire()
         assert exc.value.pid == pid and exc.value.stale is True
         assert exc.value.age is not None and 7100 < exc.value.age < 7300
         # the same holder is not stale under a longer threshold
         with pytest.raises(LockBusy) as exc2:
-            RunLock(str(path), 8000).acquire()
+            RunLock(str(path), 8000, key="state.json").acquire()
         assert exc2.value.stale is False
 
 
@@ -116,10 +117,10 @@ def test_unreadable_holder_info_is_still_busy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "lock"
-    with RunLock(str(path), 3600):
+    with RunLock(str(path), 3600, key="state.json"):
         monkeypatch.setattr("logalert.lock._read_holder", lambda fd: (None, None))
         with pytest.raises(LockBusy) as exc:
-            RunLock(str(path), 3600).acquire()
+            RunLock(str(path), 3600, key="state.json").acquire()
         assert exc.value.pid is None and exc.value.age is None and exc.value.stale is False
         assert str(exc.value).startswith("another run (an unknown process) has held the lock")
 
@@ -137,7 +138,7 @@ def test_a_holder_exactly_lock_stale_old_is_not_stale() -> None:
 
 def test_other_open_errors_propagate(tmp_path: Path) -> None:
     with pytest.raises(OSError):
-        RunLock(str(tmp_path / "nope" / "lock"), 3600).acquire()
+        RunLock(str(tmp_path / "nope" / "lock"), 3600, key="state.json").acquire()
 
 
 # -- the review's pins --------------------------------------------------------------------------
@@ -145,12 +146,12 @@ def test_other_open_errors_propagate(tmp_path: Path) -> None:
 
 def test_refused_acquire_returns_at_once_and_leaks_no_descriptor(tmp_path: Path) -> None:
     path = tmp_path / "lock"
-    with RunLock(str(path), 3600):
+    with RunLock(str(path), 3600, key="state.json"):
         probe = os.open(os.devnull, os.O_RDONLY)
         os.close(probe)
         started = time.monotonic()
         with pytest.raises(LockBusy):
-            RunLock(str(path), 3600).acquire()
+            RunLock(str(path), 3600, key="state.json").acquire()
         assert time.monotonic() - started < 1.0  # LK_NBLCK / LOCK_NB, not the blocking form
         again = os.open(os.devnull, os.O_RDONLY)
         os.close(again)
@@ -159,11 +160,11 @@ def test_refused_acquire_returns_at_once_and_leaks_no_descriptor(tmp_path: Path)
 
 def test_garbage_holder_info_is_busy_with_an_unknown_holder(tmp_path: Path) -> None:
     path = tmp_path / "lock"
-    with RunLock(str(path), 3600):
+    with RunLock(str(path), 3600, key="state.json"):
         for garbage in ("", "garbage", "4242", "x y", "4242 -inf", "4242 nan"):
             path.write_text(garbage, encoding="ascii")  # the info bytes are not locked
             with pytest.raises(LockBusy) as exc:
-                RunLock(str(path), 3600).acquire()
+                RunLock(str(path), 3600, key="state.json").acquire()
             assert exc.value.pid is None and exc.value.age is None
             assert exc.value.stale is False, garbage
 
@@ -180,12 +181,12 @@ def test_info_write_failure_releases_the_lock(
         real(fd, info)  # the release's emptying still works
 
     monkeypatch.setattr("logalert.lock._write_holder", disk_full)
-    lock = RunLock(str(path), 3600)
+    lock = RunLock(str(path), 3600, key="state.json")
     with pytest.raises(OSError, match="No space left"):
         lock.acquire()
     assert lock.fd is None
     monkeypatch.undo()
-    with RunLock(str(path), 3600):  # not stuck held by the failed attempt
+    with RunLock(str(path), 3600, key="state.json"):  # not stuck held by the failed attempt
         pass
 
 
@@ -203,18 +204,18 @@ def test_stale_verdict_is_confirmed_by_a_second_read(
         path.write_text(f"{os.getpid()} {time.time():.0f}" + chr(10), encoding="ascii")
 
     monkeypatch.setattr("logalert.lock.time.sleep", holder_writes_during_the_nap)
-    with RunLock(str(path), 3600):
+    with RunLock(str(path), 3600, key="state.json"):
         path.write_text(stale_line, encoding="ascii")
         with pytest.raises(LockBusy) as exc:
-            RunLock(str(path), 3600).acquire()
+            RunLock(str(path), 3600, key="state.json").acquire()
     assert naps == [0.2]
     assert exc.value.stale is False and exc.value.pid == os.getpid()
     # and a line that stays stale through the re-read is stale
     monkeypatch.setattr("logalert.lock.time.sleep", lambda seconds: naps.append(seconds))
-    with RunLock(str(path), 3600):
+    with RunLock(str(path), 3600, key="state.json"):
         path.write_text(stale_line, encoding="ascii")
         with pytest.raises(LockBusy) as exc:
-            RunLock(str(path), 3600).acquire()
+            RunLock(str(path), 3600, key="state.json").acquire()
     assert exc.value.stale is True and exc.value.pid == 4242 and len(naps) == 2
 
 
@@ -239,11 +240,11 @@ def test_the_lock_is_0600_and_an_older_0644_lock_is_tightened(
         pytest.skip("mode bits are fabricated on Windows; runs in the sandbox and on CI")
     path = tmp_path / "lock"
     monkeypatch.setattr(lock_module, "_tighten", lambda fd: None)
-    with RunLock(str(path), 3600):
+    with RunLock(str(path), 3600, key="state.json"):
         assert path.stat().st_mode & 0o777 == 0o600  # created so, not healed so
     monkeypatch.undo()
     path.chmod(0o644)
-    with RunLock(str(path), 3600):
+    with RunLock(str(path), 3600, key="state.json"):
         assert path.stat().st_mode & 0o777 == 0o600
     assert path.stat().st_mode & 0o777 == 0o600
 
@@ -307,23 +308,25 @@ def test_a_live_process_of_another_user_with_the_recorded_pid_is_not_the_holder(
 def test_the_unsaved_marker_is_written_in_place_carried_forward_and_cleared(
         tmp_path: Path) -> None:
     path = tmp_path / "lock"
-    lock = RunLock(str(path), 3600)
+    lock = RunLock(str(path), 3600, key="state.json")
     lock.acquire(now=1_700_000_000.0)
     assert lock.unsaved is None
     lock.mark_unsaved(6100)
     assert lock.unsaved == 6100
-    assert path.read_bytes() == f"{os.getpid()} 1700000000 unsaved 6100\n".encode("ascii")
+    assert path.read_bytes() == f"{os.getpid()} 1700000000 unsaved 6100 state.json\n".encode(
+        "ascii")
     lock.release()
     # the next holder reads it before writing its own line, and carries it forward
-    again = RunLock(str(path), 3600)
+    again = RunLock(str(path), 3600, key="state.json")
     again.acquire(now=1_700_000_010.0)
     assert again.unsaved == 6100
-    assert path.read_bytes() == f"{os.getpid()} 1700000010 unsaved 6100\n".encode("ascii")
+    assert path.read_bytes() == f"{os.getpid()} 1700000010 unsaved 6100 state.json\n".encode(
+        "ascii")
     again.clear_unsaved()
     assert again.unsaved is None
     assert path.read_bytes() == f"{os.getpid()} 1700000010\n".encode("ascii")
     again.release()
-    third = RunLock(str(path), 3600)
+    third = RunLock(str(path), 3600, key="state.json")
     third.acquire()
     assert third.unsaved is None
     third.release()
@@ -348,7 +351,7 @@ def test_the_holder_line_is_written_in_place_never_truncated_first(
     monkeypatch.setattr("logalert.lock.os.write", write)
     monkeypatch.setattr("logalert.lock.os.ftruncate", truncate)
     path = tmp_path / "lock"
-    lock = RunLock(str(path), 3600)
+    lock = RunLock(str(path), 3600, key="state.json")
     lock.acquire(now=1_700_000_000.0)
     lock.mark_unsaved(6100)
     lock.clear_unsaved()
@@ -362,13 +365,13 @@ def test_the_readers_parse_the_first_line_only(tmp_path: Path) -> None:
     """A kill between a write and its cut leaves the old tail after the new line: a
     cleared line with the old marker behind it is no marker."""
     path = tmp_path / "lock"
-    path.write_bytes(b"12345 1700000000\nunsaved 6100\n")
-    lock = RunLock(str(path), 3600)
+    path.write_bytes(b"12345 1700000000\nunsaved 6100 state.json\n")
+    lock = RunLock(str(path), 3600, key="state.json")
     lock.acquire()
     assert lock.unsaved is None
     lock.release()
-    path.write_bytes(b"12345 1700000000 unsaved 6100\n0\n")
-    lock = RunLock(str(path), 3600)
+    path.write_bytes(b"12345 1700000000 unsaved 6100 state.json\n0\n")
+    lock = RunLock(str(path), 3600, key="state.json")
     lock.acquire()
     assert lock.unsaved == 6100
     lock.release()
@@ -378,22 +381,25 @@ def test_a_shorter_marker_over_a_longer_line_leaves_no_tail(tmp_path: Path) -> N
     """The line is cut to the marker: a size with fewer digits than the last one leaves no
     digits of the old one behind."""
     path = tmp_path / "lock"
-    lock = RunLock(str(path), 3600)
+    lock = RunLock(str(path), 3600, key="state.json")
     lock.acquire(now=1_700_000_000.0)
     lock.mark_unsaved(1_000_000)
     lock.mark_unsaved(42)
-    assert path.read_bytes() == f"{os.getpid()} 1700000000 unsaved 42\n".encode("ascii")
+    assert path.read_bytes() == f"{os.getpid()} 1700000000 unsaved 42 state.json\n".encode("ascii")
     lock.release()
 
 
 @pytest.mark.parametrize("line", [b"12345 1700000000 unsaved\n", b"12345 1700000000 other 6\n",
-                                  b"12345 1700000000 unsaved x\n", b"12345 1700000000 unsaved -1\n",
-                                  b"12345 1700000000 unsaved 99999999999999\n",  # no state file
+                                  b"12345 1700000000 unsaved x state.json\n",
+                                  b"12345 1700000000 unsaved -1 state.json\n",
+                                  b"12345 1700000000 unsaved 99999999999999 state.json\n",
+                                  b"12345 1700000000 unsaved 6100\n",  # the unnamed form (#73)
+                                  b"12345 1700000000 unsaved 6100 other.json\n",  # not ours
                                   b"garbage\n", b""])
 def test_other_words_after_the_holder_are_no_marker(tmp_path: Path, line: bytes) -> None:
     path = tmp_path / "lock"
     path.write_bytes(line)
-    lock = RunLock(str(path), 3600)
+    lock = RunLock(str(path), 3600, key="state.json")
     lock.acquire()
     assert lock.unsaved is None
     lock.release()
@@ -402,7 +408,7 @@ def test_other_words_after_the_holder_are_no_marker(tmp_path: Path, line: bytes)
 def test_the_stale_check_reads_past_the_marker(tmp_path: Path) -> None:
     """The busy path parses the first two words as before, marker or not."""
     path = tmp_path / "lock"
-    lock = RunLock(str(path), 3600)
+    lock = RunLock(str(path), 3600, key="state.json")
     lock.acquire(now=time.time() - 7200)
     lock.mark_unsaved(6100)
     try:
@@ -413,7 +419,117 @@ def test_the_stale_check_reads_past_the_marker(tmp_path: Path) -> None:
 
 
 def test_marking_without_the_lock_is_a_no_op(tmp_path: Path) -> None:
-    lock = RunLock(str(tmp_path / "lock"), 3600)
+    lock = RunLock(str(tmp_path / "lock"), 3600, key="state.json")
     lock.mark_unsaved(1)
     lock.clear_unsaved()
     assert lock.unsaved is None and not (tmp_path / "lock").exists()
+
+
+# -- one marker per state file in a shared directory (issue #73) ---------------------------------
+
+
+def test_two_state_files_markers_are_carried_together_and_cleared_apart(tmp_path: Path) -> None:
+    """Configuration A marks; B's holder carries A's marker forward, sees none of its own,
+    marks its own beside it; A's holder clears only A's. MUTANT: every marker read as one's
+    own (the key ignored) -> B's `unsaved` is A's size; `clear_unsaved` dropping every
+    marker -> B's gone with A's."""
+    path = tmp_path / "lock"
+    a = RunLock(str(path), 3600, key="a.json")
+    a.acquire(now=1_700_000_000.0)
+    a.mark_unsaved(6100)
+    a.release()
+    b = RunLock(str(path), 3600, key="b.json")
+    b.acquire(now=1_700_000_010.0)
+    assert b.unsaved is None and b.markers == {"a.json": 6100}  # A's, carried, not B's
+    assert path.read_bytes() == f"{os.getpid()} 1700000010 unsaved 6100 a.json\n".encode("ascii")
+    b.mark_unsaved(70)
+    assert path.read_bytes() == (f"{os.getpid()} 1700000010 unsaved 6100 a.json unsaved 70 b.json\n"
+                                 .encode("ascii"))
+    b.release()
+    again = RunLock(str(path), 3600, key="a.json")
+    again.acquire(now=1_700_000_020.0)
+    assert again.unsaved == 6100 and again.markers == {"a.json": 6100, "b.json": 70}
+    again.clear_unsaved()
+    assert again.unsaved is None and again.markers == {"b.json": 70}
+    assert path.read_bytes() == f"{os.getpid()} 1700000020 unsaved 70 b.json\n".encode("ascii")
+    again.release()
+
+
+def test_a_state_file_name_with_a_space_or_a_non_ascii_letter_is_one_word(tmp_path: Path) -> None:
+    """The name is percent-quoted on the line, so the readers keep splitting on whitespace
+    and the line stays ASCII; the key comes back as it was."""
+    path = tmp_path / "lock"
+    name = "router state " + chr(0xE9) + ".json"  # a space and an e-acute, from the code point
+    lock = RunLock(str(path), 3600, key=name)
+    lock.acquire(now=1_700_000_000.0)
+    lock.mark_unsaved(9440)
+    line = path.read_bytes()
+    assert line == (f"{os.getpid()} 1700000000 unsaved 9440 router%20state%20%C3%A9.json\n"
+                    .encode("ascii"))
+    lock.release()
+    other = RunLock(str(path), 3600, key="plain.json")
+    other.acquire()
+    assert other.markers == {name: 9440} and other.unsaved is None
+    other.release()
+    same = RunLock(str(path), 3600, key=name)
+    same.acquire()
+    assert same.unsaved == 9440
+    same.release()
+
+
+def test_a_triplet_cut_short_ends_the_parse_and_keeps_the_ones_before_it(tmp_path: Path) -> None:
+    path = tmp_path / "lock"
+    path.write_bytes(b"12345 1700000000 unsaved 6100 a.json unsaved 70\n")
+    lock = RunLock(str(path), 3600, key="b.json")
+    lock.acquire()
+    assert lock.markers == {"a.json": 6100} and lock.unsaved is None
+    lock.release()
+    path.write_bytes(b"12345 1700000000 unsaved 6100 a.json other 70 b.json unsaved 5 c.json\n")
+    lock = RunLock(str(path), 3600, key="c.json")
+    lock.acquire()
+    assert lock.markers == {"a.json": 6100} and lock.unsaved is None  # the parse stopped at other
+    lock.release()
+
+
+def test_a_state_file_name_with_an_undecodable_byte_round_trips(tmp_path: Path) -> None:
+    """``--state-file`` on Linux decodes argv with surrogateescape, so a basename can carry a
+    lone surrogate; the name goes through the filesystem encoding, so the line is written
+    (the review's mutant: strict UTF-8 quoting raised past the run's marking) and the key
+    comes back as it was."""
+    path = tmp_path / "lock"
+    name = "st" + chr(0xDCFF) + ".json"  # a lone surrogate, from the code point
+    lock = RunLock(str(path), 3600, key=name)
+    lock.acquire(now=1_700_000_000.0)
+    lock.mark_unsaved(12)
+    line = path.read_bytes()
+    assert line.startswith(f"{os.getpid()} 1700000000 unsaved 12 st%".encode("ascii"))
+    assert line.endswith(b".json\n") and line.isascii()
+    lock.release()
+    again = RunLock(str(path), 3600, key=name)
+    again.acquire()
+    assert again.unsaved == 12
+    again.release()
+
+
+def test_a_line_cut_at_the_cap_loses_its_last_triplet_and_a_full_line_refuses_a_marker(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The readers take ``_INFO_CAP`` bytes: a name cut there would otherwise be carried
+    forever as a marker no key clears (review). And a holder whose line would pass the
+    cap records nothing and says so: this configuration's next run re-sends without a
+    proof, the others' markers stand."""
+    path = tmp_path / "lock"
+    names = [f"cfg{n:02d}-" + "x" * 50 for n in range(20)]  # 20 x 68 bytes: past the cap
+    line = "12345 1700000000" + "".join(f" unsaved {n + 1} {name}" for n, name in enumerate(names))
+    path.write_bytes((line + chr(10)).encode("ascii"))
+    mine = "mine-" + "y" * 80 + ".json"  # long enough to pass the cap with the kept ones
+    lock = RunLock(str(path), 3600, key=mine)
+    lock.acquire()
+    kept = lock.markers
+    assert 10 < len(kept) < 20 and all(name in names for name in kept)  # no phantom name
+    assert names[len(kept)] not in kept  # the triplet the cap cut is gone, whole
+    caplog.set_level(logging.ERROR, logger="logalert.lock")
+    lock.mark_unsaved(7)  # the line would pass the cap
+    assert lock.unsaved is None and mine not in path.read_bytes().decode("ascii")
+    assert path.read_bytes().count(b" unsaved ") == len(kept)  # the others written back
+    assert "the lock line is full" in caplog.text
+    lock.release()

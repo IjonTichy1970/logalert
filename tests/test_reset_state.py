@@ -65,7 +65,7 @@ def test_reset_everything(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     out = capsys.readouterr().out
     assert out.startswith("forgot 3 cursor(s) for every file;")
     assert load_state(str(state_file)).entries == {}
-    with RunLock(lock_path(str(state_file)), 3600):  # released after the reset
+    with RunLock(lock_path(str(state_file)), 3600, key="state.json"):  # released after the reset
         pass
     assert json.loads(state_file.read_text(encoding="utf-8")) == {
         "version": 1, "entries": {}, "runs": {},
@@ -125,7 +125,7 @@ def test_reset_is_refused_while_a_run_holds_the_lock(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     conf, state_file, _ = seeded(tmp_path)
-    with RunLock(lock_path(str(state_file)), 3600):
+    with RunLock(lock_path(str(state_file)), 3600, key="state.json"):
         assert main(["--reset-state", "-f", conf]) == 1
     err = capsys.readouterr().err
     assert err.startswith("logalert: another run (PID ") and err.endswith("; nothing was reset\n")
@@ -248,7 +248,7 @@ def test_reset_names_a_stale_holder(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     conf, state_file, _ = seeded(tmp_path)
-    lock = RunLock(lock_path(str(state_file)), 3600)
+    lock = RunLock(lock_path(str(state_file)), 3600, key="state.json")
     lock.acquire(now=time.time() - 7200)
     try:
         assert main(["--reset-state", "-f", conf]) == 1

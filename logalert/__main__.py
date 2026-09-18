@@ -275,7 +275,7 @@ def reset_state(config: Config, target: str, path: str) -> int:
         print(f"logalert: state file {path}: cannot stat ({exc.strerror}) -- are you the "
               f"user logalert runs as?", file=sys.stderr)
         return EXIT_ATTENTION
-    lock = RunLock(lock_path(path), settings.lock_stale)
+    lock = RunLock(lock_path(path), settings.lock_stale, key=os.path.basename(path))
     try:
         check_state_dir(path)
         lock.acquire()

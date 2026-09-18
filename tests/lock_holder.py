@@ -16,7 +16,7 @@ from logalert.lock import LockBusy, RunLock
 def main() -> int:
     path, stale_after = sys.argv[1], int(sys.argv[2])
     started = float(sys.argv[3]) if len(sys.argv) > 3 else None
-    lock = RunLock(path, stale_after)
+    lock = RunLock(path, stale_after, key="state.json")
     try:
         lock.acquire(now=started)
     except LockBusy as exc:
