@@ -39,7 +39,10 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     the anchor was compared: an older copy sharing a banner log's first line, longer than
     the position, was taken as a guess at every restart of a service whose start script
     truncates the log -- 166 old lines and a fragment mailed before the new file's. A
-    parked entry (below) records the anchor of the copy it stands in. The archives of this
+    parked entry (below) records the anchor of the copy it stands in -- which also settles
+    the live rule when a new live file gets the copy's freed inode (ext4) under the same
+    banner: TRUNCATED and the catch-up, where an entry without one read the new file on
+    from the parked offset (measured: a fragment, the rest lost). The archives of this
     log written AFTER the last run are ours or newer, and the oldest of them that fits is ours:
     that is tried first -- unless the cursor is PARKED on a rotated copy (a stop, a consumer
     that stopped mid-chain, an absent live file): such a cursor carries the copy's mtime

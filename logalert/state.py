@@ -107,7 +107,8 @@ class Cursor:
     #                             not opened again
     anchor: str | None = None  # sha256 of the (at most 4 KiB of) bytes before offset, as
     #                            read (issue #34); None from 0.1.0, on a compressed file
-    #                            and on a parked copy
+    #                            and on a parked copy from before #74 (since then the
+    #                            copy's bytes, as read)
 
 
 RunRecord = dict[str, str]  # glob, as written in ``files`` -> ISO 8601 UTC seconds, the run START

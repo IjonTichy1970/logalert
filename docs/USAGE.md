@@ -442,7 +442,8 @@ however many rotations happened in between. It recognises, beside the log or in
   out, with a log line -- so a numbered live sibling such as `worker.1.log`
   beside `worker.log` is never chained as a copy (whether it holds the saved
   position is the content check's decision, as for any candidate: a sibling
-  that shares the log's first line can be mistaken for the copy).
+  that shares the log's first line can be mistaken for the copy by an entry
+  without an anchor, from 0.1.0).
 
 Symbolic links are never candidates. A `.gz` still being written yields what it
 has, with a warning, and the run continues.

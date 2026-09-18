@@ -3330,3 +3330,35 @@ def test_the_saved_inode_with_other_bytes_before_the_position_is_not_the_file(
     assert source.plan.match is None
     assert lines == ["BANNER"] + [f"new {k:03d}" for k in range(3)]
     assert not any(line.startswith("stale") for line in lines)
+
+
+def test_a_parked_entry_whose_copys_inode_the_new_live_file_reuses_is_not_read_on(
+        tmp_path: Path) -> None:
+    """The ext4-reuse twin of the module docstring, in its PARKED shape (the check after
+    #74 found it): the run parks on the copy; the next live file gets the copy's freed inode
+    (fabricated here, as the other reuse tests do) with the same banner and more bytes than
+    the parked offset. Without an anchor on the entry the live rule said `continue` and the
+    live file was read on from the parked offset -- a fragment, and the copy's rest and the
+    live file's head lost, silently. With the copy's anchor the live rule says `truncated`
+    and the catch-up resumes in the copy. MUTANT: the parked anchor dropped -> `continue`."""
+    path = tmp_path / "router.log"
+    saved = seen(path, b"BANNER" + NLB + OLD)
+    append(path, SINCE)
+    rotate(path, tmp_path / "router.log.1")  # nocreate: the live file is absent
+    source = open_source(SECTION, str(path), saved)
+    assert isinstance(source, CatchUpSource)
+    with source:
+        stream = source.lines()
+        assert next(stream).text == "since 1"
+        parked = source.cursor()
+    path.write_bytes(b"BANNER" + NLB + b"".join(b"live %d" % n + NLB for n in range(4)))
+    st = path.stat()
+    reused = replace(parked, ino=st.st_ino, dev=st.st_dev)  # the copy's inode, handed on
+    again, lines, cursor = run(path, reused)
+    assert isinstance(again, CatchUpSource) and again.verdict == "truncated"
+    assert again.plan.stage == "mtime"
+    assert lines == ["since 2", "BANNER"] + [f"live {n}" for n in range(4)]
+    assert cursor is not None and cursor.offset == path.stat().st_size
+    # the entry as 0.1.0 wrote it, or a parked entry from before #74: the old path, pinned
+    old, lines, _ = run(path, replace(reused, anchor=None))
+    assert not isinstance(old, CatchUpSource) and lines == ["", "live 3"]  # from offset 27

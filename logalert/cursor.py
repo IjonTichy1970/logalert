@@ -18,9 +18,10 @@ will actually read, and decides how the saved cursor applies:
     the refill's lines before it lost, silently (measured on both platforms). The cursor's
     ``anchor`` is the sha256 of the last ``ANCHOR_CAP`` bytes before the offset AS READ --
     the reader keeps them as it goes, so a refill landing after the read's last check is
-    not recorded as the file -- and a cursor without one (0.1.0's, a parked copy's) is
-    trusted once. What it cannot see: a refill whose last ``ANCHOR_CAP`` bytes before the
-    position are the ones read (a file of nothing but identical lines, aligned). The plan
+    not recorded as the file -- and a cursor without one (0.1.0's, a parked copy's from
+    before #74) is trusted once. What it cannot see: a refill whose last ``ANCHOR_CAP``
+    bytes before the position are the ones read (a file of nothing but identical lines,
+    aligned). The plan
     behind the verdict is the rotation module's, which compares the anchor too: a copy
     with other bytes before the position is never taken (issue #74).
   * inode differs -> ROTATED
