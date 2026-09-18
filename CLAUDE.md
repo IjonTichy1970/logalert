@@ -62,7 +62,11 @@ sandbox). Never run two gates against the sandbox at once.
   `.claude/skills/release/SKILL.md` (local, gitignored). Personal skills shadow
   project skills of the same name, so a bare `/release` resolves to the global
   skill, whose first step is to defer to that file. Invoking `/release` here is
-  the owner's approval for exactly the three mutations it lists.
+  the owner's approval for exactly the three mutations it lists. The tag push
+  starts `.github/workflows/release.yml`, which builds the sdist and the wheel
+  on Linux, refuses a bad pair (`tools/check_artifacts.py`: a world-writable
+  member, CRLF metadata, a missing file) and attaches them to the release
+  (#56); nothing is built on this host.
 - Never commit to `main` directly (the `/release` commit is the one exception).
   The commit subject ends in `(#N)`: the PR step gathers `Closes #N` from
   subjects only, and the `changelog refs` stage keys on the same convention;

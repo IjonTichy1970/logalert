@@ -279,6 +279,13 @@ its notes.
   last pair); `dirty` was set in seven places and read in none; `open_log_file`
   was a door around the rotation catch-up that only the tests used.
 
+- `[internal]` **The release artifacts are built on Linux at the tag, and a
+  check refuses a pair with a world-writable member, CRLF metadata or a
+  missing file before it is attached** (#56). Built on the Windows host, the
+  sdist's members were 0666 and root's `tar xzf` left a world-writable tree
+  (35 of 36 entries, measured); `release.yml` builds, runs
+  `tools/check_artifacts.py` and attaches the pair to the release.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

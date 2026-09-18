@@ -1,0 +1,51 @@
+name: Release artifacts
+
+# The sdist and the wheel are built HERE, on Linux, at the tag the release procedure pushes
+# (issue #56): built on the Windows dev host they carried 0666 members, 0777 directories and
+# CRLF metadata, and GNU tar as the superuser restores archive modes, so `sudo tar xzf` of
+# that sdist left a world-writable source tree (measured: 35 of 36 entries; 0 from a Linux
+# build). tools/check_artifacts.py refuses a bad pair before anything is attached; the pair
+# is then attached to the GitHub Release the procedure creates for the same tag -- the tag
+# push starts this build while the procedure writes the release notes, so the upload waits
+# for the release, bounded. The gate is not repeated here: the procedure ran it on the
+# tree it tagged, and ci.yml runs it again on the push to main.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install build
+      - run: rm -rf dist && python -m build
+      # 1 = a defect named per member, 2 = could not check; both fail the job, and nothing
+      # is attached.
+      - run: python tools/check_artifacts.py dist/*
+      - run: ls -l dist
+      # The release for this tag is the procedure's to create (its notes are the rolled
+      # changelog section); it follows the tag push by seconds, and this job waits up to
+      # five minutes for it before attaching the pair. --clobber: a re-run replaces, never
+      # duplicates.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 20); do
+            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+              exit 0
+            fi
+            echo "no release for $GITHUB_REF_NAME yet ($i/20); waiting 15 s"
+            sleep 15
+          done
+          echo "no release for $GITHUB_REF_NAME after five minutes; the artifacts were built and checked but not attached -- create the release and re-run this job"
+          exit 1
