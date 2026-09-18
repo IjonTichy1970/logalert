@@ -204,6 +204,11 @@ its notes.
   copies. Nine symlink tests now try the link instead of skipping on Windows
   outright, and no check-config test reaches `getfqdn()` by accident.
 
+- `[internal]` **A 3.14 build without `compression.zstd` fails the one `.zst`
+  read test instead of skipping it** (#42). The skip was announced only, and
+  the gate's verdict counts an announced skip as green by design; the read
+  path would have been measured nowhere. Below 3.14 nothing changes.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty

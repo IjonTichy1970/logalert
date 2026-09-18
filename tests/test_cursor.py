@@ -7,6 +7,7 @@ platforms (NTFS file ids are stable and non-zero). Non-ASCII bytes are spelled a
 import bz2
 import gzip
 import hashlib
+import importlib
 import io
 import logging
 import lzma
@@ -853,13 +854,21 @@ def test_compressed_stream_shorter_than_the_offset_is_truncation(
 
 
 def test_zst_needs_the_stdlib_module(tmp_path: Path) -> None:
+    """Below 3.14 the refusal; on 3.14+ the ONLY read of a .zst file in the suite -- so a
+    3.14 built without zstd is a failure here, never an announced skip the gate's verdict
+    counts as green (issue #42: could-not-check is never a pass)."""
     path = tmp_path / "router.log.zst"
     path.write_bytes(b"")
     if sys.version_info < (3, 14):
         with pytest.raises(OSError, match=r"\.zst needs Python 3\.14"):
             open_log(str(path))
     else:
-        zstd = pytest.importorskip("compression.zstd")
+        try:
+            zstd = importlib.import_module("compression.zstd")
+        except ImportError:
+            pytest.fail("compression.zstd is missing on this 3.14 build: the .zst read path "
+                        "would be measured nowhere (could-not-check is never a pass)",
+                        pytrace=False)
         path.write_bytes(zstd.compress(b"first\nsecond\n"))
         log, lines = scan(path, None, from_start=True)
         assert texts(lines) == ["first", "second"] and log.fingerprint == sha(b"first")
