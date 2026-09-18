@@ -230,6 +230,13 @@ its notes.
   are cron's. `NoNewPrivileges=` and its kin make a setgid `sendmail` keep the
   caller's group (measured); the Linux stage verifies the documented text.
 
+- `[internal]` **The PreToolUse guard is launched through `python`, then
+  `python3`, and refuses every Bash command when neither is on PATH; the gate
+  runs the command as spelled** (#55). On a stock Debian or Ubuntu the bare
+  `python` exited 127 and Claude Code let every command through, announced but
+  inert, with the guard's gate stage green. Three checks now run the string
+  itself: the venv off PATH, a `python3`-only PATH, an empty one.
+
 ## [0.1.0] — 2026-09-16 — the watcher, its mail and the guide to install it
 
 ### Nitty Gritty
