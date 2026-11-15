@@ -241,10 +241,10 @@ ever will not serve.
 
   | venv | interpreter | expected |
   | --- | --- | --- |
-  | `/srv/logalert-py311` | 3.11.18 | 1033 passed, 19 skipped |
-  | `/srv/logalert-py312` | 3.12.3 | 1033 passed, 19 skipped |
-  | `/srv/logalert-py313` | 3.13.18 | 1033 passed, 19 skipped |
-  | `/srv/logalert-py314` | 3.14.10 | 1038 passed, 14 skipped |
+  | `/srv/logalert-py311` | 3.11.18 | 1037 passed, 19 skipped |
+  | `/srv/logalert-py312` | 3.12.3 | 1037 passed, 19 skipped |
+  | `/srv/logalert-py313` | 3.13.18 | 1037 passed, 19 skipped |
+  | `/srv/logalert-py314` | 3.14.10 | 1042 passed, 14 skipped |
 
   3.14 is the only leg that READS a `.zst` (six tests, issue #83): those six
   skip below it, while the unsupported-`.zst` branch skips on 3.14 instead --

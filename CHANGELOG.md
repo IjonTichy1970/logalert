@@ -43,6 +43,13 @@ its notes.
   announce a skip below it. A cut `.zst` hands over less than the other three --
   nothing at all once the payload is compressed rather than stored, measured.
 
+- `[internal]` **The assertions that pinned `smtplib`'s own sentences now pin
+  ours instead -- the failure's type, and that a reason follows it** (#84). A
+  reword upstream would have reddened the gate on a run where logalert behaved
+  correctly; dropping the reason reddened nothing at all, which it now does. The
+  RFC 2231 filename boundary (48 characters, 7 of margin) and the chosen
+  encodings stay pinned, both measured identical on five interpreters.
+
 ## [0.1.1] — 2026-09-18 — the rotation catch-up corrected and the run hardened
 
 ### Nitty Gritty

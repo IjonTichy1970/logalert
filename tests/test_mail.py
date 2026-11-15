@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from logalert import __version__
+from logalert import mail as mail_module  # for `_NAME_CAP`, which a test lifts (issue #84)
 from logalert.__main__ import main
 from logalert.config import Config, Watch, load_config
 from logalert.cursor import Line, LogFile
@@ -326,6 +327,19 @@ def test_clean_text_and_clean_header() -> None:
 
 
 def test_a_line_over_78_chars_goes_quoted_printable_and_a_short_one_7bit(tmp_path: Path) -> None:
+    """`email.contentmanager`'s own heuristic, pinned deliberately: the encoding is what a
+    relay and a mail client see, so a change there is news rather than noise. Measured on
+    3.11.18, 3.12.3, 3.12.10, 3.13.18 and 3.14.10 and identical on all five -- 7bit for a
+    short ASCII body, quoted-printable for the 108-character report line below, and the
+    same pair on the ATTACHMENT part (issue #84, which asked whether to loosen this to
+    "some valid CTE": no, for that reason -- and review found the attachment part, just as
+    visible to a relay, pinned by nothing at all).
+
+    MUTANT: `POLICY`'s `max_line_length` raised from 78 to 998 -- the knob the heuristic
+    actually hangs on -- which reddens this and the round-trip test and nothing else. A
+    `cte="base64"` at either `set_content` or `add_attachment` reddens it too, but the
+    first drags 38 other tests with it, and base64 does decode back (measured), so the
+    issue's "encoded so it cannot be decoded back" names the wrong property."""
     config = make_config(tmp_path, "patterns =\n    disk\n")
     watch = config.watches[0]
     short = compose(watch, [scan(FILE, numbered(["disk"], FILE), watch, context=0, cap=1)],
@@ -336,6 +350,14 @@ def test_a_line_over_78_chars_goes_quoted_printable_and_a_short_one_7bit(tmp_pat
                    host="router1")
     assert long.message["Content-Transfer-Encoding"] == "quoted-printable"
     assert body_of(long.message).endswith("1: disk " + "x" * 100 + NL)
+    # the attachment part carries its own, and the top level is then a multipart with none
+    for body, encoding in (("disk", "7bit"), ("disk " + "x" * 100, "quoted-printable")):
+        attached = compose(watch, [scan(FILE, numbered([body], FILE), watch, context=0,
+                                        cap=1)], sender=SENDER, settings=config.settings,
+                           now=NOW, host="router1", attach=True)
+        (part,) = attached.message.iter_attachments()
+        assert part["Content-Transfer-Encoding"] == encoding, body
+        assert attached.message["Content-Transfer-Encoding"] is None, body
 
 
 def test_flatten_is_produced_once_per_transport_and_the_sizes_differ_by_the_lines(
@@ -558,13 +580,26 @@ def test_the_message_id_is_well_formed_and_equal_everywhere_whatever_the_sender(
 
 
 def test_the_attachment_name_never_starts_with_a_dash_or_dot_and_fits_one_line() -> None:
+    """The leading `-`/`.` cases were all SHORT and the cap case was clean, so the ORDER of
+    the two -- strip, then cap -- was pinned by nothing (issue #84, review). Capping first
+    makes two sections of 45 dots and ten characters collapse to the same `section-...txt`,
+    and the operator cannot tell which section a report came from; the loader accepts both
+    names, measured."""
     assert attachment_name("-rf", NOW) == f"rf-{STAMP}.txt"
     assert attachment_name("..", NOW) == f"section-{STAMP}.txt"
     assert attachment_name(".hidden", NOW) == f"hidden-{STAMP}.txt"
     assert attachment_name("s" * 60, NOW) == "s" * 40 + f"-{STAMP}.txt"
+    assert attachment_name("." * 45 + "x" * 10, NOW) == "x" * 10 + f"-{STAMP}.txt"
 
 
 def test_a_long_section_name_keeps_the_filename_on_one_line(tmp_path: Path) -> None:
+    """A deliberate tripwire on the `email` package's folding boundary, KEPT as one because
+    what it guards is operator-visible: an RFC 2231 `filename*0` continuation, which some
+    mail clients render badly. Measured on 3.11.18, 3.12.3, 3.12.10, 3.13.18 and 3.14.10 and
+    identical on all five -- a 48-character stem is the first that folds, so `_NAME_CAP`'s 40
+    has 7 characters of margin (issue #84; the margin is recorded beside the cap).
+
+    MUTANT: `_NAME_CAP` raised to 48 -> the continuation this refuses."""
     log = (tmp_path / "router.log").as_posix()
     text = (f"[{'s' * 60}]\nsubject = S\nto = noc@example.net\nfiles = {log}\n"
             "patterns = disk\nreport = attachment\n")
@@ -577,6 +612,39 @@ def test_a_long_section_name_keeps_the_filename_on_one_line(tmp_path: Path) -> N
     assert b"filename*0" not in mail.flatten("sendmail")  # no RFC 2231 continuation
     expected = f'filename="{"s" * 40}-{STAMP}.txt"'.encode()
     assert any(ln.strip() == expected for ln in wire_lines(mail, "sendmail"))  # one line
+
+
+def test_the_filename_fold_boundary_is_where_the_name_cap_was_measured_against(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boundary recorded beside `_NAME_CAP` -- 48, with 7 characters of margin -- was
+    documented and asserted by nothing: the test above only probes the SHIPPED cap of 40, so
+    an upstream change moving the boundary anywhere into 41..47 would leave that comment
+    false with the gate green (issue #84, review), which is the opposite of the "a change
+    upstream is news" a tripwire exists for. Now the boundary itself reddens.
+
+    `_NAME_CAP` truncates the stem, so it has to be lifted for the boundary to be reachable
+    at all. The sweep starts at the cap: below it the fold cannot happen, and review
+    measured the property monotonic over stems of 1 to 80."""
+    log = (tmp_path / "router.log").as_posix()
+
+    text = (f"[{'s' * 100}]\nsubject = S\nto = noc@example.net\nfiles = {log}\n"
+            "patterns = disk\nreport = attachment\n")
+    path = tmp_path / "logalert.conf"
+    path.write_text(text, encoding="utf-8", newline="\n")
+    config = load_config(str(path))
+    watch = config.watches[0]
+    report = scan(FILE, numbered(["disk"], FILE), watch, context=0, cap=1)
+
+    def folds(stem: int) -> bool:
+        monkeypatch.setattr(mail_module, "_NAME_CAP", stem)
+        built = compose(watch, [report], sender=SENDER, settings=config.settings, now=NOW)
+        return b"filename*0" in built.flatten("sendmail")
+
+    cap = mail_module._NAME_CAP
+    first = next(stem for stem in range(cap, 56) if folds(stem))
+    assert first == 48, first  # the number the comment beside the cap records
+    assert first - 1 - cap == 7  # and the margin it records with it
 
 
 def test_preview_is_the_decoded_message_for_a_dry_run(tmp_path: Path) -> None:

@@ -94,8 +94,18 @@ _REPLACEMENT = chr(0xFFFD)
 _CONTROLS = re.compile("[" + "".join(chr(c) for c in range(0x20) if c not in (9, 10))
                        + "".join(chr(c) for c in range(0x7F, 0xA0) if c != 0x85) + "]")
 _UNSAFE_IN_NAME = re.compile(r"[^A-Za-z0-9._-]+")
-_NAME_CAP = 40  # of the section's characters: the name must fit one Content-Disposition line
-#                 (measured: at 48 the stdlib folds it into RFC 2231 continuations)
+_NAME_CAP = 40  # of the section's characters: the name must fit one Content-Disposition line.
+#                 Measured on 3.11.18, 3.12.3, 3.12.10, 3.13.18 and 3.14.10, all identical: a
+#                 48-character stem is the first the `email` package folds into RFC 2231
+#                 continuations, so 47 is the longest that stays on one line -- 65 with the
+#                 stamp and the extension -- and 40 keeps 7 characters of margin (issue #84).
+#                 That issue says "a margin of 8" against "a boundary at 66": the same
+#                 measurement in the other unit -- 66 is the first whole FILENAME that
+#                 folds and 48 the first stem, so 8 is the distance TO the boundary and 7
+#                 is what can still be added. The boundary is that package's folding, not
+#                 ours, which is why both numbers are recorded here and both pinned by
+#                 tests: a continuation is operator-visible, some clients render one badly,
+#                 and a change upstream is news
 _INDENT = 12  # the summary's label column: "Message-ID: " is the widest label
 REPORT_CAP = 1024 * 1024  # bytes of report text per message (issue #25); see render()
 
