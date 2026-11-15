@@ -6,6 +6,7 @@ Windows, a shebang copy on POSIX -- for the end-to-end paths) and ``esmtp_stub.p
 127.0.0.1 port 0. Real on both platforms; the one POSIX-only test says so.
 """
 
+import gc
 import getpass
 import json
 import logging
@@ -570,6 +571,18 @@ def test_a_421_mid_rcpt_names_the_recipients_never_tried(tmp_path: Path) -> None
     assert server.data == []
 
 
+# The ONE warning this suite accepts (issue #81, which made every warning an error). The
+# unusable timeout below leaks a socket, and the leak is the stdlib's: socket.create_connection
+# makes the socket, settimeout raises OverflowError, and the cleanup there closes only on
+# OSError. No operator can reach it -- the loader caps mail_timeout at 3600 s, which the first
+# assertion pins -- and this test exists to prove the cap plus the message. Annotated here
+# rather than in pyproject.toml: an entry there would hide unclosed sockets in every test.
+# The pattern, not the bare category, so the comment above is machine-checked: nothing else
+# unclosed passes quietly. The socket is reachable only through the OverflowError's traceback,
+# so the gc.collect() at the end of the test keeps its collection INSIDE this annotation --
+# without it a future reference cycle would move the destructor to a later test, where the
+# warning becomes that test's error and names the wrong culprit (review).
+@pytest.mark.filterwarnings("ignore:unclosed <socket:ResourceWarning")
 def test_mail_timeout_is_capped_by_the_loader_and_an_unusable_one_is_named(
         tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="mail_timeout: must be at most 3600 seconds"):
@@ -581,6 +594,9 @@ def test_mail_timeout_is_capped_by_the_loader_and_an_unusable_one_is_named(
         with pytest.raises(DeliveryError, match="^mail_timeout 1e\\+300 s is not usable here: "):
             via_smtp(dotted_mail(), "127.0.0.1", server.port, starttls=False,
                      local_hostname="router1.example.net", timeout=1e300)
+    # the stdlib's unclosed socket is collected HERE, inside this test's ignore (see above);
+    # the same deterministic window test_rotation.py's handle-leak check uses
+    gc.collect()
 
 
 def test_exit_0_with_stderr_is_kept_in_the_answer_and_warned(

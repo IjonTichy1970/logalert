@@ -30,7 +30,12 @@ jobs:
           python-version: "3.12"
       - run: |
           python -m pip install --upgrade pip
-          pip install build
+          # From the extras, never `pip install build`: the artifacts a release attaches must
+          # be built by the pinned frontend, and `pyproject.toml` is the one place it lives
+          # (issue #81). The same spelling as every other install in this repo, which
+          # tests/test_install_doc.py pins across all of them; the tools it pulls in that this
+          # job does not run cost seconds.
+          pip install -e ".[dev,docs]"
       - run: rm -rf dist && python -m build
       # 1 = a defect named per member, 2 = could not check; both fail the job, and nothing
       # is attached.

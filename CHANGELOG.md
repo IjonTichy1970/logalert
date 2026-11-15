@@ -15,6 +15,13 @@ its notes.
   loader refused the literal. Labels never sent to the loader keep their
   literals.
 
+- `[internal]` **The tools the gate runs are pinned exactly, so a release of
+  one can no longer redden an unchanged tree** (#81). A `mypy` release is an
+  internal error on 3.14 where the pinned one passes, and `fail-fast` hid the
+  leg that would have shown it. Every warning is an error now, with an empty
+  ignore list. `CLAUDE.md` records the four native venvs, and each interpreter
+  gets its own `--basetemp`: pytest wipes a shared one at session start.
+
 ## [0.1.1] — 2026-09-18 — the rotation catch-up corrected and the run hardened
 
 ### Nitty Gritty

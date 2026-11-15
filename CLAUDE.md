@@ -40,9 +40,11 @@ non-root tests skip instead, saying "expected in the root sandbox; CI runs it"
 (12 as of #69), plus one Windows-only test ("the read-only attribute is a
 Windows shape"); as `nobody` the one root-only test skips ("needs root to
 plant another user's link"), and the Linux stage carries that scenario on CI.
-Any other announced skip is worth reading. mypy on this host is the
-pure-Python build (`pip install --no-binary mypy mypy`): the compiled wheel's
-DLL is blocked by an Application Control policy. **mypy here checks nothing
+Any other announced skip is worth reading. mypy on this host is the pure-Python
+build -- `pip install --no-binary mypy -e ".[dev,docs]"`, never `--no-binary
+mypy mypy`, which carries no version and so resolves straight past the pin
+(#81): the compiled wheel's DLL is blocked by an Application Control policy.
+**mypy here checks nothing
 under a `sys.platform != "win32"` branch** (it narrows the platform and skips
 the block): a `/ship` that touches one runs mypy natively in the sandbox first
 (`/srv/logalert-py312/bin/python -m mypy --strict logalert tools tests` over a
@@ -218,14 +220,42 @@ ever will not serve.
   `/mnt/d/...`, capture stdout, write from Windows. `pip install` from `/mnt/d`
   fails on the 9p mount -- copy to `/srv` first; files read over `/mnt` look
   `0777`, so copy into `mktemp -d` before asking about modes. Tests run natively
-  there with `/srv/logalert-py312/bin/python -m pytest -q -p no:cacheprovider
-  --basetemp=/tmp/logalert-pytest tests` (the checkout is read-only there);
-  `/srv/logalert-py311` is the same venv on the floor. Install the wheel built
-  from the tree into the venv first (`--no-index --find-links`): the tests
-  that spawn a second process (`lock_holder.py`, `-m logalert`, the console
-  script) import the INSTALLED package, not the tree.
-- Never run two gates against the sandbox at once. End the session with `wsl
-  --terminate rlyeh-sandbox`; it is the polite exit, not a repair.
+  there with `/srv/logalert-py3NN/bin/python -m pytest -q -p no:cacheprovider
+  --basetemp=/tmp/logalert-pytest-3NN tests` (the checkout is read-only there)
+  -- one `3NN` throughout, so the venv and its basetemp always read alike.
+  Install the wheel built from the tree into the venv first (`--no-index
+  --find-links`): the tests that spawn a second process (`lock_holder.py`, `-m
+  logalert`, the console script) import the INSTALLED package, not the tree.
+  **Have the run print `python -V` first:** nothing in a delegated run's output
+  names the interpreter, because the gate's `tools:` line never executes there
+  -- the Linux stage runs `tools/linux_stage.sh` alone.
+- **The four native venvs, one pinned tool set (issue #81).** Every leg of CI's
+  matrix has a venv here, and all four carry what `pyproject.toml`'s `dev` and
+  `docs` extras pin, which is the only home those numbers have -- never a copy
+  of them in this file. (`ruff` runs on this host and on CI, not there.) Check a
+  venv against the extras with `pip list` when a native result surprises you.
+  Expected native results, as of #81:
+
+  | venv | interpreter | expected |
+  | --- | --- | --- |
+  | `/srv/logalert-py311` | 3.11.18 | 1007 passed, 13 skipped |
+  | `/srv/logalert-py312` | 3.12.3 | 1007 passed, 13 skipped |
+  | `/srv/logalert-py313` | 3.13.18 | 1007 passed, 13 skipped |
+  | `/srv/logalert-py314` | 3.14.10 | 1006 passed, 14 skipped |
+
+  The 14th skip on 3.14 is announced and expected (`compression.zstd` is present
+  there and absent below it, measured), and 3.12 is the one the gate's mypy
+  stage uses for a `sys.platform != "win32"` branch. **Until issue #80 lands,
+  3.13 and 3.14 also carry its one failure** (`test_activity.py`'s `udp:`
+  resolver message): 1006 and 1005 passed. Delete this sentence with it.
+- **A `--basetemp` is per interpreter, never shared.** pytest WIPES a basetemp
+  it is given, at session start (`rm_rf` then `mkdir`, read in the installed
+  pytest), so a 3.13 run started beside a running 3.12 one deletes the running
+  one's fixture trees and the damage reads like a product defect. Give each its
+  own (`/tmp/logalert-pytest-313`).
+- Never run two gates against the sandbox at once -- and the same for two native
+  suites, for the reason above. End the session with `wsl --terminate
+  rlyeh-sandbox`; it is the polite exit, not a repair.
 - Subagents: give each its own uniquely named scratchpad subdirectory, hand it
   the exact `wsl.exe` line above, and diff the tree afterwards.
 
