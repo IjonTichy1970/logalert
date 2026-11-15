@@ -9,6 +9,10 @@ its notes.
 
 ### Nitty Gritty
 
+## [0.1.2] — 2026-11-15 — a copy chosen by reading and a bounded resolver
+
+### Nitty Gritty
+
 - `[internal]` **Tests build the config paths the loader checks from `tmp_path`,
   so the mail, transport and reset_state tests pass on Windows under Python
   3.13+** (#54). `os.path.isabs("/var/log/router.log")` is False there, and the
@@ -496,6 +500,7 @@ corrects; the quote lives on the issue. The prose separator is `--`; version
 headings use the em dash.
 
 
-[Unreleased]: https://github.com/IjonTichy1970/logalert/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/IjonTichy1970/logalert/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/IjonTichy1970/logalert/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/IjonTichy1970/logalert/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/IjonTichy1970/logalert/releases/tag/v0.1.0
