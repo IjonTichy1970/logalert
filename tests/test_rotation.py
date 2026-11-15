@@ -10,7 +10,6 @@ import bz2
 import errno
 import gzip
 import logging
-import lzma
 import os
 import sys
 import time
@@ -21,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import SECTION, append, run, seen, texts, try_symlink
+from conftest import SECTION, append, packer, run, seen, texts, try_symlink, zstd_module
 
 from logalert import rotation
 from logalert.cursor import ANCHOR_CAP, NUL, BinaryStream, Line, LogFile, anchor_of, open_log
@@ -41,10 +40,9 @@ NOWHERE = 2**40 + 7  # an inode number no filesystem in a test will hand out
 
 
 def compress_to(target: Path, data: bytes) -> None:
-    packers: dict[str, Callable[[bytes], bytes]] = {
-        ".gz": gzip.compress, ".bz2": bz2.compress, ".xz": lzma.compress,
-    }
-    target.write_bytes(packers[target.suffix](data))
+    """The compressor is chosen by the suffix, through conftest's one mapping -- so a `.zst`
+    fixture skips below 3.14 and fails on a 3.14 without the module (issue #83)."""
+    target.write_bytes(packer(target.suffix)(data))
 
 
 def rotate(path: Path, to: Path, *, compress: bool = False) -> None:
@@ -419,6 +417,482 @@ def test_compression_in_progress_prefers_the_uncompressed_copy(tmp_path: Path) -
     assert isinstance(source, CatchUpSource)
     assert source.plan.match is not None and source.plan.match.path.endswith("router.log.1.bz2")
     assert lines == ["since 1", "since 2", "live 1"]
+
+
+def test_two_whole_copies_of_one_generation_are_chosen_alike_on_every_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #79, step 1: `router.log.1.gz` beside `router.log.1.bz2` tie on the style key
+    AND on the saved identity, so with a stable sort and nothing after those two components
+    `os.scandir` decided which was read -- NTFS and the sandbox list the `.bz2` first, ext4
+    the `.gz`, so 0.1.1 shipped green here and red on CI's 3.11 and 3.13 legs.
+
+    Both copies here read to their end and both fit, so no preference can separate them:
+    what is asserted is that the answer is the SAME under either listing order, which is
+    all a total order can promise. Which of the two is the truer copy is unknowable from
+    the directory -- the point is that one machine cannot disagree with another."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    compress_to(tmp_path / "router.log.1.bz2", OLD + SINCE)
+    compress_to(tmp_path / "router.log.1.gz", OLD + b"other 1" + NLB)  # same first line
+    path.write_bytes(b"")
+    append(path, LIVE)
+    real_scandir = os.scandir
+
+    for reverse in (False, True):
+        def forced(directory: str, reverse: bool = reverse) -> list[os.DirEntry[str]]:
+            return sorted(real_scandir(directory), key=lambda e: e.name, reverse=reverse)
+
+        monkeypatch.setattr(os, "scandir", forced)  # the module rotation reads it from
+        caplog.clear()
+        caplog.set_level(logging.INFO, logger="logalert")
+        source, lines, _ = run(path, saved)
+        where = f"listed {'reversed' if reverse else 'in order'}"
+        assert isinstance(source, CatchUpSource) and source.plan.stage == "content", where
+        assert source.plan.match is not None, where
+        assert source.plan.match.path.endswith("router.log.1.bz2"), where
+        assert lines == ["since 1", "since 2", "live 1"], where
+        assert any("2 rotated copies of one generation fit" in r.getMessage()
+                   for r in caplog.records), where
+
+
+def test_a_cut_copy_never_wins_over_a_tied_one_that_reads_to_its_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #79, step 2 -- and why step 1 alone is not the fix: with the compressors
+    swapped the CUT copy sorts first, `router.log.1.bz2` before `router.log.1.gz`, and
+    would win just as deterministically. Taking it mails `half` -- a complete line here,
+    the cut falls in the compressed trailer, but never one of the log's -- in place of the
+    two lines it drops.
+
+    A cut archive hands over everything it decompressed BEFORE it raises (measured on gz,
+    bz2 and xz: all 17 bytes of this fixture), so by the time the read fails the fragment
+    is already in the report. The choice is made before a line is yielded, which is why a
+    retry -- what the issue first asked for -- cannot work."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    # cut: the last 6 bytes removed, what a compressor killed mid-stream leaves behind
+    (tmp_path / "router.log.1.bz2").write_bytes(bz2.compress(OLD + b"half" + NLB)[:-6])
+    compress_to(tmp_path / "router.log.1.gz", OLD + SINCE)
+    path.write_bytes(b"")
+    append(path, LIVE)
+    real_scandir = os.scandir
+
+    for reverse in (False, True):
+        def forced(directory: str, reverse: bool = reverse) -> list[os.DirEntry[str]]:
+            return sorted(real_scandir(directory), key=lambda e: e.name, reverse=reverse)
+
+        monkeypatch.setattr(os, "scandir", forced)
+        caplog.clear()
+        caplog.set_level(logging.INFO, logger="logalert")
+        source, lines, _ = run(path, saved)
+        where = f"listed {'reversed' if reverse else 'in order'}"
+        assert isinstance(source, CatchUpSource) and source.plan.match is not None, where
+        assert source.plan.match.path.endswith("router.log.1.gz"), where
+        assert lines == ["since 1", "since 2", "live 1"], where  # never 'half'
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("2 rotated copies of one generation fit" in m for m in messages), where
+        # the copy passed over is still named, and at WARNING: this module never skips a
+        # corrupt archive in silence, and it no longer reads this one at all (review)
+        assert any("router.log.1.bz2 cannot be read to its end; reading router.log.1.gz "
+                   "instead, which can" in m for m in messages), where
+        assert [r.levelno for r in caplog.records
+                if r.levelno >= logging.WARNING] == [logging.WARNING], where
+
+
+def test_an_ordinary_rotation_never_pays_for_the_tie_preference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The full decompression the owner accepted uncapped is a TIE's cost. One copy of a
+    generation must never be decompressed a second time to answer a question with only one
+    possible answer, so the preference is not consulted when nothing ties -- which is what
+    keeps an ordinary run exactly as expensive as it was before issue #79."""
+    def never(archive: Archive) -> bool:
+        raise AssertionError(f"decompressed {archive.path} with nothing to compare it to")
+
+    monkeypatch.setattr(rotation, "_reads_to_its_end", never)
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    rotate(path, tmp_path / "router.log.1.gz", compress=True)
+    path.write_bytes(LIVE)
+    _, lines, _ = run(path, saved)
+    assert lines == ["since 1", "since 2", "live 1"]
+
+
+def test_an_older_copy_cut_mid_stream_loses_to_its_tied_twin(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same tie in the LAST RESORT stage, over the copies written BEFORE the last run
+    (`_newest_older_fit`). Found by review, and the reason the preference is applied in
+    both stages: `older` is the reverse of the oldest-first order, so once the path made
+    that order total a cut copy sorting last would have won here on every filesystem and
+    every run -- a coin toss turned into a standing answer. Issue #79's exact harm,
+    reproduced after the first half of its own fix."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    (tmp_path / "router.log.1.gz").write_bytes(gzip.compress(OLD + b"half" + NLB)[:-6])
+    compress_to(tmp_path / "router.log.1.bz2", OLD + SINCE)
+    before = time.time() - 7200  # written before the last run: the last resort's input
+    for name in ("router.log.1.gz", "router.log.1.bz2"):
+        os.utime(tmp_path / name, (before, before))
+    path.write_bytes(b"")  # copytruncate: the live file keeps the saved inode
+    append(path, LIVE)
+    caplog.set_level(logging.INFO, logger="logalert")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.1.bz2")  # reversed: the .gz is first
+    assert lines == ["since 1", "since 2", "live 1"]  # never 'half'
+
+
+def test_two_cut_copies_of_one_generation_say_the_lines_are_lost(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When neither tied copy reads to its end there is nothing to prefer. The run says so
+    at WARNING rather than INFO (review): it is about to mail a fragment and drop a
+    generation's lines, which is not news to file under "the configuration changed". It
+    reads the first in order, which is what it would have done before issue #79."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    (tmp_path / "router.log.1.bz2").write_bytes(bz2.compress(OLD + b"half" + NLB)[:-6])
+    (tmp_path / "router.log.1.gz").write_bytes(gzip.compress(OLD + b"part" + NLB)[:-6])
+    path.write_bytes(b"")
+    append(path, LIVE)
+    caplog.set_level(logging.INFO, logger="logalert")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.1.bz2")  # the first in order
+    assert lines == ["half", "live 1"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    # "past the cut", not "its lines": the fragment before the cut IS still mailed, as it
+    # was before issue #79, and the first review pass claimed more than the run does
+    assert any("router.log.1.bz2, router.log.1.gz cannot be read to its end; no copy of "
+               "that generation can, so the lines past the cut are lost" in m
+               for m in warnings)
+
+
+def test_two_generations_are_never_one_generation_however_alike_they_are_named(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`router.log.1.gz` and `router.log.2.gz` share the style and the form and differ only
+    in the key -- which is the whole point of the key. In a banner log both fit the content
+    check (the anchor's bytes are the banner, issue #74), so without the age test in `_ties`
+    they would count as one generation and a cut `.2` would hand the match to `.1`: a
+    generation skipped, by a rule meant only to choose between two names for one of them."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    # the older generation, cut; the newer one whole. Both open with the saved bytes.
+    (tmp_path / "router.log.2.gz").write_bytes(gzip.compress(OLD + b"half" + NLB)[:-6])
+    compress_to(tmp_path / "router.log.1.gz", OLD + SINCE)
+    path.write_bytes(b"")
+    append(path, LIVE)
+    caplog.set_level(logging.INFO, logger="logalert")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.2.gz")  # the oldest that fits
+    assert not any("rotated copies of one generation" in r.getMessage()
+                   for r in caplog.records)
+
+
+def test_a_same_second_file_of_another_style_is_not_one_of_this_generation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Found by review, and the narrowest shape in which this change could have mailed MORE
+    than before. `newer()` calls two archives of DIFFERENT styles equal whenever their
+    mtimes are equal -- a coarse clock tick, `cp -p`, `touch -r`, tar or rsync preservation
+    -- so without the style and form test a cut `router.log.1.gz` would lose its tie to a
+    same-second `router.log.bak` that fits by content. The match would then carry the
+    `other` style, which admits other-style files to the chain, and `router.log.keep` would
+    be mailed whole as log lines: what the module docstring forbids by name. The cut copy
+    is read instead, with the warning it has always had."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    (tmp_path / "router.log.1.gz").write_bytes(gzip.compress(OLD + b"half" + NLB)[:-6])
+    (tmp_path / "router.log.bak").write_bytes(OLD + SINCE)  # fits by content, 'other' style
+    stamp = time.time()
+    for name in ("router.log.1.gz", "router.log.bak"):
+        os.utime(tmp_path / name, (stamp, stamp))  # to the nanosecond
+    keep = tmp_path / "router.log.keep"
+    keep.write_bytes(b"NOT A LOG LINE" + NLB)
+    os.utime(keep, (stamp + 10, stamp + 10))  # newer, so it would join an 'other' chain
+    path.write_bytes(b"")
+    append(path, LIVE)
+    caplog.set_level(logging.INFO, logger="logalert")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.1.gz")  # numeric, never the .bak
+    assert lines == ["half", "live 1"]  # the pre-#79 answer: no tie here to settle
+    assert "NOT A LOG LINE" not in lines
+    assert not any("rotated copies of one generation" in r.getMessage()
+                   for r in caplog.records)
+
+
+def test_two_same_second_copies_with_no_recognised_style_are_chosen_alike(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the total order (issue #79). A list holding an `other` style is
+    ordered by mtime for the whole list -- a comparison across styles is not transitive --
+    and two hand-made copies can share the second, which `cp -p` and logrotate both
+    reproduce exactly. The path settles those too, and neither is compressed, so the
+    read-to-the-end question answers itself without reading either of them."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    stamp = time.time()  # the same second AND the same nanoseconds, for both
+    for name, tail in (("router.log.aaa", SINCE), ("router.log.zzz", b"other 1" + NLB)):
+        (tmp_path / name).write_bytes(OLD + tail)
+        os.utime(tmp_path / name, (stamp, stamp))
+    path.write_bytes(b"")
+    append(path, LIVE)
+    real_scandir = os.scandir
+
+    for reverse in (False, True):
+        def forced(directory: str, reverse: bool = reverse) -> list[os.DirEntry[str]]:
+            return sorted(real_scandir(directory), key=lambda e: e.name, reverse=reverse)
+
+        monkeypatch.setattr(os, "scandir", forced)
+        source, lines, _ = run(path, saved)
+        where = f"listed {'reversed' if reverse else 'in order'}"
+        assert isinstance(source, CatchUpSource) and source.plan.match is not None, where
+        assert source.plan.match.path.endswith("router.log.aaa"), where
+        assert lines == ["since 1", "since 2", "live 1"], where
+
+
+def _long_ago(saved: Cursor) -> Cursor:
+    """The same cursor with its last run an hour back, so copies stamped minutes apart are
+    all "written since the last run" -- the stage that chooses among generations."""
+    return replace(saved, last_seen=timestamp(datetime.now(UTC) - timedelta(hours=1)))
+
+
+def test_a_generation_between_two_copies_of_the_match_stays_in_the_chain(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Found by review -- a defect the first pass of this fix INTRODUCED, and issue #79's own
+    harm wearing the fix's clothes.
+
+    `_ties` asks the style KEY, which is what makes two names one generation; `_oldest_first`
+    orders the whole list by MTIME as soon as a second style is present. So the two copies of
+    `.1` tie although minutes separate them, and a dated copy stamped between them is newer
+    than the first and older than the other. Measured against the copy the preference CHOSE,
+    that generation fell out of the chain and nothing said so. The chain is measured against
+    the EARLIEST copy of the matched generation instead, which is the answer 0.1.1 gave: a
+    copy whose stamp falls inside a generation is ambiguous, and reading it twice over is the
+    side this module errs on."""
+    path = tmp_path / "router.log"
+    saved = _long_ago(seen(path, OLD))
+    append(path, SINCE)
+    (tmp_path / "router.log.1.bz2").write_bytes(bz2.compress(OLD + b"half" + NLB)[:-6])
+    compress_to(tmp_path / "router.log-20261115.gz", b"mid 1" + NLB)  # a later generation
+    compress_to(tmp_path / "router.log.1.gz", OLD + SINCE)  # the same generation, whole
+    now = time.time()
+    for name, when in (("router.log.1.bz2", now - 300),  # the switch to gzip came later
+                       ("router.log-20261115.gz", now - 200), ("router.log.1.gz", now - 100)):
+        os.utime(tmp_path / name, (when, when))
+    path.write_bytes(b"")
+    append(path, LIVE)
+    caplog.set_level(logging.INFO, logger="logalert")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.1.gz")  # the copy that reads whole
+    assert [Path(a.path).name for a in source.plan.chain] == ["router.log-20261115.gz"]
+    assert lines == ["since 1", "since 2", "mid 1", "live 1"]  # never 'half', never without
+
+
+def test_two_generations_stamped_in_one_second_are_still_read_oldest_first(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Found by review. `router.log.1.gz` and `router.log.2.gz` inside one second -- one
+    logrotate run compressing both, or a coarse clock tick -- beside anything of another
+    style, which orders the whole list by mtime. The path alone then settled them, and for
+    numeric names the lexical order is the REVERSE of the age order: `.1`, the NEWEST
+    generation, was taken as "the oldest that fits" and `.2`'s lines were dropped with
+    nothing said. On ext4 that was a coin toss before issue #79 and the total order would
+    have frozen it, so the style key comes before the path in that order too."""
+    path = tmp_path / "router.log"
+    saved = _long_ago(seen(path, OLD))
+    append(path, SINCE)
+    compress_to(tmp_path / "router.log.2.gz", OLD + b"older gen 1" + NLB)  # both fit: a
+    compress_to(tmp_path / "router.log.1.gz", OLD + SINCE)  # banner log's first line
+    (tmp_path / "router.log.bak").write_bytes(b"NOT A LOG LINE" + NLB)  # forces the mtime order
+    now = time.time()
+    for name in ("router.log.1.gz", "router.log.2.gz"):
+        os.utime(tmp_path / name, (now - 60, now - 60))  # the same second, to the nanosecond
+    os.utime(tmp_path / "router.log.bak", (now - 30, now - 30))
+    path.write_bytes(b"")
+    append(path, LIVE)
+    caplog.set_level(logging.INFO, logger="logalert")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.2.gz")  # the oldest that fits
+    assert [Path(a.path).name for a in source.plan.chain] == ["router.log.1.gz"]
+    # a chain member is read in FULL, and both copies have to share the first line to be
+    # candidates at all (a banner log, which is where this bug was reachable), so `.1.gz`
+    # repeats the banner here. What matters is that `older gen 1` is in the mail at all.
+    assert lines == ["older gen 1", "old 1", "old 2", "since 1", "since 2", "live 1"]
+    assert "NOT A LOG LINE" not in lines
+
+
+def test_a_plain_copy_wins_the_tie_over_a_cut_one_that_decompresses_more(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A tie whose two members disagree about compression, which is the branch that answers
+    "an uncompressed copy reads to its end" without reading -- unpinned until review
+    mutated it, and load-bearing: with it returning False the cut copy wins and mails a
+    line the log never held.
+
+    This fixture also separates the rule from its plausible alternative. In the other tie
+    tests the copy that reads to its end is also the one with the longer payload, so
+    "prefer the longest" reproduces every one of their answers; here the CUT copy
+    decompresses MORE bytes, which is the realistic shape -- a cut copy is usually a longer
+    file truncated -- and the two rules disagree."""
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    cut = OLD + NLB.join([b"half 1", b"half 2", b"half 3", b""])
+    whole = OLD + SINCE
+    assert len(cut) > len(whole), "the fixture no longer separates the two rules"
+    (tmp_path / "router.log-a.gz").write_bytes(gzip.compress(cut)[:-6])  # sorts FIRST
+    (tmp_path / "router.log-b").write_bytes(whole)  # plain, and the one that reads whole
+    stamp = time.time()
+    for name in ("router.log-a.gz", "router.log-b"):
+        os.utime(tmp_path / name, (stamp, stamp))  # one generation: 'other' style, one second
+    path.write_bytes(b"")
+    append(path, LIVE)
+    caplog.set_level(logging.INFO, logger="logalert")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log-b")
+    assert lines == ["since 1", "since 2", "live 1"]  # never 'half 1'
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("router.log-a.gz cannot be read to its end; reading router.log-b instead, "
+               "which can" in m for m in messages)
+
+
+def test_the_other_naming_form_is_never_a_copy_of_this_generation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The naming-form half of `_ties`, unpinned until review mutated it. `router.1.log.gz`
+    (logrotate's `extension` form, issue #51) carries the same style and key as the classic
+    `router.log.1.gz`, so without the form test they would count as one generation -- and
+    taking the extension-form copy moves the match's form, which leaves every classic copy
+    newer than it OUT of the chain. Measured: `router.log.0.gz`'s line was lost.
+
+    So no preference applies here. The cut classic copy is read with the warning it has
+    always had, and the classic chain is kept whole -- the choice #51 settled."""
+    path = tmp_path / "router.log"
+    saved = _long_ago(seen(path, OLD))
+    append(path, SINCE)
+    (tmp_path / "router.log.1.gz").write_bytes(gzip.compress(OLD + b"half" + NLB)[:-6])
+    compress_to(tmp_path / "router.1.log.gz", OLD + SINCE)  # the other form, whole
+    compress_to(tmp_path / "router.log.0.gz", b"newer gen 1" + NLB)  # newer: .0 beats .1
+    (tmp_path / "router.log.bak").write_bytes(b"NOT A LOG LINE" + NLB)  # the mtime order
+    now = time.time()
+    for name, when in (("router.log.1.gz", now - 300), ("router.1.log.gz", now - 200),
+                       ("router.log.0.gz", now - 100), ("router.log.bak", now - 50)):
+        os.utime(tmp_path / name, (when, when))
+    path.write_bytes(b"")
+    append(path, LIVE)
+    caplog.set_level(logging.INFO, logger="logalert")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.1.gz")  # the classic form, cut
+    assert lines == ["half", "newer gen 1", "live 1"]  # the classic chain, whole
+    assert not any("rotated copies of one generation" in r.getMessage()
+                   for r in caplog.records)
+
+
+def test_a_newer_generation_first_in_the_order_never_ties_with_an_older_one(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The second half of `_ties`'s age test, unpinned until review mutated it: dropping
+    `not newer(b, a)` leaves "the candidate is not newer than the fit", which an OLDER
+    generation satisfies. The sibling test above covers the mirror -- a newer candidate --
+    and only the mtime order can put the newer generation first, which is what this builds
+    (`.1` stamped before `.2`: a recompression, a `cp -p`, a `touch`).
+
+    Without both halves a cut `.1` would hand the match to `.2`, and the run would read a
+    generation older than the saved position while announcing it as one of two names for
+    the same one."""
+    path = tmp_path / "router.log"
+    saved = _long_ago(seen(path, OLD))
+    append(path, SINCE)
+    (tmp_path / "router.log.1.gz").write_bytes(gzip.compress(OLD + b"half" + NLB)[:-6])
+    compress_to(tmp_path / "router.log.2.gz", OLD + b"older gen 1" + NLB)  # fits; older
+    (tmp_path / "router.log.bak").write_bytes(b"NOT A LOG LINE" + NLB)  # the mtime order
+    now = time.time()
+    for name, when in (("router.log.1.gz", now - 300), ("router.log.2.gz", now - 200),
+                       ("router.log.bak", now - 100)):
+        os.utime(tmp_path / name, (when, when))
+    path.write_bytes(b"")
+    append(path, LIVE)
+    caplog.set_level(logging.INFO, logger="logalert")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.1.gz")  # the newest that fits
+    assert lines == ["half", "live 1"]  # the pre-#79 answer: no tie here to settle
+    assert not any("rotated copies of one generation" in r.getMessage()
+                   for r in caplog.records)
+
+
+def test_the_read_to_the_end_probe_refuses_a_file_that_is_not_the_copy_it_saw(
+    tmp_path: Path
+) -> None:
+    """The probe opens by NAME, after the fit that opened that same name, so a rotation
+    landing between the two would leave it answering about a different file -- the window
+    issue #32 measured, and the identity check issue #46 made the rule for. It costs that
+    copy the preference and never the match, which keeps its own open handle.
+
+    Called directly, with the inode fabricated: a rename under an open handle is refused on
+    Windows, so the real window can only be opened where the POSIX-only tests run, and this
+    guard would otherwise be pinned by nothing on either platform."""
+    target = tmp_path / "router.log.1.gz"
+    compress_to(target, OLD + SINCE)
+    st = target.stat()
+    scanned = archive("router.log.1.gz", path=str(target), ino=st.st_ino, dev=st.st_dev)
+    assert rotation._reads_to_its_end(scanned)
+    assert not rotation._reads_to_its_end(replace(scanned, ino=NOWHERE))
+
+
+def test_a_close_that_fails_still_releases_the_other_tied_handles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tie is the first time this module holds more than one verified handle (issue #79,
+    review), which is what makes the release loop's order matter: before it the loop could
+    hold at most one entry and so could not abort part-way, and now an `OSError` from the
+    first `close()` would leak every handle behind it. Only a device error or a network
+    mount raises there, and the handles are read-only and finished with, so it is suppressed
+    rather than reported -- but it must not cost the others their release."""
+    attempts: list[str] = []
+    real_close = rotation.Verified.close
+
+    def close(self: rotation.Verified) -> None:
+        attempts.append("tried")
+        real_close(self)
+        if len(attempts) == 1:  # the first leftover, already closed: only the loop is at risk
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+    monkeypatch.setattr(rotation.Verified, "close", close)
+    path = tmp_path / "router.log"
+    saved = seen(path, OLD)
+    append(path, SINCE)
+    stamp = time.time()
+    for name, tail in (("router.log.aaa", SINCE), ("router.log.mmm", b"other 1" + NLB),
+                       ("router.log.zzz", b"other 2" + NLB)):
+        (tmp_path / name).write_bytes(OLD + tail)
+        os.utime(tmp_path / name, (stamp, stamp))  # one generation of three names
+    path.write_bytes(b"")
+    append(path, LIVE)
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.aaa")
+    assert lines == ["since 1", "since 2", "live 1"]  # the failure never reached the caller
+    assert len(attempts) >= 2, "the release loop stopped at the first failure"
 
 
 def test_other_style_files_never_join_a_recognised_chain(tmp_path: Path) -> None:
@@ -3274,6 +3748,37 @@ def test_a_twin_with_the_same_stamp_and_first_line_but_other_bytes_is_refused_at
     assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
     assert again.plan.match is not None and again.plan.match.path == str(real)
     assert lines == ["since 2", "live 1"]  # nothing of the twin
+
+
+def test_a_zst_rotated_copy_is_matched_through_the_decompressor_with_its_anchor(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A `.zst` as a rotated copy in the catch-up: the forward read to the saved offset
+    through the decompressor, the anchor's bytes compared there, and a chain member of the
+    same format behind it. The shape issue #74 pinned for `.gz`, which had executed for
+    `.zst` on no host ever -- `compression.zstd` exists on 3.14+ only, and until the sandbox
+    gained a 3.14 nothing here could run it (issue #83).
+
+    A banner log, so neither the first line nor the length can tell the genuine copy from
+    the rival: only the bytes before the position can, read through zstd. `.3` is tried
+    first (lower is newer, so it is the oldest), and the anchor has to refuse it."""
+    zstd_module()  # skip below 3.14, FAIL on a 3.14 without it (issue #42)
+    path = tmp_path / "router.log"
+    saved = seen(path, _banner(b"old", 200))
+    append(path, SINCE)
+    compress_to(tmp_path / "router.log.2.zst", path.read_bytes())  # the genuine copy
+    compress_to(tmp_path / "router.log.3.zst", _banner(b"rival", 400))  # banner, longer
+    compress_to(tmp_path / "router.log.1.zst", b"newer gen 1" + NLB)  # the chain
+    path.write_bytes(b"")
+    append(path, LIVE)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.2.zst")
+    assert source.plan.stage == "content"
+    assert [Path(a.path).name for a in source.plan.chain] == ["router.log.1.zst"]
+    assert lines == ["since 1", "since 2", "newer gen 1", "live 1"]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def test_an_anchor_confirmed_choice_among_older_copies_is_not_called_a_guess(

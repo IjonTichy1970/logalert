@@ -129,6 +129,44 @@ def test_the_logging_section_names_the_send_timeout_and_the_table_has_the_row() 
     assert f"waited {SYSLOG_SEND_TIMEOUT:g} s twice" in row and "systemd-journald" in row
 
 
+def test_the_logging_section_names_the_resolve_bound_and_the_table_has_the_row() -> None:
+    """Issues #80 and #82, the same reason as the test above: the document states the bound
+    in four places, and a constant of 20.0 would leave every one of them wrong with the
+    resolver tests still green (they monkeypatch the constant, so they cannot see its
+    value). The row's warning against a diagnostic that SUCCEEDS is pinned too: a dead
+    nameserver ahead of a working one answers, 10.4 s later, which is over the bound."""
+    from logalert.activity import RESOLVE_TIMEOUT
+    text = _text()
+    logging_section = text[text.index("## Logging"):text.index("## Troubleshooting")]
+    assert f"name lookup is given {RESOLVE_TIMEOUT:g} s, once" in logging_section
+    assert f"(no answer within {RESOLVE_TIMEOUT:g} s)" in logging_section
+    assert "`--check-config` does not test the name" in logging_section
+    table = text[text.index("## Troubleshooting"):]
+    row = next(r for r in table.splitlines() if "cannot resolve the host" in r)
+    assert f"no answer within {RESOLVE_TIMEOUT:g} s" in row
+    assert "getent hosts" in row and "does NOT clear this" in row
+    source = (DOC.parents[1] / "logalert" / "activity.py").read_text(encoding="utf-8")
+    assert "cannot resolve the host (no answer within" in source  # the row quotes the module
+
+
+def test_the_rotation_section_quotes_the_tied_copies_lines_in_the_modules_words() -> None:
+    """Issue #79: the document quotes both lines of a settled tie, and a reworded message
+    or a drifted quote reddens here -- the same pin every other quoted message has."""
+    text = _text()
+    assert ("2 rotated copies of one generation fit the saved position "
+            "(router.log.1.bz2, router.log.1.gz); reading router.log.1.gz") in text
+    assert ("router.log.1.bz2 cannot be read to its end; reading router.log.1.gz "
+            "instead, which can") in text
+    source = (DOC.parents[1] / "logalert" / "rotation.py").read_text(encoding="utf-8")
+    # the argument list, not a bare "reading %s": that fragment also belongs to the "found
+    # the saved position by ..." line, which would make a reworded tie line pass (measured
+    # -- the mutation that renamed this one to "taking %s" was caught by nothing)
+    for words in ("rotated copies of one generation fit the saved ",  # the literal wraps
+                  "position (%s); ", '"reading %s", section, path, len(fitting),',
+                  "cannot be read to its end; %s", "instead, which can"):
+        assert words in source, words
+
+
 def test_the_position_section_and_the_table_carry_the_full_disk_refusal() -> None:
     """Issue #30: the opening save and its refusal are documented in the program's own words;
     a dropped sentence or row reddens here."""

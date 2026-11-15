@@ -15,6 +15,7 @@ import re
 import signal
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -234,8 +235,10 @@ def test_udp_reaches_the_listener_only_when_configured(
         listener.close()
     assert first.startswith(f"<14>logalert[{os.getpid()}]: start: ".encode())
 
-    # an unresolvable host raises gaierror at construction (measured on both platforms); the
-    # resolver is stubbed because a real lookup of a .invalid name took 11 s on the dev host
+    # An unresolvable host is OUR warning on every interpreter now (issue #80): the stdlib
+    # raises gaierror from the constructor on 3.12 and swallows it on 3.13+, so logalert
+    # resolves the host itself. The resolver is stubbed because a real lookup of a .invalid
+    # name took 11 s on the dev host.
     def unresolvable(*args: Any, **kwargs: Any) -> Any:
         raise socket.gaierror(-2, "Name or service not known")
 
@@ -245,6 +248,187 @@ def test_udp_reaches_the_listener_only_when_configured(
     assert lines[0] == ("logalert: warning: udp:nonexistent.invalid:514: cannot resolve the host "
                         "([Errno -2] Name or service not known); logging to stderr")
     assert lines[-1] == "logalert: end: exit 0"
+
+
+def test_a_udp_host_is_resolved_once_and_the_handler_gets_the_numeric_address(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #80: ``emit`` sends with ``sendto(msg, self.address)`` and the reconnect seam
+    resolves ``self.address`` again, so a NAME there is a lookup per record -- and on 3.13+ a
+    stalling one, because the constructor's gaierror is swallowed and every record retries.
+    The handler is given the numeric address the lookup produced, and an address literal is
+    not looked up at all."""
+    asked: list[tuple[Any, ...]] = []
+    real = socket.getaddrinfo
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        asked.append((args, tuple(sorted(kwargs.items()))))
+        if kwargs.get("flags", 0) & socket.AI_NUMERICHOST or (len(args) > 5 and args[5]):
+            raise socket.gaierror(-2, "Name or service not known")  # a name, not a literal
+        return [(socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("192.0.2.9", 514))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", counting)
+    handler, notice = activity._open("udp:relay.example.net:514")
+    try:
+        assert notice is None and isinstance(handler, logging.handlers.SysLogHandler)
+        assert handler.address == ("192.0.2.9", 514)  # numeric, never the name
+    finally:
+        if handler is not None:
+            handler.close()
+    # Our AI_NUMERICHOST probe and our one real lookup carry the name; everything the stdlib
+    # does afterwards -- createSocket's own getaddrinfo, and emit's per-record sendto -- is
+    # over a literal, which is a parse rather than a lookup and so can never stall.
+    assert [call[0][0] for call in asked].count("relay.example.net") == 2
+    assert asked[-1][0][0] == "192.0.2.9"
+
+    # The literal half, with a stub that records and then DELEGATES: the claim that a literal
+    # is never looked up is asserted rather than assumed, and both calls carry the literal
+    # itself -- ours and the stdlib's -- so neither is a name and neither can stall.
+    asked.clear()
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        asked.append((args, tuple(sorted(kwargs.items()))))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", recording)
+    handler, notice = activity._open("udp:192.0.2.9:514")
+    try:
+        assert notice is None and handler is not None
+        assert handler.address == ("192.0.2.9", 514)
+    finally:
+        if handler is not None:
+            handler.close()
+    assert [call[0][0] for call in asked] == ["192.0.2.9", "192.0.2.9"]
+
+
+def test_a_stalling_resolver_is_abandoned_within_the_bound(
+        site: Site, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    """Issue #82: the destination is built before the lock, so an unbounded lookup holds every
+    cron tick at its first step -- measured at 20.02 s with two unreachable nameservers, and
+    twice that on 3.13+, where the first record resolves again. Neither
+    ``socket.setdefaulttimeout`` nor a ``SIGALRM`` bounds ``getaddrinfo`` (both measured), so
+    the run abandons the lookup and says so. The stub blocks rather than sleeping a real 20 s:
+    the assertion is the bound, not the resolver."""
+    monkeypatch.setattr(activity, "RESOLVE_TIMEOUT", 0.25)
+    entered = threading.Event()
+
+    def stalling(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("flags", 0) & socket.AI_NUMERICHOST:
+            raise socket.gaierror(-2, "Name or service not known")  # a name: look it up
+        entered.set()
+        time.sleep(5)  # 20x the bound, deliberately: a budget set just above the stall would
+        # let `worker.join()` WITHOUT the timeout come in under it, and that mutation -- the
+        # one this test exists for -- would then redden only on the message below.
+        # And it RETURNS rather than raising: an exception escaping this thread would reach
+        # threading.excepthook seconds after this test has finished, and pytest reports that
+        # as a warning -- which issue #81 made an error, charged to whichever test is running
+        # by then.
+        return [(socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("192.0.2.9", 514))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalling)
+    started = time.monotonic()
+    assert site.run("--log", "udp:relay.example.net:514") == 0  # the run's own code, unchanged
+    spent = time.monotonic() - started
+    assert entered.is_set(), "the stub was never reached"
+    assert spent < 2.5, f"the lookup was not bounded: {spent:.2f} s"  # 0.27 s measured
+    # The worker is LEFT RUNNING, and it has to be a daemon: with daemon=False the run returns
+    # on time and threading._shutdown then pays the rest of the stall at interpreter exit --
+    # the whole delay back, after the run's records, where no assertion on this run would see
+    # it. Nothing else in the suite leaves a thread of this name alive.
+    abandoned = [thread for thread in threading.enumerate() if thread.name == "logalert-resolve"]
+    assert len(abandoned) == 1 and abandoned[0].daemon
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0] == ("logalert: warning: udp:relay.example.net:514: cannot resolve the host "
+                        "(no answer within 0.25 s); logging to stderr")
+    assert lines[-1] == "logalert: end: exit 0"  # the fallback never changes the exit code
+
+
+def test_a_udp_host_resolving_to_two_families_falls_through_to_the_one_that_works(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_open`` keeps the stdlib's own loop over the resolved addresses, which is the whole
+    reason ``_addresses`` returns a list in the stdlib's order: a first address whose family
+    this host cannot make is not the end of the destination. With ``addresses[0]`` instead,
+    a collector whose name answers AAAA first is unreachable from a host without IPv6, and
+    the warning blames the socket rather than the family."""
+    real = socket.getaddrinfo
+
+    def two_families(*args: Any, **kwargs: Any) -> Any:
+        if args[0] != "relay.example.net":
+            return real(*args, **kwargs)  # the literals the stdlib parses for itself
+        if kwargs.get("flags", 0) & socket.AI_NUMERICHOST:
+            raise socket.gaierror(-2, "Name or service not known")  # a name, not a literal
+        return [(socket.AF_INET6, socket.SOCK_DGRAM, 17, "", ("2001:db8::1", 514, 0, 0)),
+                (socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("192.0.2.9", 514))]
+
+    real_socket = socket.socket
+
+    def no_inet6(family: int = socket.AF_INET, *args: Any, **kwargs: Any) -> Any:
+        if family == socket.AF_INET6:
+            raise OSError(errno.EAFNOSUPPORT, "Address family not supported by protocol")
+        return real_socket(family, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", two_families)
+    monkeypatch.setattr(socket, "socket", no_inet6)
+    handler, notice = activity._open("udp:relay.example.net:514")
+    try:
+        assert notice is None and isinstance(handler, logging.handlers.SysLogHandler)
+        assert handler.address == ("192.0.2.9", 514)  # the second, after the first's family
+    finally:
+        if handler is not None:
+            handler.close()
+
+
+def test_a_udp_host_that_resolves_to_nothing_at_all_is_the_loud_fallback(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real ``getaddrinfo`` raises rather than answering with an empty list, so this guard
+    mirrors the stdlib's own ``if not ress``: it exists so that an empty answer cannot reach
+    the per-address loop, which would report the generic ``cannot open (None)``. Stubbed
+    because nothing else produces it."""
+    def empty(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("flags", 0) & socket.AI_NUMERICHOST:
+            raise socket.gaierror(-2, "Name or service not known")
+        return []
+
+    monkeypatch.setattr(socket, "getaddrinfo", empty)
+    handler, notice = activity._open("udp:relay.example.net:514")
+    assert handler is None
+    assert notice == ("udp:relay.example.net:514: cannot resolve the host (no addresses); "
+                      "logging to stderr")
+
+
+def test_any_failure_of_the_lookup_is_the_one_warning_and_never_a_traceback(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The resolve runs in a thread the run ABANDONS at the bound, so an exception the worker
+    does not catch reaches ``threading.excepthook`` after ``_resolved`` has returned: a
+    traceback landing between the run's records and in cron's mail, against this module's
+    one-WARNING rule. Nothing a configuration can produce raises outside the lookup's own
+    errors today -- which is exactly why the catch has to be broad rather than a list of the
+    ones we thought of. ``RuntimeError`` stands in for the one we did not."""
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("flags", 0) & socket.AI_NUMERICHOST:
+            raise socket.gaierror(-2, "Name or service not known")
+        raise RuntimeError("the resolver module is not what we thought")
+
+    monkeypatch.setattr(socket, "getaddrinfo", broken)
+    handler, notice = activity._open("udp:relay.example.net:514")
+    assert handler is None
+    assert notice == ("udp:relay.example.net:514: cannot resolve the host (the resolver module "
+                      "is not what we thought); logging to stderr")
+
+
+def test_a_udp_host_no_idna_encoder_will_take_is_the_loud_fallback() -> None:
+    """A DNS label may be 63 bytes, the loader checks no length on a ``udp:`` host, and
+    ``getaddrinfo`` answers a longer one with ``UnicodeError`` -- a ``ValueError``, NOT an
+    ``OSError``, so the old ``except socket.gaierror`` let it out of ``_open`` and out of
+    ``attach`` as a traceback. Now it is the one warning, like any other name that will not
+    resolve. Not stubbed: the refusal comes from pure-Python ``encodings.idna``, before any
+    query, so it is the same on every platform. The parenthetical is the codec's own wording
+    and is deliberately NOT pinned (issue #84) -- the contract is the line around it."""
+    spec = "udp:" + "x" * 100 + ".example.net:514"
+    handler, notice = activity._open(spec)
+    assert handler is None and notice is not None
+    assert notice.startswith(f"{spec}: cannot resolve the host (")
+    assert notice.endswith("); logging to stderr")
 
 
 def test_attach_leaves_no_handler_behind_even_after_a_fallback(

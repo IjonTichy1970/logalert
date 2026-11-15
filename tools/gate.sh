@@ -33,12 +33,18 @@ export PYTHONDONTWRITEBYTECODE=1
 # CDPATH in the caller's environment cannot silently send us to a different directory.
 cd -- "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)" || exit 1
 
-# The tools' versions, once, before the first stage: the extras let them float (`ruff>=0.5`,
-# `mypy>=1.10`, `pytest>=8`, `markdown>=3.5`), so a tool release can redden an unchanged tree once
-# or twice a year, and this line is what makes that diagnosable from the log (issue #52). A
-# distributions() scan rather than four version() calls: a missing extra reads MISSING here
+# The tools' versions, once, before the first stage. The extras used to let them float, so a
+# tool release could redden an unchanged tree once or twice a year, and this line is what made
+# that diagnosable from the log (issue #52) -- it is how the `mypy` 2.4.1 crash on 3.14 was
+# found. They are pinned exactly now (issue #81), which makes this line the record of what
+# actually ran against what `pyproject.toml` asked for: the two disagreeing means the venv
+# needs `pip install -e ".[dev,docs]"` again. It names all SIX pinned distributions, the stubs
+# and the build frontend included -- a stale `types-Markdown` changes `mypy --strict`'s
+# verdicts with no line of ours moving, and `build` makes the artifacts a release attaches, so
+# a line that omitted them would read clean over exactly the drift it exists to show (review).
+# A distributions() scan rather than six version() calls: a missing extra reads MISSING here
 # instead of failing three stages further down without a name.
-python -c 'import sys, importlib.metadata as m; have = {str(d.metadata.get("Name", "")).lower(): str(d.version) for d in m.distributions()}; print("tools: python %d.%d.%d, " % sys.version_info[:3] + ", ".join(n + " " + have.get(n, "MISSING") for n in ("ruff", "mypy", "pytest", "markdown")))'
+python -c 'import sys, importlib.metadata as m; have = {str(d.metadata.get("Name", "")).lower(): str(d.version) for d in m.distributions()}; print("tools: python %d.%d.%d, " % sys.version_info[:3] + ", ".join(n + " " + have.get(n, "MISSING") for n in ("ruff", "mypy", "pytest", "markdown", "types-markdown", "build")))'
 
 FAILED=""
 SKIPPED=""

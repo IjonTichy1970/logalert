@@ -446,7 +446,31 @@ however many rotations happened in between. It recognises, beside the log or in
   without an anchor, from 0.1.0).
 
 Symbolic links are never candidates. A `.gz` still being written yields what it
-has, with a warning, and the run continues.
+has, with a warning, and the run continues -- unless a copy of its own
+generation can be read whole, which is the next paragraph.
+
+**Two copies of one generation.** `router.log.1.gz` beside `router.log.1.bz2`
+-- a rotation configuration switched from one compressor to another -- are two
+names for one generation: they carry the same rotation suffix, so nothing in
+the names says which of them is the copy to read, and their timestamps can be
+minutes apart. The one that reads to its end is taken, decided before a line is
+read out of either, and a copy passed over for being cut is named in a warning:
+
+```
+[router-disk] /var/log/router.log: 2 rotated copies of one generation fit the saved position (router.log.1.bz2, router.log.1.gz); reading router.log.1.gz
+[router-disk] /var/log/router.log: router.log.1.bz2 cannot be read to its end; reading router.log.1.gz instead, which can
+```
+
+Before 0.1.2 the directory's listing order decided it, so one machine could
+read the pair differently from another; and when the cut copy won, the complete
+copy's lines were lost and a line that was never in the log was mailed in their
+place. The same release stopped two copies of *different* generations stamped
+inside one second -- one `logrotate` run compressing both -- from being read
+newest-first, which dropped the older one's lines with nothing said. A cut copy
+comes from a compression or a transfer killed half-way; two copies of one
+generation usually mean the rotation configuration changed, though two
+hand-made copies that share a second look the same from here. Both lines are
+worth grepping for.
 
 **A rotation during the run.** When a rename rotation (logrotate's default)
 lands while the copies are being read, a copy the run was about to open is no
@@ -855,8 +879,9 @@ logalert -g logalert -m 640 /dev/null /var/log/logalert.log`, then a logrotate
 stanza of its own; [INSTALL.md](../INSTALL.md#8-where-the-log-is)); `log =
 stderr` prints them (`logalert: ...`); `log = udp:host:514` sends them to a
 syslog collector -- explicit only, and be aware that a datagram to a port nobody
-listens on is silent forever. `--log
-DEST` picks any of these for one run, in every mode.
+listens on is silent forever, and that the host is looked up once per run within
+2 s (below), while a numeric address is not looked up at all. `--log DEST` picks
+any of these for one run, in every mode.
 
 **When the destination cannot be used** -- no syslog socket, a log file that
 cannot be opened, a relay host that does not resolve -- the run does not stop
@@ -875,6 +900,28 @@ nobody reads -- journald stopped or wedged while systemd holds its socket open
 -- is given 2 s per send, twice (the send, and the retry on a fresh socket), and
 then falls back the same way with `TimeoutError: timed out`: the run stalls
 those seconds instead of hanging before its lock.
+
+**A `udp:` host's name lookup is given 2 s, once.** logalert resolves the host
+itself, before the run takes its lock, and hands the collector's numeric address
+to the socket -- so the lookup is not paid again for every record, and a
+resolver that does not answer costs the run 2 s rather than however long the
+system resolver takes (two unreachable nameservers in `/etc/resolv.conf` is 20 s
+by default: `options timeout:` and `attempts:`, per nameserver, per address
+family). **The bound caps what logalert waits, not what the resolver needs:** an
+answer that arrives later is too late, and that run logs to stderr instead. The
+line says `cannot resolve the host (no answer within 2 s); logging to stderr`,
+and the run goes on with its own exit code. A numeric address in the
+configuration (`udp:192.0.2.9:514`) is never looked up at all, and
+`--check-config` does not test the name -- `getent hosts <name>` does.
+
+⚠️ **A dead nameserver ahead of a working one exceeds the bound**, even though
+the name does resolve and every shell diagnostic agrees that it does: measured
+at 10.4 s on a host whose first nameserver swallows queries, because the two
+address families are asked for separately and each waits out its own `timeout:`
+(5 s by default). `options timeout:1 attempts:1` brings that to 2.4 s -- still
+over the bound. So the fix is the resolver's: drop the dead nameserver from
+`/etc/resolv.conf`, or give the configuration the collector's numeric address,
+which is never looked up.
 
 **`-n` logs to stderr** rather than to the configured destination (unless
 `--log` is given): a dry run writes nothing, and its records (`start: ... (dry
@@ -902,6 +949,7 @@ configured destination still gets INFO and above.
 | `stale lock: the recorded holder PID N is gone; another process holds the lock ... (fuser ... names it)` (exit 1, under cron) | The last run that wrote the file has exited (or PID N now belongs to another user's process, which cannot hold a `0600` lock), and something else holds the lock: a run stalled between taking the lock and writing its line, or another process that opened the file and locked it | `fuser <lock>` (or `lsof <lock>`), run as root -- as the running user it cannot see another user's process -- names the holder; end it if it should not be there. The lock is `0600` (one left `0644` by an earlier version is tightened by the next run that takes it), so only the running user and root can open it |
 | `warning: no usable syslog socket (...); logging to stderr` in cron's mail every run | No syslog daemon, or the socket is somewhere else | Start rsyslog / journald, or set `log = file:/var/log/logalert.log` with the file pre-created owned by the running user (`install -o logalert -g logalert -m 640 /dev/null /var/log/logalert.log`; `/var/log` is root's) |
 | `warning: the activity log at syslog (/dev/log) failed (TimeoutError: timed out); logging to stderr from here on` in cron's mail, followed by the run's records | The syslog socket is held open but nobody reads it (journald stopped or wedged while systemd's socket unit keeps `/dev/log`); the run waited 2 s twice and went on | `systemctl status systemd-journald` (or rsyslog) and restart it; the runs in between logged to stderr, which is that mail |
+| `warning: udp:relay.example.net:514: cannot resolve the host (...); logging to stderr` in cron's mail every run, with the run's records after it -- or the same line saying `(no answer within 2 s)`, and the run 2 s slower | `log = udp:` names a host this machine cannot resolve, or one the resolver does not answer for within the bound -- **including a resolver that answers later**: a dead nameserver ahead of a working one in `/etc/resolv.conf` costs about 10 s (one `timeout:` per address family), so the name resolves and logalert gives up anyway. The lookup happens before the lock, so it delays every tick by the bound; without the bound it was the system resolver's own, 20 s with two unreachable nameservers | A succeeding `getent hosts <name>` does NOT clear this -- time it (`resolvectl query <name>` likewise). Fix the name, or drop the dead nameserver from `/etc/resolv.conf` (`options timeout:1 attempts:1` is 2.4 s, still over the bound); or put the collector's numeric address in the configuration, which is never looked up. The runs in between logged to stderr, which is that mail |
 | `warning: cannot open the activity log /var/log/logalert.log (Permission denied); logging to stderr` in cron's mail every run -- every record of a quiet run, four or five lines | `log = file:` names a file the service user cannot create (`/var/log` is root's), or a root run created it root-owned | Pre-create it owned by the service user; an existing one: `sudo chown logalert:logalert /var/log/logalert.log` |
 | `sudo: unable to execute ...: Permission denied`, `/bin/sh: 1: /usr/local/bin/logalert: Permission denied` in cron's mail, or `status=203/EXEC` for the unit -- while the same commands work as root; or, with the venv itself readable, `ModuleNotFoundError: No module named 'logalert.__main__'` as the running user | The venv, or the package inside it, was made under a hardened default umask (`UMASK 027` or `077` in `/etc/login.defs`, applied to every `sudo` session by `pam_umask`): directories `750` or `700` the running user cannot enter, or files it cannot read | `sudo chmod -R o+rX /opt/logalert-venv` -- again after every `pip install` made under that umask -- or make the venv and its installs under `umask 022` ([INSTALL.md](../INSTALL.md#1-create-the-venv-with-a-versioned-interpreter)) |
 | `state directory: Permission denied (/var/lib/logalert/lock) -- the lock file must belong to the user logalert runs as` (exit 1), `cannot take the run lock ... (Permission denied)` from `--reset-state`, or `state file ...: cannot read (Permission denied) -- is it owned by another user?` | A root run happened before the service user's first one, in a state directory root OWNS (`root:logalert 2770`): the lock and the state are root-owned `0600`. The refusal of root runs keys on the owner (of the state file once it exists, of the directory before), so a directory that is merely writable by the service user does not protect it | As root, `chown logalert:logalert /var/lib/logalert /var/lib/logalert/lock /var/lib/logalert/state.json` -- every position kept, and root's runs refused from then on. With no run alive the `lock` file may be removed instead, and a root-owned state replaced by `--reset-state` with no path (the lock it then takes is the user's), at the cost of every position |

@@ -27,6 +27,11 @@ jobs:
       # it CI runs that stage in auto mode and passes by not looking.
       LOGALERT_CHECK_MODE: required
     strategy:
+      # One red leg must not cancel the others (issue #81). With the default `true`, two runs
+      # on 2026-11-15 each left three legs unknown, and the hidden 3.14 leg was the only one
+      # that could have shown a mypy release crashing on 3.14 -- a four-interpreter matrix of
+      # one cheap job is exactly the case where every leg's answer is worth having.
+      fail-fast: false
       matrix:
         # MUST mirror the "Programming Language :: Python :: 3.x" classifiers in pyproject.toml
         # (tests/test_install_doc.py pins the two together with requires-python); 3.11 is the floor

@@ -15,6 +15,41 @@ its notes.
   loader refused the literal. Labels never sent to the loader keep their
   literals.
 
+- `[internal]` **The tools the gate runs are pinned exactly, so a release of
+  one can no longer redden an unchanged tree** (#81). A `mypy` release is an
+  internal error on 3.14 where the pinned one passes, and `fail-fast` hid the
+  leg that would have shown it. Every warning is an error now, with an empty
+  ignore list. `CLAUDE.md` records the four native venvs, and each interpreter
+  gets its own `--basetemp`: pytest wipes a shared one at session start.
+
+- `[contract]` 🚨 **A `udp:` activity log's host is resolved by logalert itself,
+  within 2 s, and the handler gets the numeric address** (#80, #82). The stdlib
+  swallows the resolver's failure on 3.13+, so the documented warning could not
+  appear there and every record looked the name up again; nothing bounded the
+  lookup, which cost 20 s a run with two unreachable nameservers, before the
+  lock. A numeric address is never looked up at all.
+
+- `[contract]` 🚨 **Which rotated copy a catch-up reads no longer depends on the
+  directory's listing order** (#79). A copy cut mid-stream could win over a
+  complete copy of its own generation, mailing a line that was never in the
+  log; and two generations stamped inside one second were read newest-first,
+  losing the older one's lines. That narrows #8's "a corrupt archive yields what
+  it had with a WARNING": a copy passed over yields nothing, and is named.
+
+- `[internal]` **Every `.zst` read path is measured now, not only a clean read
+  from offset 0** (#83). The resumed offset, a cut archive, a file that is not
+  zstd at all and a `.zst` rotated copy with its anchor had executed on no host
+  ever, `compression.zstd` being 3.14-only; they run on the 3.14 leg and
+  announce a skip below it. A cut `.zst` hands over less than the other three --
+  nothing at all once the payload is compressed rather than stored, measured.
+
+- `[internal]` **The assertions that pinned `smtplib`'s own sentences now pin
+  ours instead -- the failure's type, and that a reason follows it** (#84). A
+  reword upstream would have reddened the gate on a run where logalert behaved
+  correctly; dropping the reason reddened nothing at all, which it now does. The
+  RFC 2231 filename boundary (48 characters, 7 of margin) and the chosen
+  encodings stay pinned, both measured identical on five interpreters.
+
 ## [0.1.1] — 2026-09-18 — the rotation catch-up corrected and the run hardened
 
 ### Nitty Gritty

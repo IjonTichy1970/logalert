@@ -1,4 +1,9 @@
 [build-system]
+# A FLOOR on purpose, where the gate's tools are pinned exactly (issue #81): the backend has
+# to be able to build on an interpreter newer than this pin would know about. The artifacts it
+# produces get a narrow check, not a full one -- tools/check_artifacts.py reads the modes, the
+# metadata's line endings and the presence of six named members, so a backend change that
+# dropped the packaged example config would still read clean (review).
 requires = ["setuptools>=77"]          # floor for SPDX license-expression support
 build-backend = "setuptools.build_meta"
 
@@ -27,14 +32,30 @@ dependencies = []
 
 [project.optional-dependencies]
 # What the gate (tools/gate.sh) needs installed into the venv; never runtime. On this Windows
-# dev host mypy's compiled wheel is blocked by an Application Control policy -- install it as
-# `pip install --no-binary mypy mypy` there (pure Python, slower, same verdicts).
-dev = ["ruff>=0.5", "mypy>=1.10", "pytest>=8", "build>=1"]
+# dev host mypy's compiled wheel is blocked by an Application Control policy -- install the
+# whole set as `pip install --no-binary mypy -e ".[dev,docs]"` there (pure Python, slower,
+# same verdicts). NEVER `pip install --no-binary mypy mypy`: that command carries no version
+# and resolves the newest release, which is exactly the one the pin below excludes.
+#
+# EXACT pins, not floors (issue #81). The gate is the only definition of green, and what it
+# ran used to be whatever pip resolved that day: `mypy` 2.4.1 is an INTERNAL ERROR (exit 2)
+# on 3.14.10 where 2.3.1 passes, measured, so CI's 3.14 leg could not pass for a reason that
+# was not ours. A bump is its own commit, with its own fixes; the gate's `tools:` line (issue
+# #52) is the record of what actually ran, and tests/test_install_doc.py keeps every entry
+# here exact.
+#
+# These are TOP-LEVEL pins only, and that is worth knowing when the next unexplained red
+# arrives: mypy's own `librt` and `ast-serialize`, pytest's `pluggy` and `pygments`, build's
+# `pyproject_hooks` and the rest are still resolved at install time, so a release of one of
+# them can crash a tool the way 2.4.1 did. A real lock (a `constraints.txt` passed as `-c` by
+# every install step) is the fix if that ever happens twice; it is deliberately not here yet.
+dev = ["ruff==0.17.5", "mypy==2.3.1", "pytest==9.1.1", "build==1.6.1"]
 # The changelog site (tools/render_changelog.py, .github/workflows/pages.yml): `markdown` renders
 # the entries' text; `types-Markdown` is its stubs for mypy --strict (the package ships none).
 # `--check` needs neither (the gate's `changelog structure` stage runs on `dev` alone), but the
-# gate's mypy stage and the render test do: a dev venv is `.[dev,docs]`, as is CI's.
-docs = ["markdown>=3.5", "types-Markdown"]
+# gate's mypy stage and the render test do: a dev venv is `.[dev,docs]`, as is CI's. The stubs
+# are pinned too: stub drift changes `mypy --strict`'s verdicts with no line of ours moving.
+docs = ["markdown==3.10.3", "types-Markdown==3.10.2.20260712"]
 
 [project.urls]
 Homepage = "https://github.com/IjonTichy1970/logalert"
@@ -85,6 +106,27 @@ exclude = ['^\.claude/', '^\.venv/']
 # collection DURATION.
 testpaths = ["tests"]
 addopts = "-ra"
+# Every warning is an error (issue #81). Nothing set this before, so a DeprecationWarning from
+# our code or the stdlib was collected and never reported -- on the two newest legs of the
+# matrix, which are exactly the ones that would warn first about what breaks in 3.15 or 3.16.
+# Measured when it landed: the suite raises not one DeprecationWarning on 3.14.10, and `error`
+# cost exactly one test (tests/test_transport.py's mail_timeout cap, annotated there, where the
+# stdlib leaks a socket when settimeout overflows). The ignore list is therefore EMPTY on
+# purpose: an entry here would hide a warning in every test, so a warning we accept is
+# annotated at its own test with the reason, never broadened to this list.
+#
+# Three things to know when this setting first fails (all from the review that added it):
+#   * A warning raised in a DESTRUCTOR or a daemon thread arrives as pytest's
+#     PytestUnraisableExceptionWarning / PytestUnhandledThreadExceptionWarning and is charged
+#     to whichever test was running, which may not be the one that leaked. Read the repr in
+#     the message before trusting the test name.
+#   * The interpreter is the one axis this project cannot pin, so a new 3.x that deprecates
+#     something in `configparser`, `email`, `smtplib` or `logging.handlers` WILL redden a leg
+#     for a reason that is not ours. Answer it with a per-test annotation, or a module-scoped
+#     `default::DeprecationWarning:<module>`, never with an `ignore` here.
+#   * The next `pytest==` bump sees pytest's own removal notices as errors rather than as
+#     notices. That is the bump commit's work, not a break.
+filterwarnings = ["error"]
 
 [tool.bandit]
 exclude_dirs = [".claude", ".venv", "tests"]

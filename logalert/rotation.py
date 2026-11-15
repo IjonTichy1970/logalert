@@ -71,9 +71,24 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     refuses is never a guess; a cursor without one (0.1.0's, a parked entry from before
     #74) is trusted as before. A truncation
     (``copytruncate``) never looks for the inode: it is the live file's.
-  * The CHAIN: after the matched archive's tail, every archive NEWER than it, oldest first and in
+    In BOTH of the stages that choose among generations -- the copies written since the last
+    run, and the older ones -- two names for one generation (``router.log.1.gz`` beside
+    ``router.log.1.bz2``: the same style and form, and the same age by the rule that orders
+    that style) are settled by reading, not by the directory: the one that READS TO ITS END
+    is taken, and that is decided before a line is yielded, because a cut copy hands over its
+    fragment as it goes and there is nothing left to choose once the read has failed (issue
+    #79). Their stamps may be minutes apart -- a compressor switch writes them at different
+    times -- so the CHAIN is measured from the earliest of them and not from the one that is
+    read (below). A cursor PARKED on a copy is not in that company: it names one copy, and
+    identity decides it as above. A copy passed over for being cut is a WARNING naming it.
+  * The CHAIN: after the matched archive's tail, every archive NEWER than the matched
+    GENERATION, oldest first and in
     full, then the live file from 0. "Newer" is by the style key when every file involved shares
-    a style and by mtime otherwise (announced). A file of unrecognised style joins the chain only
+    a style and by mtime otherwise (announced) -- measured from the EARLIEST of the copies
+    that tie for the match, which is not always the copy read: a copy of another style
+    stamped between two of them is newer than one and older than the other, and measuring
+    from the copy chosen dropped it from the chain in silence (issue #79, review).
+    A file of unrecognised style joins the chain only
     when the match itself is an unrecognised archive OF THIS LOG: a ``router.log.bak`` with a
     fresh mtime must not be mailed as log lines. And the chain keeps to the match's naming
     form, classic or ``extension`` (issue #51): a rotating tool uses one, and a numbered live
@@ -84,7 +99,9 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     both behind it would re-open the sibling case, and a tool that rotates a hand-moved
     file into the extension form is the rarer loss (review).
   * An archive that fails part-way through (a ``.gz`` still being written, a bogus file with an
-    archive's name) yields what it had, a WARNING, and the chain continues. Nothing matching is
+    archive's name) yields what it had, a WARNING, and the chain continues -- unless a copy of
+    its own generation can be read whole, when it is passed over before the read instead, with
+    a WARNING naming it and nothing of it mailed (issue #79). Nothing matching is
     one WARNING naming the file, the saved identity, the directories searched and the likely
     causes; the copies of this log written AFTER the last run are then read in full,
     oldest first (issue #64: they are ours or newer by the rule above, and skipping them
@@ -148,6 +165,7 @@ with logrotate 3.21, the newsyslog and TimedRotatingFileHandler names from their
     finds it by content at that offset.
 """
 
+import contextlib
 import errno
 import logging
 import os
@@ -330,6 +348,31 @@ def newer(a: Archive, b: Archive) -> bool:
     return a.mtime > b.mtime
 
 
+def _ties(a: Archive, b: Archive) -> bool:
+    """Whether these are two names for ONE generation: the same age by the rule that orders
+    their style, and names that agree about what kind of archive they are.
+
+    This is NOT "nothing in the list order separates them". For a recognised style the age
+    is the style KEY, while the list is ordered by mtime as soon as a second style is
+    present -- so two copies of one generation tie here with minutes between their stamps,
+    which is what a compressor switch leaves behind and exactly the pair this exists for.
+    It is also why the chain is measured against the earliest of them and not against the
+    copy that is read: a generation stamped BETWEEN two of them is newer than one and older
+    than the other, and measuring from the copy the preference chose dropped it from the
+    chain without a word (issue #79, review -- this fix's own first pass).
+
+    The style and the naming form have to match as well as the age (issue #79, review).
+    ``newer()`` calls archives of DIFFERENT styles equal whenever their mtimes are equal,
+    which a coarse clock tick, ``cp -p``, ``touch -r`` and tar or rsync preservation all
+    produce -- so without this a ``router.log.bak`` sharing a second with
+    ``router.log.1.gz`` would count as its twin. Preferring it would move the match to an
+    ``other`` style, which widens the chain to files that are not copies of this log: the
+    one shape in which this could mail MORE than before, and the thing the module docstring
+    forbids by name."""
+    return (a.style == b.style and a.ext_form == b.ext_form
+            and not newer(a, b) and not newer(b, a))
+
+
 def _oldest_first(archives: list[Archive],
                   prefer: tuple[int, int] | None = None) -> list[Archive]:
     """Oldest first: by the style key when every archive shares a recognised style, else by
@@ -337,11 +380,27 @@ def _oldest_first(archives: list[Archive],
     tie the archive with the identity ``prefer`` (the saved one) comes first: a numbered
     live sibling in the extension form (``worker.1.log``) ties with ``worker.log.1`` and
     with a shared first line was taken as the match on a filesystem that lists it first
-    (issue #51, review); a secondary key only, so ext4's inode reuse gains nothing."""
+    (issue #51, review); a secondary key only, so ext4's inode reuse gains nothing.
+
+    The path is the LAST component of both keys, which makes the order total (issue #79):
+    ``router.log.1.gz`` beside ``router.log.1.bz2`` ties on every earlier component, and
+    without it ``os.scandir``'s order decided the match -- NTFS and the sandbox list the
+    ``.bz2`` first, ext4 the ``.gz``, so the same directory gave two different answers and
+    only CI saw the second. Being total it also settles the two sorts layered on this one
+    (the same-second set below, and the chain), since Python's sort is stable.
+
+    In the mtime branch the style key comes BEFORE the path, because a name is no guide to
+    age: ``router.log.1.gz`` and ``router.log.2.gz`` stamped inside one second sort ``.1``
+    first by name while ``.1`` is the NEWER generation, so it was taken as "the oldest that
+    fits" and ``.2``'s lines were dropped without a word -- a coin toss on ext4 before this,
+    which making the order total would have frozen (issue #79, review). That component
+    compares two archives of one style; across styles neither it nor the path claims
+    anything beyond a stable total order (the directory name included, where an
+    ``archive_dir`` puts two copies in different directories)."""
     styles = {a.style for a in archives}
     if len(styles) == 1 and "other" not in styles:
-        return sorted(archives, key=lambda a: (a.key, (a.ino, a.dev) != prefer))
-    return sorted(archives, key=lambda a: a.mtime)
+        return sorted(archives, key=lambda a: (a.key, (a.ino, a.dev) != prefer, a.path))
+    return sorted(archives, key=lambda a: (a.mtime, a.style, a.key, a.path))
 
 
 def _rank(archive: Archive) -> int:
@@ -516,6 +575,88 @@ def _content_matches(section: str, path: str, archive: Archive, saved: Cursor, *
         raise
 
 
+def _reads_to_its_end(archive: Archive) -> bool:
+    """Whether the whole archive decompresses, end-of-stream marker included (issue #79).
+
+    Asked of the candidates that TIE for one generation, before anything is yielded, and
+    that timing is the point: a cut archive hands over everything it decompressed before it
+    raises (``cursor.py``'s ``read1`` rule, measured for gz, bz2, xz and zst), so by the
+    time the read fails the fragment has already been matched and put in the report and
+    cannot be un-mailed. A retry afterwards -- what issue #79 first asked for -- cannot
+    work for that reason.
+
+    An uncompressed copy answers True without reading: there is no end-of-stream marker to
+    be missing, and a short one was already refused against the saved offset. A compressed
+    one is decompressed in full, which is the cost the tie buys and only a tie pays -- so
+    issue #46's "once, not three times" becomes twice for a tie, deliberately (the owner's
+    call: a tie is rare and the alternative is silent line loss).
+
+    A copy that cannot be opened or read answers False, and so does one that is no longer
+    the file the scan saw -- renamed on, compressed away (``FileNotFoundError`` is an
+    ``OSError``), or a NEW inode under the same name after a rotation landed mid-run, which
+    is the identity check every other read in this module makes before trusting a handle
+    (issue #46's rule; the window is issue #32's). It costs that copy the preference and
+    nothing else, since the copy that IS read was verified through its own open handle. The
+    warning's "cannot be read to its end" is literally true of all of them, a permission or
+    a device error included; which one it was is not worth a second message here."""
+    if not archive.compressed:
+        return True
+    try:
+        handle = open_log(archive.path)
+    except _READ_ERRORS:
+        return False
+    try:
+        st = os.fstat(handle.fileno())
+        if (st.st_ino, st.st_dev) != (archive.ino, archive.dev):
+            return False  # a different file under that name now: not this copy's answer
+        while handle.read1(65536):
+            pass
+    except _READ_ERRORS:
+        return False
+    finally:
+        handle.close()
+    return True
+
+
+def _best_of(section: str, path: str, fitting: list[Archive]) -> tuple[Archive, Archive]:
+    """Which of several copies of one generation to READ, when they all fit (issue #79) --
+    the first that reads to its end, decided HERE, before a line is yielded -- and which of
+    them the CHAIN is measured against: the earliest stamped, whichever one is read.
+
+    One candidate is the ordinary case and pays nothing: no copy is decompressed and
+    nothing is logged. A tie logs one INFO naming the copies -- two of them usually mean the
+    rotation configuration changed, which the operator wants to know -- and a copy passed
+    over for being cut is a WARNING naming it, so the module's promise that a corrupt
+    archive is never silent is kept even though that copy is no longer read.
+
+    The two answers differ because a copy of ANOTHER style can be stamped between two
+    copies of this generation: measuring the chain from the copy the preference chose made
+    it older than the match and dropped it, silently (review). The earliest keeps it in,
+    which is both 0.1.1's answer and the side this module errs on -- a line read twice is a
+    nuisance, a line never read is the bug this issue is."""
+    if len(fitting) < 2:
+        return fitting[0], fitting[0]
+    intact: Archive | None = None
+    cut: list[Archive] = []
+    for candidate in fitting:
+        if _reads_to_its_end(candidate):
+            intact = candidate
+            break
+        cut.append(candidate)
+    chosen = intact if intact is not None else fitting[0]
+    log.info("[%s] %s: %d rotated copies of one generation fit the saved position (%s); "
+             "reading %s", section, path, len(fitting),
+             ", ".join(os.path.basename(a.path) for a in fitting),
+             os.path.basename(chosen.path))
+    if cut:
+        log.warning("[%s] %s: %s cannot be read to its end; %s", section, path,
+                    ", ".join(os.path.basename(a.path) for a in cut),
+                    f"reading {os.path.basename(chosen.path)} instead, which can"
+                    if intact is not None
+                    else "no copy of that generation can, so the lines past the cut are lost")
+    return chosen, min(fitting, key=lambda a: a.mtime)
+
+
 def _anchored(tail: bytes, saved: Cursor) -> bool:
     """Whether the bytes before the offset are the ones the position was taken in (issue
     #74): the saved anchor against the last ``ANCHOR_CAP`` of the kept tail -- the same
@@ -575,6 +716,18 @@ class Verified:
         self.handle.close()
 
 
+def _release(kept: dict[str, Verified]) -> None:
+    """Close the fits that were not chosen -- every one of them. A tie is the first time
+    this module holds more than one verified handle (issue #79, review): before it the loop
+    could hold at most one entry and so could not abort part-way, and now a ``close()`` that
+    raises would leak every handle behind it. Only a device error raises there, and these are
+    read-only handles already finished with, so there is nothing to report and nothing to
+    abort for."""
+    for leftover in kept.values():
+        with contextlib.suppress(OSError):
+            leftover.close()
+
+
 Fits = Callable[[Archive], bool]
 
 
@@ -604,6 +757,9 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
     kept: dict[str, Verified] = {}
     everything: list[Archive] = []
     archives: list[Archive] = []
+    measured: Archive | None = None  # the EARLIEST copy of the matched generation, which is
+    #   what the chain is measured against and is not always the copy that is read (issue
+    #   #79): None until a stage settles a tie, and then the match is its own generation
 
     def fits(archive: Archive, *, by_content: bool) -> bool:
         nonlocal denied
@@ -646,7 +802,9 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
 
     def stages() -> None:
         """The stages over the last listing: the parked copy by its mtime (issue #65), then
-        the three of #8; sets ``plan.match`` (and ``plan.stage`` for the first)."""
+        the three of #8; sets ``plan.match`` (and ``plan.stage`` for the first), and
+        ``measured`` where a tie was settled."""
+        nonlocal measured
         since = parse_timestamp(saved.last_seen).timestamp() - _SLACK
         recent = _oldest_first([a for a in archives if a.mtime >= since],
                                prefer=(saved.ino, saved.dev))
@@ -673,7 +831,18 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
                 #         caller lists again; the other stages over this listing would
                 #         guess (review: the banner rival, mid-line)
         if plan.match is None and saved.fingerprint is not None:
-            plan.match = next((a for a in recent if fits(a, by_content=True)), None)
+            for index, archive in enumerate(recent):
+                if fits(archive, by_content=True):
+                    # The copies AFTER it that are the same generation under another name
+                    # -- router.log.1.gz beside router.log.1.bz2 -- are the ones the order
+                    # cannot tell apart, so which was read used to be the listing order's
+                    # answer (issue #79). Everything before it has already failed to fit,
+                    # and _ties costs no read, so the ordinary case pays nothing for this.
+                    tied = [a for a in recent[index + 1:] if _ties(a, archive)]
+                    plan.match, measured = _best_of(section, path,
+                                                    [archive, *(a for a in tied
+                                                                if fits(a, by_content=True))])
+                    break
         if plan.match is None and verdict != "truncated":  # a truncated file kept its inode
             for archive in everything:
                 if (archive.ino, archive.dev) != (saved.ino, saved.dev):
@@ -684,8 +853,10 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
                     plan.match = archive
                     break
         if plan.match is None and saved.fingerprint is not None:
-            plan.match = _newest_older_fit(section, path, older, saved,
-                                           lambda a: fits(a, by_content=True))
+            found = _newest_older_fit(section, path, older, saved,
+                                      lambda a: fits(a, by_content=True))
+            if found is not None:
+                plan.match, measured = found
 
     try:
         listing = scan()
@@ -700,8 +871,7 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
                          "rotation during the run); scanning again", section, path)
                 stages()
         if plan.match is None:
-            for leftover in kept.values():
-                leftover.close()
+            _release(kept)
             plan.chain = _written_since(section, path, archives, unreadable, saved)  # #64
             _nothing_matched(section, path, saved, verdict, directories, renamed=bool(renamed),
                              unreadable=denied, unsearchable=unsearchable,
@@ -715,9 +885,11 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
                                                                           saved.dev) \
                 else "content"
         match = plan.match
+        if measured is None:
+            measured = match  # no tie was settled: one copy is its own generation
         later = [a for a in archives
                  if a.path != match.path and (a.path, a.ino, a.dev) not in unreadable
-                 and newer(a, match)
+                 and newer(a, measured)
                  and (a.style != "other" or (match.style == "other" and match.of_log))]
         other_form = [a for a in later if a.ext_form != match.ext_form]  # issue #51
         if other_form:
@@ -737,12 +909,11 @@ def plan_catch_up(section: str, path: str, saved: Cursor, verdict: Verdict | Non
         log.info("[%s] %s: found the saved position by %s; reading %s%s", section, path, plan.stage,
                  ", then ".join(steps), ", then the live file" if verdict is not None else "")
         plan.verified = kept.pop(plan.match.path, None)  # last: kept until here, see except
-        for leftover in kept.values():  # a fit that was not chosen (none today)
-            leftover.close()
+        _release(kept)  # a fit that was not chosen: the tied copies of one generation the
+        #                content stage verified (issue #79)
         return plan
     except BaseException:  # a KeyboardInterrupt between a fit and the return (review)
-        for leftover in kept.values():
-            leftover.close()
+        _release(kept)
         raise
 
 
@@ -800,21 +971,29 @@ def _named(target: str, real: str) -> str:
 
 
 def _newest_older_fit(section: str, path: str, older: list[Archive], saved: Cursor,
-                      fits: Fits) -> Archive | None:
+                      fits: Fits) -> tuple[Archive, Archive] | None:
     """The last resort: among the archives written BEFORE the last run, newest first, the
     first that fits -- a guess when an older one shares the first line and the cursor has
     no anchor to settle it by (issue #74: with one, the bytes decided), and said so. Every
     archive tried costs a fingerprint read; a fitting one costs a seek to the saved offset.
+
+    This stage ties exactly as the one over the copies written since the last run does, and
+    answers it the same way (issue #79, review): the total order made a tie here settle the
+    same on every filesystem, which turned a coin toss into a standing answer -- so without
+    the preference a cut copy that sorts first would have won every run.
     """
     for index, archive in enumerate(older):
         if fits(archive):
+            tied = [a for a in older[index + 1:] if _ties(a, archive)]
+            chosen, measured = _best_of(section, path,
+                                        [archive, *(a for a in tied if fits(a))])
             rivals = ([] if saved.anchor is not None
                       else [a for a in older[index + 1:] if _same_first_line(a, saved)])
             if rivals:
                 log.warning("[%s] %s: %d older rotated copies share the saved first line; "
                             "taking the newest that is long enough, %s, which is a guess",
-                            section, path, len(rivals) + 1, os.path.basename(archive.path))
-            return archive
+                            section, path, len(rivals) + 1, os.path.basename(chosen.path))
+            return chosen, measured
     return None
 
 

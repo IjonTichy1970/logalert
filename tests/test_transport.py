@@ -6,6 +6,7 @@ Windows, a shebang copy on POSIX -- for the end-to-end paths) and ``esmtp_stub.p
 127.0.0.1 port 0. Real on both platforms; the one POSIX-only test says so.
 """
 
+import gc
 import getpass
 import json
 import logging
@@ -294,19 +295,47 @@ def test_every_recipient_refused_is_a_failure_naming_each(tmp_path: Path) -> Non
 
 @pytest.mark.parametrize("stub, expected", [
     (StubConfig(data_code=552), "SMTPDataError: 552 5.3.4 Error: message rejected by stub"),
-    (StubConfig(drop_on="MAIL"), "SMTPServerDisconnected: Connection unexpectedly closed"),
     (StubConfig(replies={"MAIL": "421 4.3.2 Service shutting down"}),
      "SMTPSenderRefused: 421 4.3.2 Service shutting down"),
     (StubConfig(replies={"EHLO": "500 5.5.2 no", "HELO": "500 5.5.2 no"}),
      "SMTPHeloError: 500 5.5.2 no"),
 ])
 def test_server_failures_are_named_by_type_and_reply(stub: StubConfig, expected: str) -> None:
+    """Every reply here is OUR stub's, so it is pinned whole. The dropped-connection case
+    left this list in issue #84: there is no reply to name there, only smtplib's own
+    sentence, and it has its own test below."""
     with run_stub(stub) as server:
         with pytest.raises(DeliveryError) as exc:
             via_smtp(dotted_mail(), "127.0.0.1", server.port, starttls=False,
                      local_hostname="router1.example.net", timeout=5)
         server.wait_idle()
     assert str(exc.value).startswith(expected)
+
+
+def test_a_dropped_connection_is_named_by_type_and_still_carries_a_reason() -> None:
+    """A server that hangs up mid-session leaves no reply to name, so everything after the
+    type is smtplib's own sentence -- not ours to pin (issue #84): a reword upstream must
+    not redden a run in which logalert behaved exactly as promised.
+
+    What IS ours is that there is a reason there at all, and the type prefix alone did not
+    say it. Review mutated the wrap to `f"{type(exc).__name__}: "` -- every SMTP failure
+    reduced to a bare type name, the cause gone -- and all 958 tests stayed green, where the
+    sentence this used to pin had caught it. `via_sendmail` has carried a named test for
+    that same mutation all along ("the OSError reason dropped"); this is the smtp side's.
+
+    Stated boundary: this prefix admits smtplib's other `SMTPServerDisconnected` sentences,
+    and two of them ("please run connect() first", "Server not connected") would mean
+    logalert handed it a dead session -- OUR bug, not a server drop. Review measured that
+    the suite catches that shape elsewhere (dropping the host from the constructor reddens
+    20 tests), so it is a site-level loss, taken knowingly."""
+    with run_stub(StubConfig(drop_on="MAIL")) as server:
+        with pytest.raises(DeliveryError) as exc:
+            via_smtp(dotted_mail(), "127.0.0.1", server.port, starttls=False,
+                     local_hostname="router1.example.net", timeout=5)
+        server.wait_idle()
+    said = str(exc.value)
+    assert said.startswith("SMTPServerDisconnected: ")
+    assert said[len("SMTPServerDisconnected: "):].strip(), said  # a reason, whatever it says
 
 
 def test_a_silent_server_is_bounded_by_the_timeout() -> None:
@@ -316,9 +345,89 @@ def test_a_silent_server_is_bounded_by_the_timeout() -> None:
             via_smtp(dotted_mail(), "127.0.0.1", server.port, starttls=False,
                      local_hostname="router1.example.net", timeout=1)
     assert 0.9 < time.monotonic() - started < 4
-    assert str(exc.value) == ("no reply within 1 s (SMTPServerDisconnected: Connection unexpectedly"
-                              " closed: timed out); a message the server had read at DATA may"
-                              " still be delivered")
+    # OUR sentence either side of smtplib's clause, which is only a prefix: the bound, the
+    # type and both halves of what we wrote are the contract; the stdlib's wording between
+    # them is not (issue #84). The clause itself must not be EMPTY, though -- that is the
+    # reason the operator gets, and asserting only the two ends let it vanish (review).
+    opened = "no reply within 1 s (SMTPServerDisconnected: "
+    closed = "); a message the server had read at DATA may still be delivered"
+    said = str(exc.value)
+    assert said.startswith(opened) and said.endswith(closed), said
+    assert said[len(opened):-len(closed)].strip(), said
+
+
+def test_a_transport_error_with_control_characters_is_one_clean_line(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This module promises that what a server or a child says is ONE sanitised line before
+    it reaches the log, the error or the console. Two of the three calls that keep that
+    promise were tested -- a multi-line reply, and the sendmail child's first line -- and
+    the third, the `except OSError` branch that wraps a dropped or timed-out session, was
+    pinned by nothing: dropping its `clean_header` left all 958 tests green (issue #84,
+    review).
+
+    No stub can make smtplib raise an `OSError` carrying a newline, so the raise is staged
+    where that branch sees it, with the monkeypatch device the context spy below uses."""
+    def explode(self: smtplib.SMTP, *args: object, **kwargs: object) -> None:
+        raise OSError("first line" + chr(13) + chr(10) + "second" + chr(9) + "line ")
+
+    monkeypatch.setattr(smtplib.SMTP, "sendmail", explode)
+    with run_stub() as server:
+        with pytest.raises(DeliveryError) as exc:
+            via_smtp(dotted_mail(), "127.0.0.1", server.port, starttls=False,
+                     local_hostname="router1.example.net", timeout=5)
+    assert str(exc.value) == "OSError: first line second line"  # one line, no CR, no tab
+
+
+def test_a_connect_timeout_says_the_message_may_still_be_delivered(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The timeout sentence is chosen by two tests OR'd together, and only one scenario in
+    the suite reached that line -- the silent server below, where BOTH are true, so review
+    could delete either one with all 958 tests green (issue #84). This is the scenario that
+    needs the substring half: a connect that times out raises `TimeoutError("timed out")`
+    with NO `__context__` (measured through a real connect to a non-routable address), so
+    `isinstance(exc.__context__, TimeoutError)` is False and the words are all there is.
+
+    Staged rather than dialled, to keep the suite off the network: the shape is the measured
+    one. Without that half the operator loses "a message the server had read at DATA may
+    still be delivered" -- the sentence that tells them not to assume non-delivery."""
+    def never_connects(*args: object, **kwargs: object) -> smtplib.SMTP:
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(smtplib, "SMTP", never_connects)
+    with pytest.raises(DeliveryError) as exc:
+        via_smtp(dotted_mail(), "192.0.2.1", 25, starttls=False,
+                 local_hostname="router1.example.net", timeout=1)
+    assert str(exc.value) == ("no reply within 1 s (TimeoutError: timed out); a message the "
+                              "server had read at DATA may still be delivered")
+
+
+def test_a_timeout_while_sending_says_the_message_may_still_be_delivered(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the same classifier, and the other real scenario: a socket timeout
+    inside `sendmail` surfaces as `SMTPServerDisconnected("Server not connected")`, whose
+    words say nothing about a timeout but whose `__context__` is the `TimeoutError`. So the
+    `isinstance` half is what decides here, and without it this reads as a plain
+    disconnection -- when the server may well have taken the message (issue #84, review).
+
+    `from None` keeps `__context__` and only suppresses its display, measured -- which is
+    what lets the raise satisfy both the classifier and ruff's B904."""
+    def drop(self: smtplib.SMTP, *args: object, **kwargs: object) -> None:
+        try:
+            raise TimeoutError("timed out")  # the socket's, from inside smtplib
+        except TimeoutError:
+            raise smtplib.SMTPServerDisconnected("Server not connected") from None
+
+    monkeypatch.setattr(smtplib.SMTP, "sendmail", drop)
+    with run_stub() as server:
+        with pytest.raises(DeliveryError) as exc:
+            via_smtp(dotted_mail(), "127.0.0.1", server.port, starttls=False,
+                     local_hostname="router1.example.net", timeout=2)
+    assert str(exc.value) == ("no reply within 2 s (SMTPServerDisconnected: Server not "
+                              "connected); a message the server had read at DATA may still "
+                              "be delivered")
 
 
 def test_nothing_listening_is_a_connection_error() -> None:
@@ -332,12 +441,26 @@ def test_nothing_listening_is_a_connection_error() -> None:
 
 
 def test_starttls_against_a_server_that_does_not_offer_it_is_loud(tmp_path: Path) -> None:
+    """`smtp_starttls = yes` against a server that does not advertise it never sends: the
+    failure is named by its type, a reason follows it, and nothing reaches MAIL. The type
+    prefix is the assertion, as at the SSL handshake and the context spy below -- smtplib's
+    sentence after it was the whole assertion until issue #84, and a reword upstream would
+    have reddened a run in which logalert behaved exactly as promised.
+
+    Stated boundary: `SMTPNotSupportedError` carries three other sentences in 3.12's
+    smtplib, and the SMTPUTF8 one is raised BEFORE `MAIL` goes out, so the verbs assertion
+    below could not tell it apart (review). Unreachable today -- logalert calls only
+    `SMTP()`, `starttls()` and `sendmail()` -- but it is what to re-read if a
+    `mail_options` ever appears."""
     with run_stub() as server:
         config = smtp_settings(tmp_path, server.port, "smtp_starttls = yes\n")
         with pytest.raises(DeliveryError) as exc:
             deliver(dotted_mail(), config.settings)
         server.wait_idle()
-    assert str(exc.value) == "SMTPNotSupportedError: STARTTLS extension not supported by server."
+    said = str(exc.value)
+    assert said.startswith("SMTPNotSupportedError: ")
+    assert said[len("SMTPNotSupportedError: "):].strip(), said  # the sentence is smtplib's;
+    #                                                             that there IS one is ours
     assert "MAIL" not in server.verbs() and server.data == []
 
 
@@ -570,6 +693,18 @@ def test_a_421_mid_rcpt_names_the_recipients_never_tried(tmp_path: Path) -> None
     assert server.data == []
 
 
+# The ONE warning this suite accepts (issue #81, which made every warning an error). The
+# unusable timeout below leaks a socket, and the leak is the stdlib's: socket.create_connection
+# makes the socket, settimeout raises OverflowError, and the cleanup there closes only on
+# OSError. No operator can reach it -- the loader caps mail_timeout at 3600 s, which the first
+# assertion pins -- and this test exists to prove the cap plus the message. Annotated here
+# rather than in pyproject.toml: an entry there would hide unclosed sockets in every test.
+# The pattern, not the bare category, so the comment above is machine-checked: nothing else
+# unclosed passes quietly. The socket is reachable only through the OverflowError's traceback,
+# so the gc.collect() at the end of the test keeps its collection INSIDE this annotation --
+# without it a future reference cycle would move the destructor to a later test, where the
+# warning becomes that test's error and names the wrong culprit (review).
+@pytest.mark.filterwarnings("ignore:unclosed <socket:ResourceWarning")
 def test_mail_timeout_is_capped_by_the_loader_and_an_unusable_one_is_named(
         tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="mail_timeout: must be at most 3600 seconds"):
@@ -581,6 +716,9 @@ def test_mail_timeout_is_capped_by_the_loader_and_an_unusable_one_is_named(
         with pytest.raises(DeliveryError, match="^mail_timeout 1e\\+300 s is not usable here: "):
             via_smtp(dotted_mail(), "127.0.0.1", server.port, starttls=False,
                      local_hostname="router1.example.net", timeout=1e300)
+    # the stdlib's unclosed socket is collected HERE, inside this test's ignore (see above);
+    # the same deterministic window test_rotation.py's handle-leak check uses
+    gc.collect()
 
 
 def test_exit_0_with_stderr_is_kept_in_the_answer_and_warned(

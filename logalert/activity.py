@@ -41,8 +41,13 @@ the records themselves are emitted by the other modules on the ``logalert.*`` lo
     check is ``ENXIO`` at once (issue #29; a FIFO with no reader blocks ``open(2)`` for good,
     before the lock, so cron runs would pile up); a state file, the run lock or the config file
     is refused by the loader and by ``--log``. ``udp:`` is built only when configured -- a
-    datagram to a port nobody listens on is silent forever, the "logs nowhere" fault -- and an
-    unresolvable host raises at construction; ``udp:[2001:db8::1]:514`` is the IPv6 spelling.
+    datagram to a port nobody listens on is silent forever, the "logs nowhere" fault. Its host
+    is resolved HERE, within ``RESOLVE_TIMEOUT``, and the handler is handed the numeric address
+    (issues #80 and #82): the stdlib resolves inside the handler's constructor, swallows the
+    failure on 3.13+ and resolves again for every record, so both the resolver's warning and
+    the lookup's bound have to be ours. A lookup that outlasts the bound is the loud fallback
+    below, exactly like a name that cannot be resolved at all -- the bound caps the wait, not
+    the resolver. ``udp:[2001:db8::1]:514`` is the IPv6 spelling.
   * The fallback is ALWAYS stderr and ALWAYS loud: when the destination cannot be used, the
     first record on stderr is one WARNING naming what was tried, and the run goes on with its
     exit code unchanged (cron mails that line, which is the point). A destination that fails
@@ -72,6 +77,7 @@ import os
 import socket
 import stat
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -88,6 +94,12 @@ LOGGER = "logalert"
 SYSLOG_SOCKETS = ("/dev/log", "/var/run/log", "/var/run/syslog")
 SYSLOG_SEND_TIMEOUT = 2.0  # seconds per send on the Unix socket (issue #35); a healthy daemon
 #                            drains a local socket in microseconds
+RESOLVE_TIMEOUT = 2.0  # seconds for a udp: host's name lookup (issues #80, #82). A working
+#                        resolver answers in milliseconds, and raising the bound buys nothing:
+#                        the realistic degraded case -- one dead nameserver ahead of a working
+#                        one -- measured 10.4 s, because each address family waits out its own
+#                        timeout:, so paying 5 s to fall back the same way is strictly worse
+#                        than falling back at 2 s and saying so. The run is a cron tick
 IDENT = f"logalert[{os.getpid()}]: "
 
 _LEVEL_WORDS = {logging.DEBUG: "debug: ", logging.INFO: "", logging.WARNING: "warning: ",
@@ -273,6 +285,67 @@ def describe(spec: str) -> str:
     return f"syslog ({probe.found[0]})"
 
 
+def _addresses(host: str, port: int) -> list[tuple[str, int]]:
+    """``(numeric host, port)`` for every address the name resolves to, in the order the
+    stdlib would have seen them. A host that is already an address literal answers itself
+    without a lookup: ``AI_NUMERICHOST`` forbids one, so the common ``udp:192.0.2.1:514``
+    costs two local parses of the same string and can never stall."""
+    try:
+        socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM, flags=socket.AI_NUMERICHOST)
+    except socket.gaierror:
+        pass  # a name, not a literal: it has to be looked up
+    else:
+        return [(host, port)]
+    found = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
+    # str(): typeshed spells a sockaddr across the families, so its first element is a union
+    # there even though every family in play puts the numeric host in it
+    return [(str(info[4][0]), port) for info in found]
+
+
+def _resolved(spec: str, host: str, port: int) -> tuple[list[tuple[str, int]], str | None]:
+    """The addresses of a ``udp:`` destination within ``RESOLVE_TIMEOUT``, or the one warning
+    the fallback logs.
+
+    Ours rather than the stdlib's, for two measured reasons. ``SysLogHandler`` resolves inside
+    its constructor, and 3.13 and 3.14 SWALLOW the ``socket.gaierror`` it raises (issue #80):
+    the resolver warning below was dead code there, the failure surfaced on the first record
+    as the generic one, and ``emit``'s reconnect seam then resolved all over again -- 20.02 s
+    twice, measured, both before the lock, because the first record of a run comes before it.
+    And nothing bounded the lookup at all (issue #82): two unreachable nameservers cost
+    20.02 s per run with nothing logged to say where the time went, which is how cron ticks
+    pile up. ``socket.setdefaulttimeout`` does not reach ``getaddrinfo`` and a ``SIGALRM``
+    does not interrupt it (both measured; the signal arrived only when the call returned, and
+    raising from the handler landed inside the ``except`` below), so the bound is a thread we
+    abandon. It is a daemon: a process that exits while it is still in the resolver exits 0
+    with nothing on stderr, measured on 3.12.3, 3.13.18 and 3.14.10."""
+    answer: list[list[tuple[str, int]]] = []
+    failure: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            answer.append(_addresses(host, port))
+        except Exception as exc:
+            # Broad on purpose, and wider than the lookup's own errors (gaierror and herror
+            # are OSError; a host no IDNA encoder will take is UnicodeError). This thread is
+            # ABANDONED at the bound, so anything escaping it reaches threading.excepthook
+            # after _resolved has returned -- a traceback landing between the run's records,
+            # against this module's one-WARNING rule, and in cron's mail. BaseException is
+            # not caught: a KeyboardInterrupt or SystemExit here is not ours to swallow.
+            failure.append(exc)
+
+    worker = threading.Thread(target=work, name="logalert-resolve", daemon=True)
+    worker.start()
+    worker.join(RESOLVE_TIMEOUT)
+    if answer:
+        if answer[0]:
+            return answer[0], None
+        return [], f"{spec}: cannot resolve the host (no addresses); logging to stderr"
+    if failure:
+        return [], f"{spec}: cannot resolve the host ({failure[0]}); logging to stderr"
+    return [], (f"{spec}: cannot resolve the host (no answer within {RESOLVE_TIMEOUT:g} s); "
+                f"logging to stderr")
+
+
 def _open(spec: str) -> tuple[_Loud | None, str | None]:
     """The handler for a destination, or ``None`` and the one warning the fallback logs."""
     if spec == "syslog":
@@ -293,13 +366,21 @@ def _open(spec: str) -> tuple[_Loud | None, str | None]:
         handler.where = spec
         handler.setFormatter(OneLine(IDENT, stamp=True))
         return handler, None
-    # udp:host:port, validated by the loader; built here and nowhere else
-    try:
-        return _syslog(_Syslog(address=udp_address(spec)), spec), None
-    except socket.gaierror as exc:
-        return None, f"{spec}: cannot resolve the host ({exc}); logging to stderr"
-    except OSError as exc:
-        return None, f"{spec}: cannot open ({exc}); logging to stderr"
+    # udp:host:port, validated by the loader; built here and nowhere else. The host is
+    # resolved by us first (issues #80, #82) and the handler is given the NUMERIC address:
+    # emit sends with sendto(msg, self.address), so a name there would be resolved again for
+    # every record, and the reconnect seam would stall on each one.
+    host, port = udp_address(spec)
+    addresses, failure = _resolved(spec, host, port)
+    if failure is not None:
+        return None, failure
+    opened: OSError | None = None
+    for address in addresses:  # the stdlib's own loop over the addresses, kept: a first
+        try:  #                  address whose family the host cannot make is not the end
+            return _syslog(_Syslog(address=address), spec), None
+        except OSError as exc:
+            opened = exc
+    return None, f"{spec}: cannot open ({opened}); logging to stderr"
 
 
 def _syslog(handler: _Syslog, where: str) -> _Syslog:

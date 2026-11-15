@@ -219,14 +219,36 @@ def test_the_minimum_watch_install_names_loads(tmp_path: Path) -> None:
 
 def test_the_dev_venv_extras_are_spelled_alike_everywhere() -> None:
     """One command, four documents: README.md, INSTALL.md, CLAUDE.md and ci.yml install the
-    same extras (the review found `.[dev]` surviving in three of them after `docs` arrived)."""
+    same extras (the review found `.[dev]` surviving in three of them after `docs` arrived).
+    The Pages and release workflows joined the list with #81, which made them install their
+    tools from the pinned extras instead of resolving a bare `pytest` and a bare `build`."""
     seen: dict[str, set[str]] = {}
     for name in ("README.md", "INSTALL.md", "CLAUDE.md", ".github/workflows/ci.yml",
+                 ".github/workflows/pages.yml", ".github/workflows/release.yml",
                  "tools/gate.sh"):
         found = set(re.findall(r'pip install -e "(\.\[[a-z,]+\])"', _text(name)))
         assert found, f"{name} does not spell the editable install"
         seen[name] = found
     assert all(found == {".[dev,docs]"} for found in seen.values()), seen
+
+
+def test_every_gate_tool_is_pinned_exactly() -> None:
+    """Issue #81: the gate is the only definition of green, so what it runs may not be
+    whatever pip resolved that day -- `mypy` 2.4.1 is an INTERNAL ERROR on 3.14.10 where the
+    pinned 2.3.1 passes, so CI's 3.14 leg could not pass for a reason that was not ours. This
+    asserts the SHAPE (every entry exact), never the versions: a bump stays one edit in
+    `pyproject.toml`, and this file does not become a second place they live."""
+    with open(REPO_ROOT / "pyproject.toml", "rb") as handle:
+        extras = tomllib.load(handle)["project"]["optional-dependencies"]
+    assert {"dev", "docs"} <= set(extras), sorted(extras)  # a third extra is pinned too
+    for name, entries in sorted(extras.items()):
+        assert entries, name
+        for entry in entries:
+            # One `==` and a version after it. `>=`, `~=`, a bare name, whitespace, an
+            # extras marker and an environment marker all fail -- and so does a PEP 440
+            # PREFIX pin: `mypy==2.*` resolves 2.4.1, the release this test exists to keep
+            # out, so `*` is not in the version class (review measured the hole).
+            assert re.fullmatch(r"[A-Za-z0-9._-]+==[A-Za-z0-9.+!-]+", entry), (name, entry)
 
 
 def test_install_says_what_the_timeout_is_for_and_which_hardening_breaks_the_mail_path() -> None:

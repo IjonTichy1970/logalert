@@ -5,11 +5,16 @@ helpers -- each one rule, written once. pytest loads this module before any test
 rootdir import the tree has always used between test modules (no ``__init__.py``; pytest's
 default import mode puts ``tests/`` on ``sys.path``). Gated Python: ASCII, ruff, mypy strict."""
 
+import bz2
 import errno
+import gzip
+import importlib
 import json
+import lzma
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -235,6 +240,43 @@ def fences(text: str, info: str) -> list[str]:
 
 def texts(lines: list[Line]) -> list[str]:
     return [line.text for line in lines]
+
+
+def zstd_module() -> Any:
+    """``compression.zstd``, or the right verdict when it is absent (issue #83).
+
+    Below 3.14 the module does not exist and the caller SKIPS, naming 3.14. On 3.14 a
+    missing one is a FAILURE, never a skip: every ``.zst`` read path in the suite runs
+    there and nowhere else, so a skip would leave them measured on no host at all, and
+    could-not-check is never a pass (issue #42). The sandbox's `/srv/logalert-py314` and
+    CI's 3.14 leg are where these execute."""
+    try:
+        return importlib.import_module("compression.zstd")
+    except ImportError:
+        if sys.version_info >= (3, 14):
+            pytest.fail("compression.zstd is missing on this 3.14 build: the .zst read "
+                        "paths would be measured nowhere (issue #42: could-not-check is "
+                        "never a pass)", pytrace=False)
+        pytest.skip("reading .zst needs Python 3.14+ with compression.zstd (issue #83)")
+
+
+def packer(suffix: str) -> Callable[[bytes], bytes]:
+    """The compressor for one archive suffix, so a test can be parametrised over
+    ``COMPRESSED_SUFFIXES`` itself and a format cannot be quietly left out of one (issue
+    #83: every ``.zst`` read but a clean one from offset 0 was unmeasured). A suffix with no
+    entry here is a ``KeyError``, which is the loud failure that wants to happen.
+
+    Call it from inside a test body only: for ``.zst`` it can raise ``Skipped``, and a
+    fixture built at import or collection time would get "Using pytest.skip outside of a
+    test is not allowed" instead of a skip (review -- every call site is a test body today).
+    """
+    if suffix == ".zst":
+        compress: Callable[[bytes], bytes] = zstd_module().compress
+        return compress
+    packers: dict[str, Callable[[bytes], bytes]] = {  # annotated: the three have different
+        ".gz": gzip.compress, ".bz2": bz2.compress, ".xz": lzma.compress,  # signatures and
+    }  # mypy joins them to `function` without it
+    return packers[suffix]
 
 
 def open_log_file(section: str, path: str, saved: Cursor | None, *,

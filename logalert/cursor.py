@@ -369,9 +369,18 @@ def _read_up_to(handle: BinaryStream, size: int) -> bytes:
     """Up to ``size`` bytes, keeping what a cut archive yields before it fails.
 
     ``read()`` on a decompressor raises before handing over the bytes it did decompress;
-    ``read1()`` hands them over first (measured for gz, bz2, xz), and a stream error on a
-    later call ends the read with what came through. The caller sees the error when it
-    reads the file itself.
+    ``read1()`` hands them over first (measured for gz, bz2, xz and zst), and a stream
+    error on a later call ends the read with what came through. The caller sees the error
+    when it reads the file itself.
+
+    How MUCH comes through is the compressor's business, not ours, and zstd is the outlier
+    (measured on 3.14.10, issue #83). A 28-byte payload cut by six bytes: gz, bz2 and xz
+    handed over all 28, zst 22 of them, ending MID-LINE. The same cut on a 6 KB payload:
+    the first three handed over everything, zst NOTHING AT ALL -- a truncated compressed
+    block cannot be decompressed, where a small payload's stored-raw one can. So a cut
+    ``.zst`` usually loses the whole archive rather than its tail, and where it does hand
+    bytes over they can stop inside a line. Nothing downstream may assume otherwise; what
+    keeps that fragment out of the report is that the reader yields complete lines only.
     """
     parts: list[bytes] = []
     got = 0
@@ -555,7 +564,9 @@ class LineReader:
             self._fold(buf, mark, carried)
             carried = (carried if mark == 0 else 0) + (pos - mark)
             # read1, not read: on a cut archive read() raises before handing over the bytes
-            # it did decompress, read1 hands them over first (measured for gz, bz2, xz)
+            # it did decompress, read1 hands them over first (measured for gz, bz2, xz and
+            # zst -- how much, and whether it stops mid-line, is the compressor's: see
+            # _read_up_to, where that measurement lives)
             chunk = self.handle.read1(_CHUNK)
             if self.same_file is not None and not self.same_file():
                 # the file was truncated under the handle (issue #66): the chunk may be
