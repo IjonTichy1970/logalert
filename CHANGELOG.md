@@ -29,6 +29,13 @@ its notes.
   lookup, which cost 20 s a run with two unreachable nameservers, before the
   lock. A numeric address is never looked up at all.
 
+- `[contract]` 🚨 **Which rotated copy a catch-up reads no longer depends on the
+  directory's listing order** (#79). A copy cut mid-stream could win over a
+  complete copy of its own generation, mailing a line that was never in the
+  log; and two generations stamped inside one second were read newest-first,
+  losing the older one's lines. That narrows #8's "a corrupt archive yields what
+  it had with a WARNING": a copy passed over yields nothing, and is named.
+
 ## [0.1.1] — 2026-09-18 — the rotation catch-up corrected and the run hardened
 
 ### Nitty Gritty

@@ -446,7 +446,31 @@ however many rotations happened in between. It recognises, beside the log or in
   without an anchor, from 0.1.0).
 
 Symbolic links are never candidates. A `.gz` still being written yields what it
-has, with a warning, and the run continues.
+has, with a warning, and the run continues -- unless a copy of its own
+generation can be read whole, which is the next paragraph.
+
+**Two copies of one generation.** `router.log.1.gz` beside `router.log.1.bz2`
+-- a rotation configuration switched from one compressor to another -- are two
+names for one generation: they carry the same rotation suffix, so nothing in
+the names says which of them is the copy to read, and their timestamps can be
+minutes apart. The one that reads to its end is taken, decided before a line is
+read out of either, and a copy passed over for being cut is named in a warning:
+
+```
+[router-disk] /var/log/router.log: 2 rotated copies of one generation fit the saved position (router.log.1.bz2, router.log.1.gz); reading router.log.1.gz
+[router-disk] /var/log/router.log: router.log.1.bz2 cannot be read to its end; reading router.log.1.gz instead, which can
+```
+
+Before 0.1.2 the directory's listing order decided it, so one machine could
+read the pair differently from another; and when the cut copy won, the complete
+copy's lines were lost and a line that was never in the log was mailed in their
+place. The same release stopped two copies of *different* generations stamped
+inside one second -- one `logrotate` run compressing both -- from being read
+newest-first, which dropped the older one's lines with nothing said. A cut copy
+comes from a compression or a transfer killed half-way; two copies of one
+generation usually mean the rotation configuration changed, though two
+hand-made copies that share a second look the same from here. Both lines are
+worth grepping for.
 
 **A rotation during the run.** When a rename rotation (logrotate's default)
 lands while the copies are being read, a copy the run was about to open is no
