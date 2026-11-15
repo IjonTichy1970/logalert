@@ -238,16 +238,14 @@ ever will not serve.
 
   | venv | interpreter | expected |
   | --- | --- | --- |
-  | `/srv/logalert-py311` | 3.11.18 | 1007 passed, 13 skipped |
-  | `/srv/logalert-py312` | 3.12.3 | 1007 passed, 13 skipped |
-  | `/srv/logalert-py313` | 3.13.18 | 1007 passed, 13 skipped |
-  | `/srv/logalert-py314` | 3.14.10 | 1006 passed, 14 skipped |
+  | `/srv/logalert-py311` | 3.11.18 | 1014 passed, 13 skipped |
+  | `/srv/logalert-py312` | 3.12.3 | 1014 passed, 13 skipped |
+  | `/srv/logalert-py313` | 3.13.18 | 1014 passed, 13 skipped |
+  | `/srv/logalert-py314` | 3.14.10 | 1013 passed, 14 skipped |
 
   The 14th skip on 3.14 is announced and expected (`compression.zstd` is present
   there and absent below it, measured), and 3.12 is the one the gate's mypy
-  stage uses for a `sys.platform != "win32"` branch. **Until issue #80 lands,
-  3.13 and 3.14 also carry its one failure** (`test_activity.py`'s `udp:`
-  resolver message): 1006 and 1005 passed. Delete this sentence with it.
+  stage uses for a `sys.platform != "win32"` branch.
 - **A `--basetemp` is per interpreter, never shared.** pytest WIPES a basetemp
   it is given, at session start (`rm_rf` then `mkdir`, read in the installed
   pytest), so a 3.13 run started beside a running 3.12 one deletes the running

@@ -22,6 +22,13 @@ its notes.
   ignore list. `CLAUDE.md` records the four native venvs, and each interpreter
   gets its own `--basetemp`: pytest wipes a shared one at session start.
 
+- `[contract]` 🚨 **A `udp:` activity log's host is resolved by logalert itself,
+  within 2 s, and the handler gets the numeric address** (#80, #82). The stdlib
+  swallows the resolver's failure on 3.13+, so the documented warning could not
+  appear there and every record looked the name up again; nothing bounded the
+  lookup, which cost 20 s a run with two unreachable nameservers, before the
+  lock. A numeric address is never looked up at all.
+
 ## [0.1.1] — 2026-09-18 — the rotation catch-up corrected and the run hardened
 
 ### Nitty Gritty
