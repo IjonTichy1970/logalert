@@ -10,7 +10,6 @@ import bz2
 import errno
 import gzip
 import logging
-import lzma
 import os
 import sys
 import time
@@ -21,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import SECTION, append, run, seen, texts, try_symlink
+from conftest import SECTION, append, packer, run, seen, texts, try_symlink, zstd_module
 
 from logalert import rotation
 from logalert.cursor import ANCHOR_CAP, NUL, BinaryStream, Line, LogFile, anchor_of, open_log
@@ -41,10 +40,9 @@ NOWHERE = 2**40 + 7  # an inode number no filesystem in a test will hand out
 
 
 def compress_to(target: Path, data: bytes) -> None:
-    packers: dict[str, Callable[[bytes], bytes]] = {
-        ".gz": gzip.compress, ".bz2": bz2.compress, ".xz": lzma.compress,
-    }
-    target.write_bytes(packers[target.suffix](data))
+    """The compressor is chosen by the suffix, through conftest's one mapping -- so a `.zst`
+    fixture skips below 3.14 and fails on a 3.14 without the module (issue #83)."""
+    target.write_bytes(packer(target.suffix)(data))
 
 
 def rotate(path: Path, to: Path, *, compress: bool = False) -> None:
@@ -3750,6 +3748,37 @@ def test_a_twin_with_the_same_stamp_and_first_line_but_other_bytes_is_refused_at
     assert isinstance(again, CatchUpSource) and again.plan.stage == "mtime"
     assert again.plan.match is not None and again.plan.match.path == str(real)
     assert lines == ["since 2", "live 1"]  # nothing of the twin
+
+
+def test_a_zst_rotated_copy_is_matched_through_the_decompressor_with_its_anchor(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A `.zst` as a rotated copy in the catch-up: the forward read to the saved offset
+    through the decompressor, the anchor's bytes compared there, and a chain member of the
+    same format behind it. The shape issue #74 pinned for `.gz`, which had executed for
+    `.zst` on no host ever -- `compression.zstd` exists on 3.14+ only, and until the sandbox
+    gained a 3.14 nothing here could run it (issue #83).
+
+    A banner log, so neither the first line nor the length can tell the genuine copy from
+    the rival: only the bytes before the position can, read through zstd. `.3` is tried
+    first (lower is newer, so it is the oldest), and the anchor has to refuse it."""
+    zstd_module()  # skip below 3.14, FAIL on a 3.14 without it (issue #42)
+    path = tmp_path / "router.log"
+    saved = seen(path, _banner(b"old", 200))
+    append(path, SINCE)
+    compress_to(tmp_path / "router.log.2.zst", path.read_bytes())  # the genuine copy
+    compress_to(tmp_path / "router.log.3.zst", _banner(b"rival", 400))  # banner, longer
+    compress_to(tmp_path / "router.log.1.zst", b"newer gen 1" + NLB)  # the chain
+    path.write_bytes(b"")
+    append(path, LIVE)
+    caplog.set_level(logging.WARNING, logger="logalert.rotation")
+    source, lines, _ = run(path, saved)
+    assert isinstance(source, CatchUpSource) and source.plan.match is not None
+    assert source.plan.match.path.endswith("router.log.2.zst")
+    assert source.plan.stage == "content"
+    assert [Path(a.path).name for a in source.plan.chain] == ["router.log.1.zst"]
+    assert lines == ["since 1", "since 2", "newer gen 1", "live 1"]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def test_an_anchor_confirmed_choice_among_older_copies_is_not_called_a_guess(

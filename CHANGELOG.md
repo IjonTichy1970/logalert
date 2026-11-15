@@ -36,6 +36,13 @@ its notes.
   losing the older one's lines. That narrows #8's "a corrupt archive yields what
   it had with a WARNING": a copy passed over yields nothing, and is named.
 
+- `[internal]` **Every `.zst` read path is measured now, not only a clean read
+  from offset 0** (#83). The resumed offset, a cut archive, a file that is not
+  zstd at all and a `.zst` rotated copy with its anchor had executed on no host
+  ever, `compression.zstd` being 3.14-only; they run on the 3.14 leg and
+  announce a skip below it. A cut `.zst` hands over less than the other three --
+  nothing at all once the payload is compressed rather than stored, measured.
+
 ## [0.1.1] — 2026-09-18 — the rotation catch-up corrected and the run hardened
 
 ### Nitty Gritty

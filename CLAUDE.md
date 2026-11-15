@@ -34,11 +34,14 @@ Expected announced skips on the Windows host: `pytest` only (the POSIX-only
 tests -- file modes, a FIFO, symlinks, the real-`logrotate` module, the
 POSIX-only lock probe, a rename under an open handle, a signal delivered to a
 handler, the faked uids of the root-owner pin -- all but the lock probe saying
-"runs in the sandbox and on CI"; 71 as of #69); `changelog refs` skipped ("no
+"runs in the sandbox and on CI"; plus the four `.zst` read tests, which need
+3.14 and say so (#83); 75 as of #83); `changelog refs` skipped ("no
 release commit yet") only until 0.1.0 was cut. In the root sandbox the
 non-root tests skip instead, saying "expected in the root sandbox; CI runs it"
 (12 as of #69), plus one Windows-only test ("the read-only attribute is a
-Windows shape"); as `nobody` the one root-only test skips ("needs root to
+Windows shape"), plus those four `.zst` tests below 3.14 -- 17 there as of #83,
+and 14 on 3.14, where the `.zst` reads run and the unsupported-`.zst` branch
+skips instead; as `nobody` the one root-only test skips ("needs root to
 plant another user's link"), and the Linux stage carries that scenario on CI.
 Any other announced skip is worth reading. mypy on this host is the pure-Python
 build -- `pip install --no-binary mypy -e ".[dev,docs]"`, never `--no-binary
@@ -238,14 +241,17 @@ ever will not serve.
 
   | venv | interpreter | expected |
   | --- | --- | --- |
-  | `/srv/logalert-py311` | 3.11.18 | 1030 passed, 13 skipped |
-  | `/srv/logalert-py312` | 3.12.3 | 1030 passed, 13 skipped |
-  | `/srv/logalert-py313` | 3.13.18 | 1030 passed, 13 skipped |
-  | `/srv/logalert-py314` | 3.14.10 | 1029 passed, 14 skipped |
+  | `/srv/logalert-py311` | 3.11.18 | 1033 passed, 17 skipped |
+  | `/srv/logalert-py312` | 3.12.3 | 1033 passed, 17 skipped |
+  | `/srv/logalert-py313` | 3.13.18 | 1033 passed, 17 skipped |
+  | `/srv/logalert-py314` | 3.14.10 | 1036 passed, 14 skipped |
 
-  The 14th skip on 3.14 is announced and expected (`compression.zstd` is present
-  there and absent below it, measured), and 3.12 is the one the gate's mypy
-  stage uses for a `sys.platform != "win32"` branch.
+  3.14 is the only leg that READS a `.zst` (four tests, issue #83): they skip
+  below it, which is three of the four extra skips there, and the fourth is the
+  unsupported-`.zst` branch, which skips on 3.14 instead -- so 3.14 runs three
+  tests more and skips three fewer (`compression.zstd` is present there and
+  absent below it, measured). 3.12 is the one the gate's mypy stage uses for a
+  `sys.platform != "win32"` branch.
 - **A `--basetemp` is per interpreter, never shared.** pytest WIPES a basetemp
   it is given, at session start (`rm_rf` then `mkdir`, read in the installed
   pytest), so a 3.13 run started beside a running 3.12 one deletes the running

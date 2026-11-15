@@ -20,12 +20,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import SECTION, open_log_file, texts, try_symlink
+from conftest import SECTION, open_log_file, packer, texts, try_symlink, zstd_module
 
 from logalert.cursor import (
     ANCHOR_CAP,
+    COMPRESSED_SUFFIXES,
     FINGERPRINT_CAP,
     LINE_CAP,
+    STREAM_ERRORS,
     Line,
     LineReader,
     LogFile,
@@ -809,13 +811,14 @@ def test_compressed_suffix() -> None:
     assert compressed_suffix("/var/log/router.log.zst") == ".zst"
 
 
-@pytest.mark.parametrize(
-    ("suffix", "pack"),
-    [(".gz", gzip.compress), (".bz2", bz2.compress), (".xz", lzma.compress)],
-)
+@pytest.mark.parametrize("suffix", COMPRESSED_SUFFIXES)
 def test_compressed_files_read_from_an_uncompressed_offset(
-    tmp_path: Path, suffix: str, pack: Callable[[bytes], bytes]
+    tmp_path: Path, suffix: str
 ) -> None:
+    """Parametrised over ``COMPRESSED_SUFFIXES`` itself, so a supported format cannot be
+    left out of it: `.zst` was, and the resumed read -- the decompress-and-skip, with the
+    offset in the UNCOMPRESSED stream -- had executed on no host ever (issue #83)."""
+    pack = packer(suffix)
     plain = b"first line\nsecond line\nthird\n"
     path = tmp_path / f"router.log.1{suffix}"
     path.write_bytes(pack(plain))
@@ -830,6 +833,74 @@ def test_compressed_files_read_from_an_uncompressed_offset(
     saved = replace(log.cursor(), offset=len(b"first line\n"), size=None, mtime=None)
     log2, lines2 = scan(path, saved)
     assert log2.verdict == "continue" and texts(lines2) == ["second line", "third"]
+
+
+@pytest.mark.parametrize("suffix", COMPRESSED_SUFFIXES)
+def test_a_cut_compressed_archive_never_yields_a_line_the_file_did_not_have(
+    tmp_path: Path, suffix: str
+) -> None:
+    """A cut archive hands over what it decompressed before it raises, and the reader passes
+    on every COMPLETE line of that and nothing else -- never the fragment a cut leaves at
+    the end, which was never a line of the log.
+
+    How much comes through is the compressor's business, not ours, and `.zst` is the format
+    that proves it (issue #83, measured on 3.14.10, a 6-byte cut): `.gz`, `.bz2` and `.xz`
+    handed over all 28 bytes of this payload, `.zst` 22 of them ending MID-LINE -- and for a
+    6 KB payload `.zst` handed over nothing at all, a truncated compressed block being
+    undecompressable where a small payload's stored-raw one is not. So this measures its own
+    fixture instead of pinning a count, and asserts the relationship that must hold for
+    every format: the lines read are exactly the complete lines of what came through, those
+    are a prefix of the file's, and the offset left behind is resumable."""
+    pack = packer(suffix)
+    plain = b"old 1\nold 2\nsince 1\nsince 2\n"
+    path = tmp_path / f"router.log.1{suffix}"
+    path.write_bytes(pack(plain)[:-6])  # what a compressor killed mid-stream leaves behind
+    handed = b""
+    with open_log(str(path)) as probe:  # the same read1 loop the reader runs
+        try:
+            while True:
+                chunk = probe.read1(65536)
+                if not chunk:
+                    break
+                handed += chunk
+        except STREAM_ERRORS:
+            pass
+    assert handed, ("nothing came through at all -- a measurement, not a rule: re-measure "
+                    "issue #83's cut table if a compressor here has changed")
+    complete = [part.decode() for part in handed.split(b"\n")[:-1]]
+    assert complete == plain.decode().splitlines()[:len(complete)]  # a prefix, never a mix
+
+    log = open_log_file(SECTION, str(path), None, from_start=True)
+    assert log is not None
+    got: list[str] = []
+    with log, pytest.raises(OSError, match="incomplete or corrupt compressed stream"):
+        for line in log.lines():
+            got.append(line.text)
+    assert got == complete  # every whole line that came through, and never the fragment
+    assert log.offset == sum(len(line) + 1 for line in complete)  # resumable from there
+
+
+def test_a_zst_named_file_that_is_not_zstd_is_a_stream_error_not_a_crash(
+    tmp_path: Path
+) -> None:
+    """`ZstdError`'s base is `Exception`, not `OSError`, so `_stream_errors()` has to name
+    it or it escapes every `except STREAM_ERRORS` here and `rotation.py`'s `_READ_ERRORS`.
+    Nothing proved that entry until issue #83; the mutation is to drop it from the list,
+    and this is what reddens.
+
+    A truncation does NOT reach it -- measured on 3.14.10, a cut `.zst` raises `EOFError`,
+    which arrives by a different entry -- so the fixture is a file that is not zstd at all,
+    the one damaged shape whose error owes nothing to the compressor's frame layout. A
+    damaged body raises `ZstdError` as well ("Data corruption detected", measured for a
+    single flipped byte, a 16-byte run and the last two bytes), but which bytes to damage is
+    the compressor's business to change and this is not."""
+    zstd_module()  # skip below 3.14, FAIL on a 3.14 without it (issue #42)
+    path = tmp_path / "router.log.1.zst"
+    path.write_bytes(b"not zstd at all\n")
+    log = open_log_file(SECTION, str(path), None, from_start=True)
+    assert log is not None
+    with log, pytest.raises(OSError, match="incomplete or corrupt compressed stream"):
+        list(log.lines())
 
 
 def test_compressed_first_sight_starts_at_the_uncompressed_end(tmp_path: Path) -> None:
