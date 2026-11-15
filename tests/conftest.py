@@ -264,7 +264,12 @@ def packer(suffix: str) -> Callable[[bytes], bytes]:
     """The compressor for one archive suffix, so a test can be parametrised over
     ``COMPRESSED_SUFFIXES`` itself and a format cannot be quietly left out of one (issue
     #83: every ``.zst`` read but a clean one from offset 0 was unmeasured). A suffix with no
-    entry here is a ``KeyError``, which is the loud failure that wants to happen."""
+    entry here is a ``KeyError``, which is the loud failure that wants to happen.
+
+    Call it from inside a test body only: for ``.zst`` it can raise ``Skipped``, and a
+    fixture built at import or collection time would get "Using pytest.skip outside of a
+    test is not allowed" instead of a skip (review -- every call site is a test body today).
+    """
     if suffix == ".zst":
         compress: Callable[[bytes], bytes] = zstd_module().compress
         return compress

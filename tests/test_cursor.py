@@ -4,17 +4,14 @@ Every test builds real files under tmp_path, so the inode logic is exercised on 
 platforms (NTFS file ids are stable and non-zero). Non-ASCII bytes are spelled as code points.
 """
 
-import bz2
+import contextlib
 import gzip
 import hashlib
-import importlib
 import io
 import logging
-import lzma
 import os
 import sys
 import time
-from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -485,18 +482,17 @@ def test_a_fifo_swapped_in_after_the_stat_cannot_block_the_open(
         assert time.monotonic() - started < 5
 
 
-@pytest.mark.parametrize(
-    "suffix, pack",
-    [("", lambda raw: raw), (".gz", gzip.compress), (".bz2", bz2.compress),
-     (".xz", lzma.compress)],
-)
-def test_closing_the_handle_closes_the_descriptor(
-    tmp_path: Path, suffix: str, pack: Callable[[bytes], bytes]
-) -> None:
+@pytest.mark.parametrize("suffix", ("", *COMPRESSED_SUFFIXES))
+def test_closing_the_handle_closes_the_descriptor(tmp_path: Path, suffix: str) -> None:
     """The decompressors are built over the checked descriptor's file object and none of
-    them closes a file object it was given (measured); the handle logalert hands out does."""
+    them closes a file object it was given (measured); the handle logalert hands out does.
+
+    Parametrised over `COMPRESSED_SUFFIXES` and the plain case, because `_wrap`'s claim
+    covers every decompressor it builds and `.zst`'s was measured on no host at all (issue
+    #83, review)."""
+    plain = b"first\nsecond\n"
     path = tmp_path / f"router.log{suffix}"
-    path.write_bytes(pack(b"first\nsecond\n"))
+    path.write_bytes(packer(suffix)(plain) if suffix else plain)
     handle = open_log(str(path))
     fd = handle.fileno()
     assert handle.read1(5) == b"first" and handle.seekable()
@@ -655,13 +651,14 @@ def test_size_and_mtime_are_recorded_only_for_a_compressed_file_read_to_its_end(
     assert log3.cursor().size == whole.stat().st_size
 
 
-@pytest.mark.parametrize("suffix, pack", [(".gz", gzip.compress), (".bz2", bz2.compress),
-                                          (".xz", lzma.compress)])
+@pytest.mark.parametrize("suffix", COMPRESSED_SUFFIXES)
 def test_compressed_first_sight_boundaries_match_the_plain_files(
-        tmp_path: Path, suffix: str, pack: Callable[[bytes], bytes]) -> None:
+        tmp_path: Path, suffix: str) -> None:
     """The one-pass first sight decides the boundary exactly as the plain file's does
     (review: the first version started BEFORE an over-cap unterminated tail and mailed
-    pre-existing content, the one thing first sight promises never to do)."""
+    pre-existing content, the one thing first sight promises never to do). Over
+    `COMPRESSED_SUFFIXES`, `.zst` included since issue #83."""
+    pack = packer(suffix)
     path = tmp_path / f"router.log{suffix}"
     path.write_bytes(pack(b"header\n" + b"x" * (LINE_CAP + 1)))  # over the cap: the end
     log, lines = scan(path, None)
@@ -843,41 +840,52 @@ def test_a_cut_compressed_archive_never_yields_a_line_the_file_did_not_have(
     on every COMPLETE line of that and nothing else -- never the fragment a cut leaves at
     the end, which was never a line of the log.
 
-    How much comes through is the compressor's business, not ours, and `.zst` is the format
-    that proves it (issue #83, measured on 3.14.10, a 6-byte cut): `.gz`, `.bz2` and `.xz`
-    handed over all 28 bytes of this payload, `.zst` 22 of them ending MID-LINE -- and for a
-    6 KB payload `.zst` handed over nothing at all, a truncated compressed block being
-    undecompressable where a small payload's stored-raw one is not. So this measures its own
-    fixture instead of pinning a count, and asserts the relationship that must hold for
-    every format: the lines read are exactly the complete lines of what came through, those
-    are a prefix of the file's, and the offset left behind is resumable."""
+    The cut depth is SWEPT, not chosen, because how much comes through is the compressor's
+    business and at any single depth the rule in the name may not be exercised at all:
+    review measured that at the six bytes this test first cut, `.gz`, `.bz2` and `.xz` all
+    hand over the whole payload ending on a newline, leaving no fragment to withhold, so
+    only the 3.14 `.zst` leg tested the promise. Measured on 3.12.10 over this payload:
+    `.gz` first stops mid-line at a 10-byte cut (handing over 27 of 28, the fragment
+    `since 2`), `.xz` at 30, `.zst` at 6 (on 3.14), and `.bz2` at NO depth -- it hands over
+    all 28 bytes down to a 10-byte cut and none at all from 11, its blocks being
+    all-or-nothing -- which is why `.bz2` is the one format the last assertion exempts.
+
+    The invariant at every depth that hands anything over: the lines read are exactly the
+    complete lines of what came through, those are a prefix of the file's, and the offset
+    left behind is the end of the last of them, so the read is resumable with no fragment
+    consumed. The `.zst` asymmetry itself -- 22 bytes of 28 here, and nothing at all for a
+    6 KB payload -- is recorded where the rule lives, in `cursor.py`'s `_read_up_to`."""
     pack = packer(suffix)
     plain = b"old 1\nold 2\nsince 1\nsince 2\n"
+    whole = pack(plain)
     path = tmp_path / f"router.log.1{suffix}"
-    path.write_bytes(pack(plain)[:-6])  # what a compressor killed mid-stream leaves behind
-    handed = b""
-    with open_log(str(path)) as probe:  # the same read1 loop the reader runs
-        try:
-            while True:
+    stopped_mid_line = False
+    for cut in range(1, min(40, len(whole))):
+        path.write_bytes(whole[:-cut])  # what a compressor killed mid-stream leaves behind
+        handed = b""
+        with contextlib.suppress(OSError, *STREAM_ERRORS), open_log(str(path)) as probe:
+            while True:  # the same read1 loop the reader runs
                 chunk = probe.read1(65536)
                 if not chunk:
                     break
                 handed += chunk
-        except STREAM_ERRORS:
-            pass
-    assert handed, ("nothing came through at all -- a measurement, not a rule: re-measure "
-                    "issue #83's cut table if a compressor here has changed")
-    complete = [part.decode() for part in handed.split(b"\n")[:-1]]
-    assert complete == plain.decode().splitlines()[:len(complete)]  # a prefix, never a mix
-
-    log = open_log_file(SECTION, str(path), None, from_start=True)
-    assert log is not None
-    got: list[str] = []
-    with log, pytest.raises(OSError, match="incomplete or corrupt compressed stream"):
-        for line in log.lines():
-            got.append(line.text)
-    assert got == complete  # every whole line that came through, and never the fragment
-    assert log.offset == sum(len(line) + 1 for line in complete)  # resumable from there
+        if not handed:
+            continue  # this depth cost the whole stream: nothing to pass on, nothing to ask
+        stopped_mid_line = stopped_mid_line or not handed.endswith(b"\n")
+        kept = handed.split(b"\n")[:-1]  # the complete lines; a trailing fragment dropped
+        where = f"{suffix} cut by {cut}"
+        assert kept == plain.split(b"\n")[:len(kept)], where  # a prefix, never a mix
+        log = open_log_file(SECTION, str(path), None, from_start=True)
+        assert log is not None, where
+        got: list[bytes] = []
+        with log, pytest.raises(OSError, match="incomplete or corrupt compressed stream"):
+            for line in log.lines():
+                got.append(line.text.encode())
+        assert got == kept, where  # every whole line that came through, never the fragment
+        assert log.offset == sum(len(line) + 1 for line in kept), where  # resumable
+    assert stopped_mid_line or suffix == ".bz2", (
+        f"no cut depth left {suffix} stopping inside a line, so the rule this test is named "
+        f"for went untested here: re-measure issue #83's cut table")
 
 
 def test_a_zst_named_file_that_is_not_zstd_is_a_stream_error_not_a_crash(
@@ -926,21 +934,18 @@ def test_compressed_stream_shorter_than_the_offset_is_truncation(
 
 
 def test_zst_needs_the_stdlib_module(tmp_path: Path) -> None:
-    """Below 3.14 the refusal; on 3.14+ the ONLY read of a .zst file in the suite -- so a
-    3.14 built without zstd is a failure here, never an announced skip the gate's verdict
-    counts as green (issue #42: could-not-check is never a pass)."""
+    """Below 3.14 the refusal; on 3.14+ the first `.zst` read the suite ever had -- and since
+    issue #83 no longer the only one, which is what that issue was for. A 3.14 built without
+    zstd is a failure here and in all four of those, never an announced skip the gate's
+    verdict counts as green (issue #42: could-not-check is never a pass) -- one decision, in
+    conftest's `zstd_module()`."""
     path = tmp_path / "router.log.zst"
     path.write_bytes(b"")
     if sys.version_info < (3, 14):
         with pytest.raises(OSError, match=r"\.zst needs Python 3\.14"):
             open_log(str(path))
     else:
-        try:
-            zstd = importlib.import_module("compression.zstd")
-        except ImportError:
-            pytest.fail("compression.zstd is missing on this 3.14 build: the .zst read path "
-                        "would be measured nowhere (could-not-check is never a pass)",
-                        pytrace=False)
+        zstd = zstd_module()  # here it can only FAIL: 3.14 is where these paths run
         path.write_bytes(zstd.compress(b"first\nsecond\n"))
         log, lines = scan(path, None, from_start=True)
         assert texts(lines) == ["first", "second"] and log.fingerprint == sha(b"first")
