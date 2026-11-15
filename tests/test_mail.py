@@ -49,8 +49,10 @@ TRANSPORTS: tuple[Transport, ...] = ("sendmail", "smtp")
 def make_config(tmp_path: Path, body: str = "", settings: str = "",
                 to: str = "noc@example.net") -> Config:
     """A config built by the real loader: the watch's rules are the loader's."""
+    first = (tmp_path / "router.log").as_posix()
+    second = (tmp_path / "router2.log").as_posix()
     text = (f"[logalert]\n{settings}\n[router-disk]\nsubject = Router disk failure\n"
-            f"to = {to}\nfiles = {FILE}\n    {FILE2}\n" + body)
+            f"to = {to}\nfiles = {first}\n    {second}\n" + body)
     path = tmp_path / "logalert.conf"
     path.write_text(text, encoding="utf-8", newline="\n")
     return load_config(str(path))
@@ -257,7 +259,8 @@ def test_subject_controls_are_sanitised_and_non_ascii_is_encoded(tmp_path: Path)
 
 
 def test_section_name_reaches_the_header_and_a_safe_attachment_name(tmp_path: Path) -> None:
-    text = (f"[a b{TAB}c{EM_DASH}]\nsubject = S\nto = noc@example.net\nfiles = {FILE}\n"
+    log = (tmp_path / "router.log").as_posix()
+    text = (f"[a b{TAB}c{EM_DASH}]\nsubject = S\nto = noc@example.net\nfiles = {log}\n"
             "patterns = disk\nreport = attachment\n")
     path = tmp_path / "logalert.conf"
     path.write_text(text, encoding="utf-8", newline="\n")
@@ -507,8 +510,9 @@ def test_a_line_boundary_the_loader_passes_does_not_raise_at_composition(
         tmp_path: Path, boundary: str) -> None:
     # NEL, LS and PS are one line to configparser and to _optional, and exactly what
     # EmailMessage refuses in a header value (measured: ValueError on every run for the section)
+    log = (tmp_path / "router.log").as_posix()
     text = (f"[rou{boundary}ter]\nsubject = Disk failure{boundary}now\nto = noc@example.net\n"
-            f"files = {FILE}\npatterns = disk\n")
+            f"files = {log}\npatterns = disk\n")
     path = tmp_path / "logalert.conf"
     path.write_text(text, encoding="utf-8", newline="\n")
     config = load_config(str(path))
@@ -561,7 +565,8 @@ def test_the_attachment_name_never_starts_with_a_dash_or_dot_and_fits_one_line()
 
 
 def test_a_long_section_name_keeps_the_filename_on_one_line(tmp_path: Path) -> None:
-    text = (f"[{'s' * 60}]\nsubject = S\nto = noc@example.net\nfiles = {FILE}\n"
+    log = (tmp_path / "router.log").as_posix()
+    text = (f"[{'s' * 60}]\nsubject = S\nto = noc@example.net\nfiles = {log}\n"
             "patterns = disk\nreport = attachment\n")
     path = tmp_path / "logalert.conf"
     path.write_text(text, encoding="utf-8", newline="\n")

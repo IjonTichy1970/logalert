@@ -9,6 +9,12 @@ its notes.
 
 ### Nitty Gritty
 
+- `[internal]` **Tests build the config paths the loader checks from `tmp_path`,
+  so the mail, transport and reset_state tests pass on Windows under Python
+  3.13+** (#54). `os.path.isabs("/var/log/router.log")` is False there, and the
+  loader refused the literal. Labels never sent to the loader keep their
+  literals.
+
 ## [0.1.1] — 2026-09-18 — the rotation catch-up corrected and the run hardened
 
 ### Nitty Gritty

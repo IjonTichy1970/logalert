@@ -86,10 +86,11 @@ def test_reset_unknown_file_lists_what_the_state_knows(
 ) -> None:
     conf, state_file, log = seeded(tmp_path)
     before = state_file.stat()
-    assert main(["--reset-state", "/var/log/typo.log", "-f", conf]) == 1
+    typo = (tmp_path / "typo.log").as_posix()
+    assert main(["--reset-state", typo, "-f", conf]) == 1
     err = capsys.readouterr().err
     known = ", ".join(sorted(["/var/log/other.log", log]))  # the order depends on tmp_path
-    assert err == (f"logalert: no entry for /var/log/typo.log; the state file knows {known}"
+    assert err == (f"logalert: no entry for {typo}; the state file knows {known}"
                    f" -- and no section lists that file\n")
     after = state_file.stat()  # nothing rewritten: a rewrite is a new inode
     assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)

@@ -73,7 +73,8 @@ def make_config(tmp_path: Path, settings: str = "", to: str = "noc@example.net",
         settings = f"from = {sender}\n" + settings
     text = (f"[logalert]\nlog = file:{(tmp_path / 'activity.log').as_posix()}\n{settings}\n"
             f"[router-disk]\nsubject = Router disk failure\n"
-            f"to = {to}\nfiles = {FILE}\npatterns =\n    disk failure\n")
+            f"to = {to}\nfiles = {(tmp_path / 'router.log').as_posix()}\npatterns =\n"
+            f"    disk failure\n")
     path = tmp_path / "logalert.conf"
     path.write_text(text, encoding="utf-8", newline="\n")
     return load_config(str(path))
