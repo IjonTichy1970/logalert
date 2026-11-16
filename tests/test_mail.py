@@ -38,6 +38,10 @@ EM_DASH = chr(0x2014)  # spelled from the code point for the ASCII gate
 REPLACEMENT = chr(0xFFFD)
 LONE_SURROGATE = chr(0xDCFF)  # what surrogateescape would leave in a str
 
+# Report LABELS only: the path a FileReport, Entry or Line carries into the message, and the
+# ==> path <== header over its lines. Nothing hands these to the loader or to main, so they
+# stay literal on every platform. A path that something CHECKS is built from tmp_path instead
+# (make_config below): os.path.isabs of this literal is False on Windows since 3.13 (#54).
 FILE = "/var/log/router.log"
 ARCHIVE = "/var/log/router.log.1.gz"
 FILE2 = "/var/log/router2.log"
@@ -50,10 +54,12 @@ TRANSPORTS: tuple[Transport, ...] = ("sendmail", "smtp")
 def make_config(tmp_path: Path, body: str = "", settings: str = "",
                 to: str = "noc@example.net") -> Config:
     """A config built by the real loader: the watch's rules are the loader's."""
-    first = (tmp_path / "router.log").as_posix()
-    second = (tmp_path / "router2.log").as_posix()
+    # Never FILE/FILE2 here: the loader checks that a files entry is absolute (#54). The
+    # names say "log" because first/second mean the two report STREAMS elsewhere in this file.
+    first_log = (tmp_path / "router.log").as_posix()
+    second_log = (tmp_path / "router2.log").as_posix()
     text = (f"[logalert]\n{settings}\n[router-disk]\nsubject = Router disk failure\n"
-            f"to = {to}\nfiles = {first}\n    {second}\n" + body)
+            f"to = {to}\nfiles = {first_log}\n    {second_log}\n" + body)
     path = tmp_path / "logalert.conf"
     path.write_text(text, encoding="utf-8", newline="\n")
     return load_config(str(path))

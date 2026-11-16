@@ -9,15 +9,21 @@ its notes.
 
 ### Nitty Gritty
 
+- `[internal]` 🚨 **A corrected claim: #54's entry credited the config loader
+  for a path `--reset-state` refuses itself** (#54). `main` checks that its
+  argument is absolute before any configuration is read. The literals left
+  behind in the mail and transport tests now say in a comment that they are
+  report labels, never config values.
+
 ## [0.1.2] — 2026-11-15 — a copy chosen by reading and a bounded resolver
 
 ### Nitty Gritty
 
-- `[internal]` **Tests build the config paths the loader checks from `tmp_path`,
+- `[internal]` **Tests build the paths that have to be absolute from `tmp_path`,
   so the mail, transport and reset_state tests pass on Windows under Python
-  3.13+** (#54). `os.path.isabs("/var/log/router.log")` is False there, and the
-  loader refused the literal. Labels never sent to the loader keep their
-  literals.
+  3.13+** (#54). `os.path.isabs("/var/log/router.log")` is False there: the
+  loader refuses such a `files` entry, and `--reset-state` refuses its own
+  argument. Labels never handed to either keep their literals.
 
 - `[internal]` **The tools the gate runs are pinned exactly, so a release of
   one can no longer redden an unchanged tree** (#81). A `mypy` release is an

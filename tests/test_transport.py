@@ -56,6 +56,9 @@ if sys.platform != "win32":
 NL = chr(10)
 CR = chr(13)
 FAKE = Path(__file__).with_name("fake_sendmail.py")
+# A report LABEL only: what scan() and Line() carry into the message, never a config value.
+# The loader checks that a files entry is absolute, so make_config below builds that path from
+# tmp_path -- os.path.isabs of this literal is False on Windows since 3.13 (#54).
 FILE = "/var/log/router.log"
 SENDER = "logalert@router1.example.net"
 MISSING = "/nonexistent/sbin/sendmail" if sys.platform != "win32" else "C:/nonexistent/sendmail.exe"
